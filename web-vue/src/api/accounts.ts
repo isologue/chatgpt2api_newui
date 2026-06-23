@@ -480,16 +480,25 @@ async function refreshAndPoll(accessTokens: string[]) {
 
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
-    const progress = await apiClient.get<never, any>(
+    const progress = await apiClient.get<never, AccountRefreshProgress>(
       `/api/accounts/refresh/progress/${encodeURIComponent(progressId)}`,
     )
-    if (progress?.done || progress?.status === 'done' || progress?.finished) {
+    const legacyProgress = progress as AccountRefreshProgress & { status?: string; finished?: boolean }
+    if (progress.done || legacyProgress.status === 'done' || legacyProgress.finished) {
       if (progress.error) throw new Error(String(progress.error))
+      const errors = Array.isArray(progress?.result?.errors) ? progress.result.errors : []
+      if (errors.length) {
+        const first = errors[0]
+        const message = typeof first === 'string'
+          ? first
+          : [first?.token, first?.error].map(cleanString).filter(Boolean).join(': ')
+        throw new Error(message || `账号刷新失败，共 ${errors.length} 个错误`)
+      }
       return { status: 'ok', progress }
     }
     await new Promise((resolve) => window.setTimeout(resolve, 800))
   }
-  return { status: 'ok', progress_id: progressId }
+  throw new Error('刷新进度超时，请稍后重新打开列表查看结果')
 }
 
 async function refreshAndPollWithProgress(

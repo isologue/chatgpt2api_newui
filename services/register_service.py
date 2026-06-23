@@ -240,14 +240,19 @@ class RegisterService:
             )
         return self.get()
 
+    def _mail_config_with_proxy(self) -> dict:
+        mail = json.loads(json.dumps(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, ensure_ascii=False))
+        mail["proxy"] = str(self._config.get("proxy") or "").strip()
+        return mail
+
     def gptmail_status(self, provider: dict | None = None, force: bool = False) -> dict:
         with self._lock:
-            mail = json.loads(json.dumps(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, ensure_ascii=False))
+            mail = self._mail_config_with_proxy()
         return mail_provider.gptmail_status(mail, provider, force=force)
 
     def refresh_gptmail_public_key(self, provider: dict | None = None, force: bool = True) -> dict:
         with self._lock:
-            mail = json.loads(json.dumps(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, ensure_ascii=False))
+            mail = self._mail_config_with_proxy()
         return mail_provider.refresh_gptmail_public_key(mail, provider, force=force)
 
     def _append_log(self, text: str, color: str = "") -> None:

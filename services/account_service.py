@@ -1464,7 +1464,7 @@ class AccountService:
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
         """刷新单个账号后，更新进度计数。"""
         account = self.get_account(token)
-        status = str(account.get("status") or "正常").strip() if account else "正常"
+        status = str(account.get("status") or "正常").strip() if account else "异常"
         quota = max(0, int(account.get("quota") or 0)) if account else 0
 
         with self._refresh_progress_lock:

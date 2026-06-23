@@ -268,6 +268,16 @@ def _create_session(conf: dict):
     return requests.Session(**kwargs)
 
 
+def _gptmail_proxy_hint(conf: dict) -> str:
+    proxy = str(conf.get("proxy") or "").strip()
+    return f"（当前注册代理：{proxy}）" if proxy else "（当前未配置注册代理，可能使用稳定代理运行时）"
+
+
+def _is_proxy_tunnel_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "connect tunnel failed" in text or "curl: (56)" in text
+
+
 def _gptmail_api_base(entry: dict) -> str:
     value = str(entry.get("api_base") or "").strip()
     return (value or GPTMAIL_DEFAULT_API_BASE).rstrip("/")
@@ -280,8 +290,8 @@ def _gptmail_key_mode(entry: dict) -> str:
     return "custom" if str(entry.get("api_key") or "").strip() else "public"
 
 
-def _gptmail_cache_key(api_base: str, key_mode: str, api_key: str = "", reveal_public_key: bool = False) -> str:
-    digest = hashlib.sha256(f"{api_base}|{key_mode}|{api_key}|{int(reveal_public_key)}".encode()).hexdigest()[:16]
+def _gptmail_cache_key(api_base: str, key_mode: str, api_key: str = "", reveal_public_key: bool = False, proxy: str = "") -> str:
+    digest = hashlib.sha256(f"{api_base}|{key_mode}|{api_key}|{int(reveal_public_key)}|{proxy}".encode()).hexdigest()[:16]
     return f"{api_base}|{key_mode}|{digest}"
 
 
@@ -383,6 +393,12 @@ def _gptmail_status_payload(entry: dict, conf: dict, *, reveal_public_key: bool 
             "seconds_until_reset": _gptmail_int(usage.get("seconds_until_reset") or body.get("seconds_until_reset")),
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        if _is_proxy_tunnel_error(exc):
+            raise RuntimeError(f"GPTMail 检测失败：代理 CONNECT 隧道返回 503，无法连接 {api_base}{_gptmail_proxy_hint(conf)}。请切换直连或更换注册代理后重试。原始错误: {exc}") from exc
+        raise RuntimeError(f"GPTMail 检测失败{_gptmail_proxy_hint(conf)}: {exc}") from exc
     finally:
         session.close()
 
@@ -392,7 +408,7 @@ def _gptmail_cached_status(entry: dict, conf: dict, *, reveal_public_key: bool =
     key_mode = _gptmail_key_mode(entry)
     api_key = str(entry.get("api_key") or "").strip()
     ttl = GPTMAIL_PUBLIC_STATUS_CACHE_SECONDS if key_mode == "public" else GPTMAIL_CUSTOM_STATUS_CACHE_SECONDS
-    cache_key = _gptmail_cache_key(api_base, key_mode, api_key, reveal_public_key)
+    cache_key = _gptmail_cache_key(api_base, key_mode, api_key, reveal_public_key, str(conf.get("proxy") or "").strip())
     now = time.time()
     if not force:
         with gptmail_status_lock:
