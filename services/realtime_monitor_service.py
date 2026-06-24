@@ -277,6 +277,13 @@ class RealtimeMonitorService:
             perf = detail.get("perf")
             if isinstance(perf, dict):
                 self._merge_metric_dict(record.setdefault("perf", {}), perf)
+            events = [dict(item) for item in self._events if item.get("call_id") == call_id][-60:]
+            diagnostic = self._detail_diagnostic(record, events)
+            if diagnostic:
+                detail["monitor"] = diagnostic
+                for key in ("proxy_source", "proxy_hash", "has_proxy", "egress_mode", "local_reason"):
+                    if key in diagnostic and key not in detail:
+                        detail[key] = diagnostic[key]
             self._completed.append(self._copy_record(record))
             self._events.append(self._event(call_id, str(record["stage"]), record))
 
@@ -459,6 +466,77 @@ class RealtimeMonitorService:
         if stage in ACTIVE_STAGE_GROUPS:
             return ACTIVE_STAGE_GROUPS[stage]
         return str(record.get("stage_label") or STAGE_LABELS.get(stage) or stage or "运行中")
+
+    def _detail_diagnostic(self, record: dict[str, Any], events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        diagnostic: dict[str, Any] = {}
+        for key in ("stage", "stage_label", "proxy_source", "proxy_hash", "egress_mode", "local_reason"):
+            value = str(record.get(key) or "").strip()
+            if value:
+                diagnostic[key] = value
+        if "has_proxy" in record:
+            diagnostic["has_proxy"] = bool(record.get("has_proxy"))
+
+        metrics = {
+            key: _int_ms(value)
+            for key, value in dict(record.get("metrics") or {}).items()
+            if str(key).endswith("_ms") and _int_ms(value) > 0
+        }
+        perf_metrics = {
+            key: _int_ms(value)
+            for key, value in dict(record.get("perf") or {}).items()
+            if str(key).endswith("_ms") and _int_ms(value) > 0
+        }
+        metrics.update({key: max(metrics.get(key, 0), value) for key, value in perf_metrics.items()})
+        if metrics:
+            diagnostic["metrics"] = metrics
+
+        images = record.get("images")
+        if isinstance(images, dict):
+            image_items: dict[str, Any] = {}
+            for key, value in images.items():
+                if not isinstance(value, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for field in (
+                    "index",
+                    "total",
+                    "stage",
+                    "stage_label",
+                    "status",
+                    "returned_result",
+                    "returned_message",
+                    "proxy_source",
+                    "proxy_hash",
+                    "has_proxy",
+                    "egress_mode",
+                    "local_reason",
+                ):
+                    if field in value and value[field] not in ("", None):
+                        item[field] = value[field]
+                image_metrics = {
+                    metric_key: _int_ms(metric_value)
+                    for metric_key, metric_value in dict(value.get("metrics") or {}).items()
+                    if str(metric_key).endswith("_ms") and _int_ms(metric_value) > 0
+                }
+                if image_metrics:
+                    item["metrics"] = image_metrics
+                if item:
+                    image_items[str(key)] = item
+            if image_items:
+                diagnostic["images"] = image_items
+
+        if events:
+            diagnostic["events"] = [
+                {
+                    key: value
+                    for key, value in event.items()
+                    if key in {"time", "event", "label", "index", "total", "status"}
+                    or (str(key).endswith("_ms") and _int_ms(value) > 0)
+                }
+                for event in events
+            ]
+
+        return diagnostic
 
     def _public_record(self, record: dict[str, Any]) -> dict[str, Any]:
         item = self._copy_record(record)

@@ -129,6 +129,10 @@ export type SystemLogRow = {
   role: string
   accountEmail: string
   conversationId: string
+  proxySource: string
+  proxyHash: string
+  hasProxy: string
+  egressMode: string
   durationMs: string
   statusCode: string
   startedAt: string
@@ -160,6 +164,25 @@ export type NormalizeSystemLogRowOptions = {
 
 function cleanString(value: unknown): string {
   return String(value || '').trim()
+}
+
+function formatDetailValue(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+  if (Array.isArray(value)) return value.map(formatDetailValue).filter(Boolean).join(' · ')
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined && item !== null && item !== '')
+    if (!entries.length) return ''
+    const primitive = entries.every(([, item]) => !item || ['string', 'number', 'boolean'].includes(typeof item))
+    if (primitive && entries.length <= 8) {
+      return entries.map(([key, item]) => `${key}: ${formatDetailValue(item)}`).join(' · ')
+    }
+    try {
+      return JSON.stringify(value, null, 2)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value).trim()
 }
 
 function normalizeLevel(item: SystemLog): LogEntry['level'] {
@@ -204,9 +227,9 @@ function terminalStatus(status: string, error: string): AdminLogGroup['status'] 
 
 function detailValue(detail: Record<string, any>, key: string): string {
   const value = detail[key]
-  if (value !== undefined && value !== null && value !== '') return cleanString(value)
+  if (value !== undefined && value !== null && value !== '') return formatDetailValue(value)
   const diagnosis = detail.diagnosis
-  if (diagnosis && typeof diagnosis === 'object') return cleanString(diagnosis[key])
+  if (diagnosis && typeof diagnosis === 'object') return formatDetailValue(diagnosis[key])
   return ''
 }
 
@@ -328,6 +351,7 @@ function buildSystemLogDiagnosisChips(row: {
 
 export function normalizeSystemLogRow(item: SystemLog, index: number, options: NormalizeSystemLogRowOptions = {}): SystemLogRow {
   const detail = item.detail || {}
+  const monitor = detail.monitor && typeof detail.monitor === 'object' ? detail.monitor as Record<string, any> : {}
   const error = detailValue(detail, 'error')
   const requestText = detailValue(detail, 'request_text')
   const rawUpstreamMessage = detailValue(detail, 'raw_upstream_message')
@@ -367,6 +391,10 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
     role: detailValue(detail, 'role'),
     accountEmail: detailValue(detail, 'account_email'),
     conversationId: detailValue(detail, 'conversation_id'),
+    proxySource: detailValue(detail, 'proxy_source') || formatDetailValue(monitor.proxy_source),
+    proxyHash: detailValue(detail, 'proxy_hash') || formatDetailValue(monitor.proxy_hash),
+    hasProxy: detailValue(detail, 'has_proxy') || boolDetailLabel(monitor.has_proxy),
+    egressMode: detailValue(detail, 'egress_mode') || formatDetailValue(monitor.egress_mode),
     durationMs,
     statusCode,
     startedAt,

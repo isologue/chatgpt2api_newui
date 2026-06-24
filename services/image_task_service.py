@@ -7,11 +7,13 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.realtime_monitor_service import realtime_monitor_service
 from utils.timezone import beijing_from_timestamp, beijing_now_str
 
 TASK_STATUS_QUEUED = "queued"
@@ -261,6 +263,18 @@ class ImageTaskService:
         model: str,
     ) -> None:
         started = time.time()
+        call_id = uuid4().hex[:16]
+        endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
+        summary_prefix = "图生图" if mode == "edit" else "文生图"
+        perf_timings: dict[str, int] = {"handler_queue_ms": 0}
+        realtime_monitor_service.start(
+            call_id,
+            endpoint=endpoint,
+            model=model,
+            summary=summary_prefix,
+            role=str(identity.get("role") or ""),
+            key_name=str(identity.get("name") or ""),
+        )
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
@@ -268,10 +282,24 @@ class ImageTaskService:
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        payload_with_progress = {
+            **payload,
+            "progress_callback": progress_callback,
+            "_call_id": call_id,
+            "_trace_image_perf": True,
+        }
+        handler_started = time.perf_counter()
+        realtime_monitor_service.stage(
+            call_id,
+            "handler_started",
+            handler_queue_ms=0,
+            endpoint=endpoint,
+            model=model,
+        )
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
+            perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -298,8 +326,11 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                call_id=call_id,
+                perf=perf_timings,
             )
         except Exception as exc:
+            perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
@@ -317,6 +348,9 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                perf=perf_timings,
             )
 
     def _log_call(
@@ -332,6 +366,9 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        conversation_id: str = "",
+        call_id: str = "",
+        perf: dict[str, int] | None = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -341,20 +378,27 @@ class ImageTaskService:
             "role": identity.get("role"),
             "endpoint": endpoint,
             "model": model,
+            "call_id": call_id,
             "started_at": beijing_from_timestamp(started),
             "ended_at": _now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "status": status,
         }
+        if perf:
+            detail["perf"] = dict(perf)
         if request_preview:
             detail["request_text"] = request_preview
         if error:
             detail["error"] = error
         if account_email:
             detail["account_email"] = account_email
+        if conversation_id:
+            detail["conversation_id"] = conversation_id
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
+            if call_id:
+                realtime_monitor_service.finish(detail)
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
             pass

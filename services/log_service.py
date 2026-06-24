@@ -485,9 +485,10 @@ class LoggedCall:
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
 
+        if args and isinstance(args[0], dict):
+            self.attach_trace_metadata(args[0])
         trace_perf = self._trace_image_perf()
         if trace_perf:
-            self._inject_call_metadata(args)
             realtime_monitor_service.start(
                 self.call_id,
                 endpoint=self.endpoint,
@@ -602,12 +603,13 @@ class LoggedCall:
             return "image" in model
         return False
 
-    def _inject_call_metadata(self, args: tuple[Any, ...]) -> None:
-        if not args or not isinstance(args[0], dict):
+    def attach_trace_metadata(self, body: dict[str, Any]) -> None:
+        if not isinstance(body, dict):
             return
-        body = args[0]
-        body.setdefault("_call_id", self.call_id)
-        body.setdefault("_trace_image_perf", True)
+        if not self._trace_image_perf():
+            return
+        body["_call_id"] = self.call_id
+        body["_trace_image_perf"] = True
 
     def stream(self, items):
         urls: list[str] = []

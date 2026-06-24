@@ -260,7 +260,7 @@
 
     <ModalShell
       :open="!!selectedLog"
-      max-width="46rem"
+      max-width="54rem"
       :z-index="130"
       align="start"
       placement="end"
@@ -269,18 +269,38 @@
       @close="closeDetail"
     >
       <template v-if="selectedLog">
-          <ModalHeader title="日志详情" :subtitle="selectedLog.id" @close="closeDetail" />
+          <ModalHeader title="日志详情" @close="closeDetail" />
 
           <div class="scrollbar-slim flex-1 space-y-5 overflow-y-auto px-5 py-4">
+            <section class="log-detail-summary">
+              <div class="log-detail-summary__main">
+                <div class="log-detail-summary__copy">
+                  <div class="log-detail-summary__title-row">
+                    <StateBadge :tone="statusTone(selectedLog)" shape="rounded" :bordered="false">
+                      {{ statusLabel(selectedLog) }}
+                    </StateBadge>
+                  </div>
+                  <p class="log-detail-summary__title">
+                    {{ summaryText(selectedLog) || '调用日志' }}
+                  </p>
+                </div>
+                <div class="log-detail-summary__duration">
+                  <span>总耗时</span>
+                  <strong>{{ formatTimelineMs(selectedLog.durationMs) }}</strong>
+                </div>
+              </div>
+            </section>
+
             <div class="detail-field-stack">
               <section class="detail-field-section">
                 <div class="detail-field-section__header">
-                  <span>关键信息</span>
+                  <span>请求身份</span>
                 </div>
                 <div class="detail-field-grid">
                   <DetailFieldCard
                     v-for="field in selectedPrimaryDetailFields"
                     :key="field.label"
+                    :class="{ 'detail-field-grid__item--wide': field.wide }"
                     :label="field.label"
                     :value="field.value"
                     :copyable="field.copyable"
@@ -307,6 +327,96 @@
                 </div>
               </section>
             </div>
+
+            <section class="detail-timeline">
+              <div class="detail-timeline__header">
+                <div>
+                  <span class="detail-timeline__title">步骤耗时</span>
+                  <p>按执行顺序展示，条形长度表示相对耗时</p>
+                </div>
+                <div class="detail-timeline__meta">
+                  <MetaChip size="xs" tone="muted">{{ selectedTimelineStepCount }} 步</MetaChip>
+                  <MetaChip v-if="selectedTimelineSegmentTotal" size="xs" tone="muted">
+                    分段合计 {{ formatTimelineMs(selectedTimelineSegmentTotal) }}
+                  </MetaChip>
+                  <MetaChip v-if="selectedBottleneckStep" size="xs" tone="warning">
+                    瓶颈 {{ selectedBottleneckStep.label }}
+                  </MetaChip>
+                </div>
+              </div>
+
+              <div v-if="selectedTimelineSegments.length" class="detail-timeline-segments">
+                <div class="detail-timeline-segments__track">
+                  <div
+                    v-for="segment in selectedTimelineSegments"
+                    :key="segment.key"
+                    class="detail-timeline-segments__segment"
+                    :class="[
+                      `detail-timeline-segments__segment--${segment.category}`,
+                      `detail-timeline-segments__segment--${segment.tone}`,
+                      { 'detail-timeline-segments__segment--compact': segment.compact },
+                    ]"
+                    :style="segment.barStyle"
+                    :title="segment.title"
+                  >
+                    <span>{{ segment.label }}</span>
+                    <strong>{{ segment.value }}</strong>
+                  </div>
+                </div>
+                <div v-if="selectedTimelineLegendItems.length" class="detail-timeline-segments__legend">
+                  <span
+                    v-for="item in selectedTimelineLegendItems"
+                    :key="`${item.key}-legend`"
+                    class="detail-timeline-segments__legend-item"
+                    :class="[`detail-timeline-segments__legend-item--${item.category}`, `detail-timeline-segments__legend-item--${item.tone}`]"
+                  >
+                    <i />
+                    {{ item.label }}
+                  </span>
+                </div>
+              </div>
+
+              <div v-else class="detail-timeline__empty">
+                这条日志没有步骤耗时埋点；新的图片请求会显示分段耗时。
+              </div>
+
+              <div v-if="selectedTimelineGroups.length" class="detail-timeline__details">
+                <button type="button" class="detail-timeline__toggle" @click="timelineDetailsExpanded = !timelineDetailsExpanded">
+                  <span>步骤明细</span>
+                  <strong>{{ timelineDetailsVisible ? '收起' : '展开' }}</strong>
+                </button>
+                <div v-show="timelineDetailsVisible" class="detail-timeline__groups">
+                  <div v-for="group in selectedTimelineGroups" :key="group.name" class="detail-timeline__group">
+                    <div class="detail-timeline__group-title">{{ group.name }}</div>
+                    <div class="detail-timeline__steps">
+                      <div
+                        v-for="step in group.steps"
+                        :key="step.key"
+                        class="detail-timeline__step"
+                        :class="[`detail-timeline__step--${step.category}`, `detail-timeline__step--${step.tone}`]"
+                      >
+                        <div class="detail-timeline__step-main">
+                          <div class="detail-timeline__step-head">
+                            <div class="detail-timeline__step-label">
+                              <span>{{ step.label }}</span>
+                              <StateBadge :tone="step.tone" size="xs" shape="rounded">
+                                {{ step.statusLabel }}
+                              </StateBadge>
+                            </div>
+                            <span v-if="step.time" class="detail-timeline__step-time">{{ step.time }}</span>
+                          </div>
+                          <div class="detail-timeline__bar">
+                            <span :style="step.barStyle" />
+                          </div>
+                          <p v-if="step.note" class="detail-timeline__step-note">{{ step.note }}</p>
+                        </div>
+                        <strong class="detail-timeline__step-value">{{ step.value }}</strong>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
 
             <DetailTextBlock
               title="请求文本"
@@ -337,7 +447,7 @@
             />
 
             <DetailTextBlock
-              title="Raw detail JSON"
+              title="原始 detail JSON"
               :content="selectedLog.rawJson"
               tone="muted"
               max-height="24rem"
@@ -421,6 +531,53 @@ type DetailField = {
   label: string
   value: string
   copyable?: boolean
+  wide?: boolean
+}
+
+type DetailTone = 'success' | 'danger' | 'warning' | 'info' | 'muted'
+type DetailTimelineCategory = 'entry' | 'prepare' | 'upstream' | 'resolve' | 'download' | 'retry' | 'response'
+
+type DetailTimelineStepConfig = {
+  key: string
+  label: string
+  group: string
+  hint?: string
+}
+
+type DetailTimelineStep = DetailTimelineStepConfig & {
+  valueMs: number
+  value: string
+  tone: DetailTone
+  category: DetailTimelineCategory
+  statusLabel: string
+  barStyle: Record<string, string>
+  time: string
+  note: string
+}
+
+type DetailTimelineSegment = {
+  key: string
+  label: string
+  valueMs: number
+  value: string
+  percent: string
+  tone: DetailTone
+  category: DetailTimelineCategory
+  compact: boolean
+  barStyle: Record<string, string>
+  title: string
+}
+
+type DetailTimelineLegendItem = {
+  key: DetailTimelineCategory | DetailTone
+  label: string
+  category: DetailTimelineCategory | 'state'
+  tone: DetailTone
+}
+
+type DetailTimelineGroup = {
+  name: string
+  steps: DetailTimelineStep[]
 }
 
 type DetailPreviewImage = {
@@ -445,6 +602,55 @@ type AdvancedConditionGroup = {
   options: FilterOption[]
 }
 
+const detailTimelineSteps: DetailTimelineStepConfig[] = [
+  { key: 'handler_queue_ms', label: '等待入口', group: '入口与账号', hint: 'run_in_threadpool' },
+  { key: 'stream_first_queue_ms', label: '读取首包', group: '入口与账号', hint: '首个响应事件' },
+  { key: 'account_wait_ms', label: '等待账号', group: '入口与账号', hint: '账号池筛选' },
+  { key: 'egress_wait_ms', label: '等待出口', group: '入口与账号', hint: '代理出口准备' },
+  { key: 'upload_ms', label: '上传输入图', group: '上游准备', hint: '参考图上传' },
+  { key: 'bootstrap_ms', label: '预热页面', group: '上游准备', hint: 'ChatGPT 页面' },
+  { key: 'requirements_ms', label: '获取请求令牌', group: '上游准备', hint: 'requirements / token' },
+  { key: 'prepare_conversation_ms', label: '准备会话', group: '上游准备', hint: '图片会话上下文' },
+  { key: 'generation_start_ms', label: '启动生成', group: '上游准备', hint: '提交上游请求' },
+  { key: 'conversation_stream_ms', label: '上游生成', group: '生成与结果', hint: 'ChatGPT 会话流' },
+  { key: 'stream_error_ms', label: '上游断流', group: '生成与结果', hint: 'HTTP2 / SSE' },
+  { key: 'resolve_ms', label: '解析/轮询', group: '生成与结果', hint: 'conversation / file' },
+  { key: 'download_ms', label: '下载图片', group: '生成与结果', hint: '图片文件下载' },
+  { key: 'retry_wait_ms', label: '重试等待', group: '生成与结果', hint: '轮询 / 退避' },
+  { key: 'response_ms', label: '响应整理', group: '生成与结果', hint: 'Codex 响应' },
+  { key: 'stream_ms', label: '单图内部', group: '生成与结果', hint: '单图链路' },
+  { key: 'total_ms', label: '单图总耗时', group: '生成与结果', hint: '完整链路' },
+]
+
+const detailTimelineGroupOrder = ['入口与账号', '上游准备', '生成与结果']
+const detailTimelineAggregateKeys = new Set(['stream_ms', 'total_ms'])
+const defaultTimelineWarningThresholdMs = 60_000
+const timelineWarningThresholdMs: Record<string, number> = {
+  handler_queue_ms: 1_000,
+  stream_first_queue_ms: 1_000,
+  account_wait_ms: 10_000,
+  egress_wait_ms: 10_000,
+  upload_ms: 60_000,
+  bootstrap_ms: 60_000,
+  requirements_ms: 60_000,
+  prepare_conversation_ms: 60_000,
+  generation_start_ms: 60_000,
+  download_ms: 60_000,
+  retry_wait_ms: 60_000,
+  response_ms: 30_000,
+}
+
+const detailTimelineCategoryLabels: Record<DetailTimelineCategory, string> = {
+  entry: '入口与账号',
+  prepare: '上游准备',
+  upstream: '上游生成',
+  resolve: '解析/轮询',
+  download: '图片下载',
+  retry: '重试等待',
+  response: '响应整理',
+}
+const detailTimelineCategoryOrder: DetailTimelineCategory[] = ['entry', 'prepare', 'upstream', 'resolve', 'download', 'retry', 'response']
+
 const toast = useToast()
 const route = useRoute()
 const apiBaseUrl = import.meta.env.VITE_API_URL || window.location.origin
@@ -456,6 +662,7 @@ const runtimeLogs = ref<RuntimeLog[]>([])
 const runtimeFetching = ref(false)
 const runtimeLoadError = ref('')
 const selectedLog = ref<LogRow | null>(null)
+const timelineDetailsExpanded = ref(false)
 const selectedDetailPreview = ref<DetailPreviewImage | null>(null)
 const copiedLogPreviewKey = ref('')
 const autoRefreshEnabled = ref(false)
@@ -780,29 +987,136 @@ const allVisibleLogsSelected = computed(() => {
   return visibleLogs.value.every((item) => selectedLogIdSet.value.has(item.id))
 })
 
+const selectedBottleneckStep = computed<DetailTimelineStep | null>(() => {
+  const steps = selectedTimelineGroups.value.flatMap((group) => group.steps)
+  return steps.reduce<DetailTimelineStep | null>((current, step) => {
+    if (!current || step.valueMs > current.valueMs) return step
+    return current
+  }, null)
+})
+
+const selectedTimelineStepCount = computed(() => selectedTimelineGroups.value.reduce((total, group) => total + group.steps.length, 0))
+const selectedTimelineSegmentTotal = computed(() => selectedTimelineSegments.value.reduce((total, segment) => total + segment.valueMs, 0))
+
+const selectedTimelineSegments = computed<DetailTimelineSegment[]>(() => {
+  const item = selectedLog.value
+  if (!item) return []
+  const rawSegments = detailTimelineSteps
+    .filter((step) => !detailTimelineAggregateKeys.has(step.key))
+    .map((step) => ({
+      ...step,
+      valueMs: metricValueFromLog(item, step.key),
+    }))
+    .filter((step) => step.valueMs > 0)
+  const totalMs = rawSegments.reduce((total, step) => total + step.valueMs, 0)
+  if (totalMs <= 0) return []
+  const maxMs = Math.max(...rawSegments.map((step) => step.valueMs), 0)
+  return rawSegments.map((step) => {
+    const percent = (step.valueMs / totalMs) * 100
+    const tone = timelineStepTone(step.key, step.valueMs, maxMs)
+    const category = timelineStepCategory(step.key, step.group)
+    const value = formatTimelineMs(step.valueMs)
+    return {
+      key: step.key,
+      label: step.label,
+      valueMs: step.valueMs,
+      value,
+      percent: `${percent.toFixed(percent >= 10 ? 0 : 1)}%`,
+      tone,
+      category,
+      compact: percent < 12,
+      barStyle: { flexGrow: String(Math.max(step.valueMs, 1)) },
+      title: `${step.label} ${value} · ${percent.toFixed(1)}%`,
+    }
+  })
+})
+
+const selectedTimelineLegendItems = computed<DetailTimelineLegendItem[]>(() => {
+  const segments = selectedTimelineSegments.value
+  if (!segments.length) return []
+  const categories = new Set(segments.map((segment) => segment.category))
+  const items: DetailTimelineLegendItem[] = detailTimelineCategoryOrder
+    .filter((category) => categories.has(category))
+    .map((category) => ({
+      key: category,
+      label: detailTimelineCategoryLabels[category],
+      category,
+      tone: 'info',
+    }))
+  if (segments.some((segment) => segment.tone === 'warning')) {
+    items.push({ key: 'warning', label: '超过阈值', category: 'state', tone: 'warning' })
+  }
+  if (segments.some((segment) => segment.tone === 'danger')) {
+    items.push({ key: 'danger', label: '异常中断', category: 'state', tone: 'danger' })
+  }
+  return items
+})
+
+const selectedTimelineGroups = computed<DetailTimelineGroup[]>(() => {
+  const item = selectedLog.value
+  if (!item) return []
+  const maxMs = Math.max(...detailTimelineSteps.map((step) => metricValueFromLog(item, step.key)), 0)
+  if (maxMs <= 0) return []
+  const groups = new Map<string, DetailTimelineStep[]>()
+  detailTimelineSteps.forEach((step) => {
+    const valueMs = metricValueFromLog(item, step.key)
+    if (valueMs <= 0) return
+    const width = Math.max(3, Math.round((valueMs / maxMs) * 100))
+    const tone = timelineStepTone(step.key, valueMs, maxMs)
+    const category = timelineStepCategory(step.key, step.group)
+    const groupSteps = groups.get(step.group) || []
+    groupSteps.push({
+      ...step,
+      valueMs,
+      value: formatTimelineMs(valueMs),
+      tone,
+      category,
+      statusLabel: timelineStatusLabel(tone),
+      barStyle: { width: `${width}%` },
+      time: eventTimeForMetric(item, step.key),
+      note: timelineStepNote(item, step),
+    })
+    groups.set(step.group, groupSteps)
+  })
+  return detailTimelineGroupOrder
+    .map((name) => ({ name, steps: groups.get(name) || [] }))
+    .filter((group) => group.steps.length > 0)
+})
+
+const timelineDetailsAutoExpanded = computed(() => {
+  const item = selectedLog.value
+  if (!item) return false
+  if (isFailed(item)) return true
+  if (Number(item.durationMs || 0) >= 180_000) return true
+  if (metricValueFromLog(item, 'stream_error_ms') > 0) return true
+  return selectedBottleneckStep.value?.tone === 'danger'
+})
+const timelineDetailsVisible = computed(() => timelineDetailsExpanded.value || timelineDetailsAutoExpanded.value)
+
 const selectedPrimaryDetailFields = computed<DetailField[]>(() => {
   const item = selectedLog.value
   if (!item) return []
   return compactDetailFields([
-    { label: '状态', value: statusLabel(item) },
+    { label: '请求 ID', value: rawDetailValue(item, 'call_id') || item.id, copyable: true },
     { label: '接口', value: item.endpoint, copyable: true },
     { label: '模型', value: item.model, copyable: true },
-    { label: '耗时', value: durationDetailValue(item) },
-    { label: '时间', value: timeRangeDetailValue(item) },
     { label: '账号', value: item.accountEmail, copyable: true },
-    { label: '密钥', value: [item.keyName, item.keyId].filter(Boolean).join(' / '), copyable: true },
-  ], { keepStatus: true })
+    { label: '密钥', value: maskKeyLabel([item.keyName, item.keyId].filter(Boolean).join(' / ')) },
+    { label: '出口', value: egressDetailValue(item) },
+    { label: '会话 ID', value: item.conversationId, copyable: true },
+    { label: '时间', value: timeRangeDetailValue(item), wide: true },
+  ])
 })
 
 const selectedDiagnosticDetailFields = computed<DetailField[]>(() => {
   const item = selectedLog.value
   if (!item) return []
-  const shouldShowBooleans = isFailed(item) || Boolean(item.errorCode || item.error || item.stage || item.reason)
+  if (!hasDiagnosticSignal(item)) return []
+  const shouldShowBooleans = isFailed(item) || isLimited(item) || Boolean(item.errorCode || item.error || item.reason)
   return compactDetailFields([
     { label: '状态码', value: item.statusCode },
-    { label: '会话 ID', value: item.conversationId, copyable: true },
     { label: '错误码', value: item.errorCode, copyable: true },
-    { label: '阶段', value: item.stage, copyable: true },
+    { label: '阶段', value: diagnosticStageValue(item), copyable: true },
     { label: '原因', value: item.reason, copyable: true },
     { label: '上游错误', value: item.upstreamErrorType, copyable: true },
     { label: '上游请求 ID', value: item.upstreamRequestId, copyable: true },
@@ -881,6 +1195,211 @@ function statusTone(item: LogRow): 'success' | 'danger' | 'warning' | 'muted' {
   return 'muted'
 }
 
+function detailRecord(item: LogRow): Record<string, any> {
+  const detail = item.raw.detail
+  return detail && typeof detail === 'object' ? detail : {}
+}
+
+function monitorRecord(item: LogRow): Record<string, any> {
+  const monitor = detailRecord(item).monitor
+  return monitor && typeof monitor === 'object' ? monitor : {}
+}
+
+function rawDetailValue(item: LogRow, key: string): string {
+  return formatInlineValue(detailRecord(item)[key])
+}
+
+function rawMonitorValue(item: LogRow, key: string): string {
+  return formatInlineValue(monitorRecord(item)[key])
+}
+
+function isErrorStatusCode(value: string): boolean {
+  const statusCode = Number(cleanString(value))
+  return Number.isFinite(statusCode) && statusCode >= 400
+}
+
+function diagnosticStageValue(item: LogRow): string {
+  const stage = item.stage || rawMonitorValue(item, 'stage_label') || rawMonitorValue(item, 'stage')
+  const normalized = cleanString(stage).toLowerCase()
+  if (isSuccess(item) && ['success', 'completed', 'complete', 'done', '完成'].includes(normalized)) return ''
+  return stage
+}
+
+function hasDiagnosticSignal(item: LogRow): boolean {
+  return Boolean(
+    isFailed(item)
+      || isLimited(item)
+      || isErrorStatusCode(item.statusCode)
+      || item.errorCode
+      || item.error
+      || item.reason
+      || item.upstreamErrorType
+      || item.upstreamRequestId
+      || item.blocked === '是'
+      || item.toolInvoked === '是'
+      || diagnosticStageValue(item),
+  )
+}
+
+function formatInlineValue(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+  if (Array.isArray(value)) return value.map(formatInlineValue).filter(Boolean).join(' · ')
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined && item !== null && item !== '')
+    if (!entries.length) return ''
+    const primitive = entries.every(([, item]) => !item || ['string', 'number', 'boolean'].includes(typeof item))
+    if (primitive && entries.length <= 8) {
+      return entries.map(([key, item]) => `${key}: ${formatInlineValue(item)}`).join(' · ')
+    }
+    try {
+      return JSON.stringify(value, null, 2)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value).trim()
+}
+
+function formatTimelineMs(value: unknown): string {
+  const ms = Number(value || 0)
+  if (!Number.isFinite(ms) || ms <= 0) return '-'
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`
+  if (ms >= 10_000) return `${(ms / 1000).toFixed(1)}s`
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
+  return `${Math.round(ms)}ms`
+}
+
+function metricFromRecord(record: unknown, key: string): number {
+  if (!record || typeof record !== 'object') return 0
+  const raw = (record as Record<string, unknown>)[key]
+  const parsed = Number(raw || 0)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+}
+
+function metricValueFromLog(item: LogRow, key: string): number {
+  const detail = detailRecord(item)
+  const monitor = monitorRecord(item)
+  const values = [
+    metricFromRecord(detail.perf, key),
+    metricFromRecord(detail.metrics, key),
+    metricFromRecord(monitor.metrics, key),
+  ]
+  const images = monitor.images
+  if (images && typeof images === 'object') {
+    Object.values(images as Record<string, any>).forEach((image) => {
+      if (image && typeof image === 'object') values.push(metricFromRecord(image.metrics, key))
+    })
+  }
+  return Math.max(...values, 0)
+}
+
+function timelineStepCategory(key: string, group: string): DetailTimelineCategory {
+  if (group === '入口与账号') return 'entry'
+  if (group === '上游准备') return 'prepare'
+  if (key === 'conversation_stream_ms') return 'upstream'
+  if (key === 'resolve_ms') return 'resolve'
+  if (key === 'download_ms') return 'download'
+  if (key === 'retry_wait_ms') return 'retry'
+  return 'response'
+}
+
+function timelineStepTone(key: string, valueMs: number, _maxMs: number): DetailTone {
+  if (key === 'stream_error_ms') return 'danger'
+  const threshold = timelineWarningThresholdMs[key] ?? defaultTimelineWarningThresholdMs
+  if (valueMs >= threshold) return 'warning'
+  return 'info'
+}
+
+function timelineStatusLabel(tone: DetailTone): string {
+  if (tone === 'danger') return '异常'
+  if (tone === 'warning') return '慢'
+  if (tone === 'success') return '完成'
+  if (tone === 'info') return '记录'
+  return '记录'
+}
+
+function durationTone(valueMs: number): DetailTone {
+  if (valueMs >= 120_000) return 'warning'
+  return 'muted'
+}
+
+function eventTimeForMetric(item: LogRow, metricKey: string): string {
+  const events = monitorRecord(item).events
+  if (!Array.isArray(events)) return ''
+  const matched = events.find((event) => event && typeof event === 'object' && Number((event as Record<string, unknown>)[metricKey] || 0) > 0)
+  return formatInlineValue((matched as Record<string, unknown> | undefined)?.time)
+}
+
+function requestShapeImageSummary(item: LogRow): string {
+  const shape = detailRecord(item).request_shape
+  if (!shape || typeof shape !== 'object') return ''
+  const record = shape as Record<string, unknown>
+  const pairs: Array<[string, string]> = [
+    ['input_image_parts', '输入图'],
+    ['image_url_parts', '图链'],
+    ['image_parts', '图片块'],
+    ['data_url_images', 'base64'],
+    ['remote_image_urls', '远程图'],
+    ['literal_image_placeholders', '占位图'],
+  ]
+  const parts = pairs
+    .map(([key, label]) => [label, Number(record[key] || 0)] as const)
+    .filter(([, count]) => Number.isFinite(count) && count > 0)
+    .map(([label, count]) => `${label} ${count}`)
+  return parts.join(' · ')
+}
+
+function timelineStepNote(item: LogRow, step: DetailTimelineStepConfig): string {
+  const parts = [step.hint || '']
+  if (step.key === 'upload_ms') parts.push(requestShapeImageSummary(item))
+  if (step.key === 'resolve_ms' && item.imageUrls.length) parts.push(`结果图 ${item.imageUrls.length}`)
+  if (step.key === 'download_ms' && item.imageUrls.length) parts.push(`下载 ${item.imageUrls.length} 张`)
+  return parts.filter(Boolean).join(' · ')
+}
+
+function maskEmail(value: string): string {
+  const email = cleanString(value)
+  if (!email || !email.includes('@')) return email
+  const [name, domain] = email.split('@')
+  const masked = name.length <= 2 ? `${name.slice(0, 1)}*` : `${name.slice(0, 2)}***${name.slice(-1)}`
+  return `${masked}@${domain}`
+}
+
+function maskKeyLabel(value: string): string {
+  return cleanString(value).replace(/sk-[A-Za-z0-9_-]{6,}/g, (token) => `${token.slice(0, 5)}***${token.slice(-4)}`)
+}
+
+function proxySourceLabel(value: unknown): string {
+  const source = cleanString(value)
+  if (!source) return ''
+  if (source.includes('account_group')) return '账号组'
+  if (source.includes('account')) return '账号'
+  if (source.includes('global')) return '全局'
+  if (source.includes('runtime_resource')) return '资源代理'
+  if (source.includes('runtime')) return 'Runtime'
+  if (source.includes('explicit')) return '指定'
+  if (source.includes('direct')) return '直连'
+  return source
+}
+
+function egressModeLabel(value: unknown): string {
+  const mode = cleanString(value)
+  if (!mode) return ''
+  if (mode === 'direct') return '直连'
+  if (mode === 'single_proxy') return '单代理'
+  if (mode === 'proxy_group') return '代理组'
+  return mode
+}
+
+function egressDetailValue(item: LogRow): string {
+  const source = item.proxySource || rawMonitorValue(item, 'proxy_source')
+  const hash = item.proxyHash || rawMonitorValue(item, 'proxy_hash')
+  const label = proxySourceLabel(source)
+  if (!label) return ''
+  if (hash && hash !== 'direct') return `${label} ${hash}`
+  return label
+}
+
 function hasDetailValue(value: string): boolean {
   const clean = cleanString(value)
   return Boolean(clean && clean !== '-' && clean.toLowerCase() !== 'null' && clean.toLowerCase() !== 'undefined')
@@ -892,14 +1411,6 @@ function compactDetailFields(fields: Array<DetailField | null>, options: { keepS
     if (options.keepStatus && field.label === '状态') return true
     return hasDetailValue(field.value)
   })
-}
-
-function durationDetailValue(item: LogRow): string {
-  const raw = cleanString(item.durationMs)
-  const formatted = formatDuration(raw)
-  if (!raw) return ''
-  if (!formatted || formatted === raw) return raw
-  return `${formatted} (${raw}ms)`
 }
 
 function timeRangeDetailValue(item: LogRow): string {
@@ -1403,6 +1914,10 @@ watch(activeLogView, () => {
   scheduleAutoRefresh()
 })
 
+watch(selectedLog, () => {
+  timelineDetailsExpanded.value = false
+})
+
 watch(
   () => [
     runtimeFilters.level,
@@ -1463,6 +1978,64 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
 }
 
+.log-detail-summary {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, hsl(var(--muted) / 0.34), transparent 72%),
+    hsl(var(--card));
+  padding: 12px 14px;
+}
+
+.log-detail-summary__main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.log-detail-summary__copy {
+  min-width: 0;
+}
+
+.log-detail-summary__title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-detail-summary__title {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: hsl(var(--foreground));
+}
+
+.log-detail-summary__duration {
+  display: flex;
+  min-width: 5.5rem;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  text-align: right;
+}
+
+.log-detail-summary__duration span {
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+}
+
+.log-detail-summary__duration strong {
+  font-size: 20px;
+  font-weight: 650;
+  color: hsl(var(--foreground));
+}
+
 .detail-field-stack {
   display: flex;
   flex-direction: column;
@@ -1499,9 +2072,427 @@ onBeforeUnmount(() => {
   gap: 6px;
 }
 
+.detail-field-grid__item--wide {
+  grid-column: 1 / -1;
+}
+
+.detail-field-grid > .detail-field-grid__item--wide.detail-field-card--row {
+  grid-template-columns: 4.8rem minmax(0, 1fr);
+}
+
+.detail-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--card));
+  padding: 14px;
+}
+
+.detail-timeline__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.detail-timeline__title {
+  font-size: 13px;
+  font-weight: 650;
+  color: hsl(var(--foreground));
+}
+
+.detail-timeline__header p {
+  margin-top: 3px;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.detail-timeline-segments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.detail-timeline-segments__track {
+  display: flex;
+  height: 28px;
+  min-height: 28px;
+  gap: 2px;
+  overflow: hidden;
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.72);
+  padding: 3px;
+}
+
+.detail-timeline-segments__segment {
+  position: relative;
+  display: flex;
+  min-width: 6px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: hsl(var(--muted-foreground) / 0.45);
+  color: rgb(255 255 255 / 0.96);
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.detail-timeline-segments__segment + .detail-timeline-segments__segment {
+  border-left: 0;
+}
+
+.detail-timeline-segments__segment span,
+.detail-timeline-segments__segment strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.detail-timeline-segments__segment span {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.detail-timeline-segments__segment strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.detail-timeline-segments__segment--muted,
+.detail-timeline-segments__segment--info {
+  background: hsl(var(--muted-foreground) / 0.48);
+}
+
+.detail-timeline-segments__segment--compact {
+  padding: 0;
+}
+
+.detail-timeline-segments__segment--compact span,
+.detail-timeline-segments__segment--compact strong {
+  display: none;
+}
+
+.detail-timeline-segments__segment--entry {
+  background: rgb(96 165 250 / 0.74);
+}
+
+.detail-timeline-segments__segment--prepare {
+  background: rgb(20 184 166 / 0.72);
+}
+
+.detail-timeline-segments__segment--upstream {
+  background: rgb(99 102 241 / 0.72);
+}
+
+.detail-timeline-segments__segment--resolve {
+  background: rgb(245 158 11 / 0.58);
+  color: rgb(74 45 0);
+}
+
+.detail-timeline-segments__segment--download {
+  background: rgb(34 197 94 / 0.62);
+  color: rgb(4 52 24);
+}
+
+.detail-timeline-segments__segment--retry {
+  background: rgb(249 115 22 / 0.66);
+  color: rgb(68 33 0);
+}
+
+.detail-timeline-segments__segment--response {
+  background: hsl(var(--muted-foreground) / 0.46);
+}
+
+.detail-timeline-segments__segment--warning {
+  background: rgb(245 158 11 / 0.84);
+  color: rgb(74 45 0);
+}
+
+.detail-timeline-segments__segment--danger {
+  background: rgb(244 63 94 / 0.86);
+  color: rgb(255 255 255 / 0.96);
+}
+
+.detail-timeline-segments__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.detail-timeline-segments__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline-segments__legend-item i {
+  height: 7px;
+  width: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: hsl(var(--muted-foreground) / 0.54);
+}
+
+.detail-timeline-segments__legend-item--entry i {
+  background: rgb(96 165 250);
+}
+
+.detail-timeline-segments__legend-item--prepare i {
+  background: rgb(20 184 166);
+}
+
+.detail-timeline-segments__legend-item--upstream i {
+  background: rgb(99 102 241);
+}
+
+.detail-timeline-segments__legend-item--resolve i {
+  background: rgb(245 158 11);
+}
+
+.detail-timeline-segments__legend-item--download i {
+  background: rgb(34 197 94);
+}
+
+.detail-timeline-segments__legend-item--retry i {
+  background: rgb(249 115 22);
+}
+
+.detail-timeline-segments__legend-item--response i {
+  background: hsl(var(--muted-foreground));
+}
+
+.detail-timeline-segments__legend-item--state i {
+  background: hsl(var(--muted-foreground));
+}
+
+.detail-timeline-segments__legend-item--warning i {
+  background: rgb(245 158 11);
+}
+
+.detail-timeline-segments__legend-item--danger i {
+  background: rgb(244 63 94);
+}
+
+.detail-timeline__empty {
+  border: 1px dashed hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.25);
+  padding: 14px;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-timeline__details {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-timeline__toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.22);
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__toggle:hover {
+  background: hsl(var(--muted) / 0.34);
+  color: hsl(var(--foreground));
+}
+
+.detail-timeline__toggle span {
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.detail-timeline__toggle strong {
+  font-weight: 600;
+}
+
+.detail-timeline__group {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  gap: 12px;
+}
+
+.detail-timeline__group-title {
+  padding-top: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__steps {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.detail-timeline__step {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.5rem;
+  align-items: start;
+  gap: 12px;
+}
+
+.detail-timeline__step-main {
+  min-width: 0;
+}
+
+.detail-timeline__step-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.detail-timeline__step-label {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.detail-timeline__step-time {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__bar {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: hsl(var(--muted) / 0.48);
+  margin-top: 7px;
+}
+
+.detail-timeline__bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+.detail-timeline__step--entry .detail-timeline__bar span {
+  background: rgb(96 165 250 / 0.78);
+}
+
+.detail-timeline__step--prepare .detail-timeline__bar span {
+  background: rgb(20 184 166 / 0.76);
+}
+
+.detail-timeline__step--upstream .detail-timeline__bar span {
+  background: rgb(99 102 241 / 0.76);
+}
+
+.detail-timeline__step--resolve .detail-timeline__bar span {
+  background: rgb(245 158 11 / 0.62);
+}
+
+.detail-timeline__step--download .detail-timeline__bar span {
+  background: rgb(34 197 94 / 0.68);
+}
+
+.detail-timeline__step--retry .detail-timeline__bar span {
+  background: rgb(249 115 22 / 0.72);
+}
+
+.detail-timeline__step--response .detail-timeline__bar span {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+.detail-timeline__step--warning .detail-timeline__bar span {
+  background: rgb(245 158 11 / 0.84);
+}
+
+.detail-timeline__step--danger .detail-timeline__bar span {
+  background: rgb(244 63 94 / 0.82);
+}
+
+.detail-timeline__step-note {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-timeline__step-value {
+  padding-top: 1.6rem;
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  font-weight: 650;
+  color: hsl(var(--foreground));
+}
+
 @media (min-width: 640px) {
   .detail-field-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .log-detail-summary__main,
+  .detail-timeline__header {
+    flex-direction: column;
+  }
+
+  .log-detail-summary__duration {
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .detail-timeline__group {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .detail-timeline__step {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-timeline-segments__track {
+    height: 22px;
+    min-height: 22px;
+  }
+
+  .detail-timeline__step-value {
+    padding-top: 0;
+    text-align: left;
   }
 }
 
