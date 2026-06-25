@@ -131,19 +131,18 @@
       </div>
     </PagePanel>
 
-    <div class="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,0.72fr)]">
+    <div class="grid items-stretch gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,0.72fr)]">
       <PagePanel flush class="monitor-paired-panel">
-        <div class="p-4">
-          <PanelHeader title="最近完成" align="start">
-            <template #copy>
-              <p class="mt-1 text-xs text-muted-foreground">
-                最近完成的图片相关调用，窗口保存在进程内存中。
-              </p>
-            </template>
-            <template #actions>
-              <MetaChip size="xs" tone="muted">{{ completedWindowText }}</MetaChip>
-            </template>
-          </PanelHeader>
+        <div class="monitor-paired-header">
+          <div class="monitor-paired-header__copy">
+            <p class="ui-section-title">最近完成</p>
+            <p class="monitor-paired-header__desc">
+              最近完成的图片相关调用，窗口保存在进程内存中。
+            </p>
+          </div>
+          <div class="monitor-paired-header__meta">
+            <MetaChip size="xs" tone="muted">{{ completedWindowText }}</MetaChip>
+          </div>
         </div>
         <div v-if="recentRows.length" class="monitor-paired-body">
           <TableShell>
@@ -184,14 +183,16 @@
       </PagePanel>
 
       <PagePanel flush class="monitor-paired-panel">
-        <div class="p-4">
-          <PanelHeader title="慢请求" align="start">
-            <template #copy>
-              <p class="mt-1 text-xs text-muted-foreground">
-                按等待入口、等待账号、等待出口、上游生成和上游断流综合排序。
-              </p>
-            </template>
-          </PanelHeader>
+        <div class="monitor-paired-header">
+          <div class="monitor-paired-header__copy">
+            <p class="ui-section-title">慢请求</p>
+            <p class="monitor-paired-header__desc">
+              按等待入口、等待账号、等待出口、上游生成和上游断流综合排序。
+            </p>
+          </div>
+          <div class="monitor-paired-header__meta">
+            <MetaChip size="xs" tone="muted">慢 {{ slowRows.length }}</MetaChip>
+          </div>
         </div>
         <div v-if="slowRows.length" class="monitor-paired-body space-y-2 px-4 pb-4">
           <div
@@ -749,14 +750,59 @@ onBeforeUnmount(() => {
 
 .monitor-paired-panel {
   display: flex;
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
   flex-direction: column;
 }
 
+.monitor-paired-header {
+  display: flex;
+  min-height: 92px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+}
+
+.monitor-paired-header__copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.monitor-paired-header__desc {
+  margin-top: 6px;
+  max-width: 48rem;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.monitor-paired-header__meta {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
 .monitor-paired-body {
-  height: clamp(360px, calc(100vh - 330px), 560px);
+  height: clamp(360px, calc(100vh - 350px), 560px);
   min-height: 0;
   overflow-y: auto;
+}
+
+@media (max-width: 768px) {
+  .monitor-paired-header {
+    min-height: auto;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .monitor-paired-header__meta {
+    justify-content: flex-start;
+    padding-top: 0;
+  }
 }
 
 </style>
