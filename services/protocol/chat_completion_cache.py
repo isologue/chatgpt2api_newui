@@ -17,6 +17,7 @@ CACHEABLE_TEXT_KEYS = {
     "metadata",
     "model",
     "presence_penalty",
+    "reasoning",
     "reasoning_effort",
     "response_format",
     "seed",
@@ -25,6 +26,7 @@ CACHEABLE_TEXT_KEYS = {
     "tool_choice",
     "tools",
     "top_p",
+    "thinking_effort",
     "user",
 }
 

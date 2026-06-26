@@ -21,6 +21,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
+from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -475,9 +476,15 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> Dict[str, Any]:
+    def _conversation_payload(
+            self,
+            messages: list[Dict[str, Any]],
+            model: str,
+            timezone: str,
+            thinking_effort: str = "",
+    ) -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
-        return {
+        payload = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
@@ -507,6 +514,10 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        normalized_effort = normalize_thinking_effort(thinking_effort)
+        if normalized_effort:
+            payload["thinking_effort"] = normalized_effort
+        return payload
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -2480,6 +2491,7 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            thinking_effort: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
@@ -2490,7 +2502,7 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone)
+        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),

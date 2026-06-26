@@ -21,6 +21,7 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.reasoning import thinking_effort_from_body
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -96,11 +97,16 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(
+    backend,
+    messages: list[dict[str, Any]],
+    model: str,
+    thinking_effort: str = "",
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -273,22 +279,24 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         model, messages = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
+        thinking_effort = thinking_effort_from_body(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
     model, messages = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
+    thinking_effort = thinking_effort_from_body(body)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
         lambda: completion_response(
             model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
+            collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
             messages=messages,
         ),
     )
