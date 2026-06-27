@@ -104,11 +104,22 @@ METRIC_LABELS = {
     "stream_first_queue_ms": "首包线程等待",
     "account_wait_ms": "等待账号",
     "egress_wait_ms": "等待出口",
+    "egress_acquire_ms": "出口租约",
     "upload_ms": "图片上传",
     "bootstrap_ms": "上游初始化",
     "requirements_ms": "获取令牌",
     "prepare_conversation_ms": "准备会话",
     "generation_start_ms": "启动生成",
+    "http_dns_ms": "HTTP DNS",
+    "http_tcp_ms": "HTTP TCP",
+    "http_tls_ms": "HTTP TLS",
+    "http_wait_ms": "HTTP 等待",
+    "http_ttfb_ms": "HTTP 首包",
+    "http_total_ms": "HTTP 总耗时",
+    "sse_first_event_ms": "SSE 首事件",
+    "sse_max_gap_ms": "SSE 最大空窗",
+    "sse_last_gap_ms": "SSE 收尾空窗",
+    "sse_stream_ms": "SSE 流耗时",
     "conversation_stream_ms": "上游生成中",
     "stream_error_ms": "上游断流",
     "resolve_ms": "图片解析",
@@ -338,7 +349,7 @@ class RealtimeMonitorService:
             record["conversation_id"] = str(data.get("conversation_id") or "")
         if data.get("model") and not record.get("model"):
             record["model"] = str(data.get("model") or "")
-        for key in ("proxy_source", "proxy_hash", "egress_mode", "local_reason"):
+        for key in ("proxy_source", "proxy_hash", "egress_mode", "egress_key", "egress_label", "image_egress_limit", "local_reason"):
             if key in data:
                 record[key] = str(data.get(key) or "")
         if "has_proxy" in data:
@@ -359,7 +370,7 @@ class RealtimeMonitorService:
                 image["returned_result"] = bool(data.get("returned_result"))
             if data.get("returned_message") is not None:
                 image["returned_message"] = bool(data.get("returned_message"))
-            for key in ("proxy_source", "proxy_hash", "egress_mode", "local_reason"):
+            for key in ("proxy_source", "proxy_hash", "egress_mode", "egress_key", "egress_label", "image_egress_limit", "local_reason"):
                 if key in data:
                     image[key] = str(data.get(key) or "")
             if "has_proxy" in data:
@@ -384,11 +395,16 @@ class RealtimeMonitorService:
                 "stream_first_queue_ms",
                 "account_wait_ms",
                 "egress_wait_ms",
+                "egress_acquire_ms",
                 "upload_ms",
                 "bootstrap_ms",
                 "requirements_ms",
                 "prepare_conversation_ms",
                 "generation_start_ms",
+                "http_ttfb_ms",
+                "http_wait_ms",
+                "sse_first_event_ms",
+                "sse_max_gap_ms",
                 "conversation_stream_ms",
                 "stream_error_ms",
                 "resolve_ms",
@@ -586,6 +602,17 @@ class RealtimeMonitorService:
                 "requirements_ms",
                 "prepare_conversation_ms",
                 "generation_start_ms",
+                "http_dns_ms",
+                "http_tcp_ms",
+                "http_tls_ms",
+                "http_wait_ms",
+                "http_ttfb_ms",
+                "http_total_ms",
+                "sse_first_event_ms",
+                "sse_max_gap_ms",
+                "sse_last_gap_ms",
+                "sse_stream_ms",
+                "sse_event_count",
                 "conversation_stream_ms",
                 "stream_error_ms",
                 "resolve_ms",

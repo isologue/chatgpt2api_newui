@@ -16,6 +16,22 @@
           <StateBadge :tone="autoRefresh ? 'success' : 'muted'" shape="rounded">
             {{ autoRefresh ? '自动刷新' : '已暂停' }}
           </StateBadge>
+          <label class="flex items-center gap-2 text-xs text-muted-foreground">
+            <span class="whitespace-nowrap">间隔</span>
+            <Input
+              :model-value="String(refreshIntervalSeconds)"
+              type="number"
+              min="1"
+              max="300"
+              step="1"
+              root-class="w-16"
+              @update:model-value="setRefreshIntervalInput"
+              @blur="applyRefreshInterval()"
+              @change="applyRefreshInterval()"
+              @keyup.enter="applyRefreshInterval()"
+            />
+            <span class="whitespace-nowrap">秒</span>
+          </label>
           <Button size="sm" variant="outline" :disabled="isLoading" @click="loadMonitor(false)">
             {{ isLoading ? '刷新中...' : '立即刷新' }}
           </Button>
@@ -35,7 +51,7 @@
             <p class="text-sm font-semibold text-foreground">{{ group.title }}</p>
             <p class="text-xs text-muted-foreground">{{ group.meta }}</p>
           </div>
-          <div class="mt-3 grid gap-2 sm:grid-cols-2 2xl:grid-cols-3">
+          <div class="mt-3 grid gap-2 sm:grid-cols-2 2xl:grid-cols-4">
             <div
               v-for="item in group.items"
               :key="`${group.key}-${item.key}`"
@@ -277,7 +293,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Button } from 'nanocat-ui'
+import { Button, Input } from 'nanocat-ui'
 import { monitorApi, type RealtimeMonitorEvent, type RealtimeMonitorRecord, type RealtimeMonitorResponse } from '@/api/monitor'
 import { MetaChip, PagePanel, PanelHeader, StateBadge, StateBlock, TableShell } from '@/components/ai'
 
@@ -287,7 +303,13 @@ const monitorData = ref<RealtimeMonitorResponse | null>(null)
 const isLoading = ref(false)
 const loadError = ref('')
 const autoRefresh = ref(true)
+const REFRESH_INTERVAL_STORAGE_KEY = 'chatgpt2api_monitor_refresh_interval_secs'
+const DEFAULT_REFRESH_INTERVAL_SECONDS = 5
+const MIN_REFRESH_INTERVAL_SECONDS = 1
+const MAX_REFRESH_INTERVAL_SECONDS = 300
+const refreshIntervalSeconds = ref(readStoredRefreshInterval())
 let refreshTimer: number | undefined
+let refreshRunId = 0
 
 const summary = computed(() => monitorData.value?.summary)
 const activeRows = computed(() => monitorData.value?.active || [])
@@ -309,14 +331,6 @@ const activeStageItems = computed(() =>
 
 const entryQueueMetricKeys = ['handler_queue_ms', 'stream_first_queue_ms'] as const
 const entryAccountMetricKeys = ['handler_queue_ms', 'stream_first_queue_ms', 'account_wait_ms', 'egress_wait_ms'] as const
-const upstreamPrepareMetrics = [
-  { key: 'upload_ms', label: '图片上传' },
-  { key: 'bootstrap_ms', label: '上游初始化' },
-  { key: 'requirements_ms', label: '令牌获取' },
-  { key: 'prepare_conversation_ms', label: '会话准备' },
-  { key: 'generation_start_ms', label: '启动生成' },
-] as const
-const upstreamPrepareMetricKeys = upstreamPrepareMetrics.map(item => item.key)
 
 const diagnosticGroups = computed(() => {
   const data = summary.value
@@ -324,49 +338,51 @@ const diagnosticGroups = computed(() => {
   const bottleneckValue = Number(data?.bottleneck?.value_ms || 0)
   const localBusy = summary.value?.slow_counts?.local_reject_or_busy ?? 0
   const entryAccountTotal = sumMetricFromMap(p95, entryAccountMetricKeys)
-  const upstreamPrepareTotal = sumMetricFromMap(p95, upstreamPrepareMetricKeys)
-  const upstreamPrepareSlowest = topMetricFromMap(p95, upstreamPrepareMetrics)
-  const upstreamTotalReference = Math.max(Number(data?.p95_duration_ms || 0), Number(p95.total_ms || 0))
+  const httpConnectTotal = sumMetricFromMap(p95, ['http_dns_ms', 'http_tcp_ms', 'http_tls_ms'])
   return [
     {
       key: 'overview',
       title: '实时概览',
-      meta: completedWindowText.value,
+      meta: '窗口、成功率、瓶颈',
       items: [
         { key: 'active', label: '活跃请求', value: data?.active ?? 0, meta: `线程 ${threadTokens.value}`, valueClass: 'text-foreground' },
         { key: 'completed', label: '完成窗口', value: data?.completed ?? 0, meta: completedWindowText.value, valueClass: 'text-foreground' },
-        { key: 'success', label: '成功率', value: `${data?.success_rate ?? 0}%`, meta: `失败 ${data?.failed ?? 0}`, valueClass: 'text-emerald-600 dark:text-emerald-400' },
-        { key: 'average', label: '平均耗时', value: formatMs(data?.avg_duration_ms), meta: `P95 ${formatMs(data?.p95_duration_ms)}`, valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'entry_p95', label: '入口等待 P95', value: formatMs(maxMetricFromMap(p95, entryQueueMetricKeys)), meta: `慢 ${data?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'bottleneck', label: '当前瓶颈', value: data?.bottleneck?.label || '-', meta: bottleneckValue > 0 ? formatMs(bottleneckValue) : '', valueClass: 'text-foreground' },
+        { key: 'success', label: '成功率', value: `${data?.success_rate ?? 0}%`, meta: `成功 ${data?.success ?? 0}`, valueClass: 'text-emerald-600 dark:text-emerald-400' },
+        { key: 'failed', label: '失败数', value: data?.failed ?? 0, meta: '窗口内失败', valueClass: Number(data?.failed || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'average', label: '平均耗时', value: formatMs(data?.avg_duration_ms), meta: '窗口均值', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'p95', label: 'P95 耗时', value: formatMs(data?.p95_duration_ms), meta: '慢请求参考', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'bottleneck', label: '当前瓶颈', value: data?.bottleneck?.label || '-', meta: 'P95 最大阶段', valueClass: 'text-foreground' },
+        { key: 'bottleneck_ms', label: '瓶颈耗时', value: formatMs(bottleneckValue), meta: '阶段 P95', valueClass: 'text-foreground' },
       ],
     },
     {
       key: 'account',
-      title: '入口与账号',
-      meta: '线程、账号池、出口',
+      title: '入口、账号与出口',
+      meta: '本地线程、账号池、代理出口',
       items: [
         { key: 'handler_queue_ms', label: '入口线程等待', value: formatMs(p95.handler_queue_ms), meta: 'run_in_threadpool', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'stream_first_queue_ms', label: '首包线程等待', value: formatMs(p95.stream_first_queue_ms), meta: '读取首个事件', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'account_wait_ms', label: '账号等待', value: formatMs(p95.account_wait_ms), meta: '账号池筛选', valueClass: 'text-cyan-600 dark:text-cyan-400' },
         { key: 'egress_wait_ms', label: '出口等待', value: formatMs(p95.egress_wait_ms), meta: activeEgressMeta(), valueClass: 'text-teal-600 dark:text-teal-400' },
+        { key: 'egress_acquire_ms', label: '出口租约', value: formatMs(p95.egress_acquire_ms), meta: '代理节点并发', valueClass: 'text-teal-600 dark:text-teal-400' },
         { key: 'entry_account_total_ms', label: '入口账号合计', value: formatMs(entryAccountTotal), meta: '入口 + 首包 + 账号 + 出口', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'entry_p95', label: '入口等待 P95', value: formatMs(maxMetricFromMap(p95, entryQueueMetricKeys)), meta: `慢 ${data?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'local_busy', label: '本地拒绝/繁忙', value: `${localBusy}`, meta: '无号 / 并发 / 策略', valueClass: 'text-foreground' },
       ],
     },
     {
       key: 'upstream_prepare',
-      title: '上游准备',
-      meta: '上传、初始化、令牌',
+      title: '上游准备与 HTTP',
+      meta: '上传、令牌、建连、首包',
       items: [
         { key: 'upload_ms', label: '图片上传', value: formatMs(p95.upload_ms), meta: '参考图上传', valueClass: 'text-foreground' },
         { key: 'bootstrap_ms', label: '上游初始化', value: formatMs(p95.bootstrap_ms), meta: 'ChatGPT 会话', valueClass: 'text-foreground' },
         { key: 'requirements_ms', label: '令牌获取', value: formatMs(p95.requirements_ms), meta: 'requirements / token', valueClass: 'text-foreground' },
         { key: 'prepare_conversation_ms', label: '会话准备', value: formatMs(p95.prepare_conversation_ms), meta: '准备图片会话', valueClass: 'text-foreground' },
         { key: 'generation_start_ms', label: '启动生成', value: formatMs(p95.generation_start_ms), meta: '提交上游请求', valueClass: 'text-foreground' },
-        { key: 'upstream_prepare_total_ms', label: '准备合计', value: formatMs(upstreamPrepareTotal), meta: '上传到启动生成', valueClass: 'text-foreground' },
-        { key: 'upstream_prepare_ratio', label: '准备占比', value: ratioText(upstreamPrepareTotal, upstreamTotalReference), meta: '相对总 P95', valueClass: 'text-foreground' },
-        { key: 'upstream_prepare_slowest', label: '最慢准备项', value: upstreamPrepareSlowest.label, meta: upstreamPrepareSlowest.value > 0 ? formatMs(upstreamPrepareSlowest.value) : '', valueClass: 'text-foreground' },
+        { key: 'http_connect_ms', label: 'HTTP 建连', value: formatMs(httpConnectTotal), meta: 'DNS + TCP + TLS', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_wait_ms', label: 'HTTP 等待', value: formatMs(p95.http_wait_ms), meta: '发出请求到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_ttfb_ms', label: 'HTTP 首包', value: formatMs(p95.http_ttfb_ms), meta: '请求开始到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
       ],
     },
     {
@@ -374,12 +390,12 @@ const diagnosticGroups = computed(() => {
       title: '生成与结果',
       meta: '流、轮询、下载',
       items: [
+        { key: 'sse_first_event_ms', label: 'SSE 首事件', value: formatMs(p95.sse_first_event_ms), meta: '首个 data 事件', valueClass: 'text-indigo-600 dark:text-indigo-400' },
+        { key: 'sse_max_gap_ms', label: 'SSE 最大空窗', value: formatMs(p95.sse_max_gap_ms), meta: '两次事件最大间隔', valueClass: 'text-indigo-600 dark:text-indigo-400' },
         { key: 'conversation_stream_ms', label: '上游生成', value: formatMs(p95.conversation_stream_ms), meta: '会话流响应', valueClass: 'text-emerald-600 dark:text-emerald-400' },
         { key: 'stream_error_ms', label: '上游断流', value: formatMs(p95.stream_error_ms), meta: 'HTTP2 / SSE', valueClass: 'text-slate-600 dark:text-slate-300' },
         { key: 'resolve_ms', label: '图片解析', value: formatMs(p95.resolve_ms), meta: 'conversation / file', valueClass: 'text-emerald-600 dark:text-emerald-400' },
         { key: 'download_ms', label: '图片下载', value: formatMs(p95.download_ms), meta: '下载并返回', valueClass: 'text-foreground' },
-        { key: 'retry_wait_ms', label: '重试等待', value: formatMs(p95.retry_wait_ms), meta: '轮询 / 退避', valueClass: 'text-foreground' },
-        { key: 'response_ms', label: '响应整理', value: formatMs(p95.response_ms), meta: 'Codex 响应', valueClass: 'text-foreground' },
         { key: 'stream_ms', label: '单图内部', value: formatMs(p95.stream_ms), meta: '上游到结果', valueClass: 'text-foreground' },
         { key: 'total_ms', label: '单图总耗时', value: formatMs(p95.total_ms), meta: '完整链路', valueClass: 'text-foreground' },
       ],
@@ -387,13 +403,19 @@ const diagnosticGroups = computed(() => {
   ]
 })
 
-async function loadMonitor(silent = true) {
+async function loadMonitor(silent = true, source: 'auto' | 'manual' = silent ? 'auto' : 'manual') {
+  const autoRequest = source === 'auto'
+  const runId = refreshRunId
+  if (autoRequest && !autoRefresh.value) return
   if (isLoading.value && silent) return
   isLoading.value = true
   try {
-    monitorData.value = await monitorApi.realtime()
+    const data = await monitorApi.realtime()
+    if (autoRequest && (!autoRefresh.value || runId !== refreshRunId)) return
+    monitorData.value = data
     loadError.value = ''
   } catch (error: any) {
+    if (autoRequest && (!autoRefresh.value || runId !== refreshRunId)) return
     loadError.value = error?.message || 'Request failed'
   } finally {
     isLoading.value = false
@@ -401,11 +423,15 @@ async function loadMonitor(silent = true) {
 }
 
 function startPolling() {
-  stopPolling()
+  if (refreshTimer) {
+    window.clearInterval(refreshTimer)
+    refreshTimer = undefined
+  }
   if (!autoRefresh.value) return
   refreshTimer = window.setInterval(() => {
-    void loadMonitor(true)
-  }, 2000)
+    if (!autoRefresh.value) return
+    void loadMonitor(true, 'auto')
+  }, normalizedRefreshIntervalSeconds() * 1000)
 }
 
 function stopPolling() {
@@ -413,15 +439,52 @@ function stopPolling() {
     window.clearInterval(refreshTimer)
     refreshTimer = undefined
   }
+  refreshRunId += 1
 }
 
 function toggleAutoRefresh() {
   autoRefresh.value = !autoRefresh.value
   if (autoRefresh.value) {
-    void loadMonitor(true)
+    applyRefreshInterval(false)
     startPolling()
+    void loadMonitor(true, 'auto')
   } else {
     stopPolling()
+  }
+}
+
+function clampRefreshInterval(value: unknown) {
+  const seconds = Math.round(Number(value || DEFAULT_REFRESH_INTERVAL_SECONDS))
+  if (!Number.isFinite(seconds)) return DEFAULT_REFRESH_INTERVAL_SECONDS
+  return Math.min(MAX_REFRESH_INTERVAL_SECONDS, Math.max(MIN_REFRESH_INTERVAL_SECONDS, seconds))
+}
+
+function readStoredRefreshInterval() {
+  try {
+    return clampRefreshInterval(window.localStorage.getItem(REFRESH_INTERVAL_STORAGE_KEY))
+  } catch {
+    return DEFAULT_REFRESH_INTERVAL_SECONDS
+  }
+}
+
+function normalizedRefreshIntervalSeconds() {
+  return clampRefreshInterval(refreshIntervalSeconds.value)
+}
+
+function setRefreshIntervalInput(value: unknown) {
+  refreshIntervalSeconds.value = clampRefreshInterval(value)
+}
+
+function applyRefreshInterval(restart = true) {
+  const nextValue = normalizedRefreshIntervalSeconds()
+  refreshIntervalSeconds.value = nextValue
+  try {
+    window.localStorage.setItem(REFRESH_INTERVAL_STORAGE_KEY, String(nextValue))
+  } catch {
+    // ignore storage errors
+  }
+  if (restart && autoRefresh.value) {
+    startPolling()
   }
 }
 
@@ -446,24 +509,6 @@ function sumMetricFromMap(map: Record<string, number> | undefined, keys: readonl
   return keys.reduce((sum, key) => sum + Math.max(0, Number(map?.[key] || 0)), 0)
 }
 
-function ratioText(value: number, total: number) {
-  if (!Number.isFinite(value) || !Number.isFinite(total) || value <= 0 || total <= 0) return '-'
-  return `${Math.round((value / total) * 100)}%`
-}
-
-function topMetricFromMap(
-  map: Record<string, number> | undefined,
-  items: ReadonlyArray<{ key: string; label: string }>,
-) {
-  return items.reduce(
-    (top, item) => {
-      const value = Math.max(0, Number(map?.[item.key] || 0))
-      return value > top.value ? { label: item.label, value } : top
-    },
-    { label: '-', value: 0 },
-  )
-}
-
 function metricValue(row: RealtimeMonitorRecord, key: string) {
   const perf = row.perf || {}
   const metrics = row.metrics || {}
@@ -474,7 +519,8 @@ function proxySourceLabel(value: unknown) {
   const source = String(value || 'direct')
   if (source.includes('account_group')) return '账号组'
   if (source.includes('account')) return '账号'
-  if (source.includes('global')) return '全局'
+  if (source.includes('default')) return '默认'
+  if (source.includes('global')) return '默认'
   if (source.includes('runtime_resource')) return '资源代理'
   if (source.includes('runtime')) return 'Runtime'
   if (source.includes('explicit')) return '指定'
@@ -497,7 +543,7 @@ function accountEgressDigest(row: RealtimeMonitorRecord) {
 
 function activeEgressMeta() {
   const items = Object.entries(summary.value?.active_by_egress || {})
-  if (!items.length) return '代理组、全局代理、Runtime 或直连出口'
+  if (!items.length) return '代理组、默认代理、Runtime 或直连出口'
   return items
     .slice(0, 2)
     .map(([key, count]) => `${proxySourceLabel(key.split(':')[0])} ${count}`)
@@ -510,11 +556,16 @@ function metricDigest(row: RealtimeMonitorRecord) {
     ['首包', 'stream_first_queue_ms'],
     ['等待账号', 'account_wait_ms'],
     ['等待出口', 'egress_wait_ms'],
+    ['出口租约', 'egress_acquire_ms'],
     ['上传', 'upload_ms'],
     ['初始化', 'bootstrap_ms'],
     ['令牌', 'requirements_ms'],
     ['准备', 'prepare_conversation_ms'],
     ['启动', 'generation_start_ms'],
+    ['HTTP首包', 'http_ttfb_ms'],
+    ['HTTP等待', 'http_wait_ms'],
+    ['SSE首事件', 'sse_first_event_ms'],
+    ['SSE空窗', 'sse_max_gap_ms'],
     ['上游生成', 'conversation_stream_ms'],
     ['上游断流', 'stream_error_ms'],
     ['解析/轮询', 'resolve_ms'],
@@ -573,11 +624,20 @@ function slowMetricItems(row: RealtimeMonitorRecord) {
     { key: 'stream_first_queue_ms', label: '首包' },
     { key: 'account_wait_ms', label: '等待账号' },
     { key: 'egress_wait_ms', label: '等待出口' },
+    { key: 'egress_acquire_ms', label: '出口租约' },
     { key: 'upload_ms', label: '上传' },
     { key: 'bootstrap_ms', label: '初始化' },
     { key: 'requirements_ms', label: '令牌' },
     { key: 'prepare_conversation_ms', label: '准备' },
     { key: 'generation_start_ms', label: '启动' },
+    { key: 'http_dns_ms', label: 'HTTP DNS' },
+    { key: 'http_tcp_ms', label: 'HTTP TCP' },
+    { key: 'http_tls_ms', label: 'HTTP TLS' },
+    { key: 'http_wait_ms', label: 'HTTP 等待' },
+    { key: 'http_ttfb_ms', label: 'HTTP 首包' },
+    { key: 'sse_first_event_ms', label: 'SSE 首事件' },
+    { key: 'sse_max_gap_ms', label: 'SSE 最大空窗' },
+    { key: 'sse_last_gap_ms', label: 'SSE 收尾空窗' },
     { key: 'conversation_stream_ms', label: '上游生成' },
     { key: 'stream_error_ms', label: '上游断流' },
     { key: 'resolve_ms', label: '解析/轮询' },
@@ -632,8 +692,20 @@ function slowRowReason(row: RealtimeMonitorRecord) {
   if (top.key === 'stream_error_ms') {
     return `主要卡在上游断流，通常是 HTTP2/SSE、代理或上游边缘节点中断。`
   }
+  if (top.key === 'http_ttfb_ms' || top.key === 'http_wait_ms') {
+    return `主要卡在 HTTP 首包，通常是代理出口、上游边缘节点或请求排队变慢。`
+  }
+  if (['http_dns_ms', 'http_tcp_ms', 'http_tls_ms'].includes(top.key)) {
+    return `主要卡在 HTTP 建连阶段：${top.label} ${top.value}。`
+  }
+  if (top.key === 'sse_first_event_ms') {
+    return `主要卡在 SSE 首事件，说明连接已建立但上游长时间没有返回首个事件。`
+  }
+  if (top.key === 'sse_max_gap_ms' || top.key === 'sse_last_gap_ms') {
+    return `主要卡在 SSE 空窗，说明上游流中间长时间没有新事件。`
+  }
   if (top.key === 'egress_wait_ms') {
-    return `主要卡在等待出口，通常是代理组、全局代理、Runtime 出口或出站会话准备变慢。`
+    return `主要卡在等待出口，通常是代理组、默认代理、Runtime 出口或出站会话准备变慢。`
   }
   if (['upload_ms', 'bootstrap_ms', 'requirements_ms', 'prepare_conversation_ms', 'generation_start_ms'].includes(top.key)) {
     return `主要卡在上游准备阶段：${top.label} ${top.value}。`
@@ -677,6 +749,10 @@ function eventMetricText(row: RealtimeMonitorEvent) {
     ['令牌', 'requirements_ms'],
     ['准备', 'prepare_conversation_ms'],
     ['启动', 'generation_start_ms'],
+    ['HTTP首包', 'http_ttfb_ms'],
+    ['HTTP等待', 'http_wait_ms'],
+    ['SSE首事件', 'sse_first_event_ms'],
+    ['SSE空窗', 'sse_max_gap_ms'],
     ['上游生成', 'conversation_stream_ms'],
     ['上游断流', 'stream_error_ms'],
     ['解析/轮询', 'resolve_ms'],

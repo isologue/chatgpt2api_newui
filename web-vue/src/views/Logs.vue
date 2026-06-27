@@ -535,7 +535,7 @@ type DetailField = {
 }
 
 type DetailTone = 'success' | 'danger' | 'warning' | 'info' | 'muted'
-type DetailTimelineCategory = 'entry' | 'prepare' | 'upstream' | 'resolve' | 'download' | 'retry' | 'response'
+type DetailTimelineCategory = 'entry' | 'prepare' | 'network' | 'upstream' | 'resolve' | 'download' | 'retry' | 'response'
 
 type DetailTimelineStepConfig = {
   key: string
@@ -607,11 +607,20 @@ const detailTimelineSteps: DetailTimelineStepConfig[] = [
   { key: 'stream_first_queue_ms', label: '读取首包', group: '入口与账号', hint: '首个响应事件' },
   { key: 'account_wait_ms', label: '等待账号', group: '入口与账号', hint: '账号池筛选' },
   { key: 'egress_wait_ms', label: '等待出口', group: '入口与账号', hint: '代理出口准备' },
+  { key: 'egress_acquire_ms', label: '出口租约', group: '入口与账号', hint: '代理节点并发' },
   { key: 'upload_ms', label: '上传输入图', group: '上游准备', hint: '参考图上传' },
   { key: 'bootstrap_ms', label: '预热页面', group: '上游准备', hint: 'ChatGPT 页面' },
   { key: 'requirements_ms', label: '获取请求令牌', group: '上游准备', hint: 'requirements / token' },
   { key: 'prepare_conversation_ms', label: '准备会话', group: '上游准备', hint: '图片会话上下文' },
   { key: 'generation_start_ms', label: '启动生成', group: '上游准备', hint: '提交上游请求' },
+  { key: 'http_dns_ms', label: 'HTTP DNS', group: 'HTTP 连接', hint: '域名解析' },
+  { key: 'http_tcp_ms', label: 'HTTP TCP', group: 'HTTP 连接', hint: '代理 / TCP 建连' },
+  { key: 'http_tls_ms', label: 'HTTP TLS', group: 'HTTP 连接', hint: 'TLS 握手' },
+  { key: 'http_wait_ms', label: 'HTTP 等待', group: 'HTTP 连接', hint: '请求发出到首包' },
+  { key: 'http_ttfb_ms', label: 'HTTP 首包', group: 'HTTP 连接', hint: '请求开始到首包' },
+  { key: 'sse_first_event_ms', label: 'SSE 首事件', group: '生成与结果', hint: '首个 data 事件' },
+  { key: 'sse_max_gap_ms', label: 'SSE 最大空窗', group: '生成与结果', hint: '两次事件最大间隔' },
+  { key: 'sse_last_gap_ms', label: 'SSE 收尾空窗', group: '生成与结果', hint: '最后事件到关闭' },
   { key: 'conversation_stream_ms', label: '上游生成', group: '生成与结果', hint: 'ChatGPT 会话流' },
   { key: 'stream_error_ms', label: '上游断流', group: '生成与结果', hint: 'HTTP2 / SSE' },
   { key: 'resolve_ms', label: '解析/轮询', group: '生成与结果', hint: 'conversation / file' },
@@ -622,19 +631,39 @@ const detailTimelineSteps: DetailTimelineStepConfig[] = [
   { key: 'total_ms', label: '单图总耗时', group: '生成与结果', hint: '完整链路' },
 ]
 
-const detailTimelineGroupOrder = ['入口与账号', '上游准备', '生成与结果']
-const detailTimelineAggregateKeys = new Set(['stream_ms', 'total_ms'])
+const detailTimelineGroupOrder = ['入口与账号', '上游准备', 'HTTP 连接', '生成与结果']
+const detailTimelineAggregateKeys = new Set([
+  'http_dns_ms',
+  'http_tcp_ms',
+  'http_tls_ms',
+  'http_wait_ms',
+  'http_ttfb_ms',
+  'sse_first_event_ms',
+  'sse_max_gap_ms',
+  'sse_last_gap_ms',
+  'stream_ms',
+  'total_ms',
+])
 const defaultTimelineWarningThresholdMs = 60_000
 const timelineWarningThresholdMs: Record<string, number> = {
   handler_queue_ms: 1_000,
   stream_first_queue_ms: 1_000,
   account_wait_ms: 10_000,
   egress_wait_ms: 10_000,
+  egress_acquire_ms: 10_000,
   upload_ms: 60_000,
   bootstrap_ms: 60_000,
   requirements_ms: 60_000,
   prepare_conversation_ms: 60_000,
   generation_start_ms: 60_000,
+  http_dns_ms: 1_000,
+  http_tcp_ms: 3_000,
+  http_tls_ms: 5_000,
+  http_wait_ms: 30_000,
+  http_ttfb_ms: 30_000,
+  sse_first_event_ms: 30_000,
+  sse_max_gap_ms: 60_000,
+  sse_last_gap_ms: 30_000,
   download_ms: 60_000,
   retry_wait_ms: 60_000,
   response_ms: 30_000,
@@ -643,13 +672,14 @@ const timelineWarningThresholdMs: Record<string, number> = {
 const detailTimelineCategoryLabels: Record<DetailTimelineCategory, string> = {
   entry: '入口与账号',
   prepare: '上游准备',
+  network: 'HTTP 连接',
   upstream: '上游生成',
   resolve: '解析/轮询',
   download: '图片下载',
   retry: '重试等待',
   response: '响应整理',
 }
-const detailTimelineCategoryOrder: DetailTimelineCategory[] = ['entry', 'prepare', 'upstream', 'resolve', 'download', 'retry', 'response']
+const detailTimelineCategoryOrder: DetailTimelineCategory[] = ['entry', 'prepare', 'network', 'upstream', 'resolve', 'download', 'retry', 'response']
 
 const toast = useToast()
 const route = useRoute()
@@ -1301,6 +1331,8 @@ function metricValueFromLog(item: LogRow, key: string): number {
 function timelineStepCategory(key: string, group: string): DetailTimelineCategory {
   if (group === '入口与账号') return 'entry'
   if (group === '上游准备') return 'prepare'
+  if (group === 'HTTP 连接') return 'network'
+  if (key === 'sse_first_event_ms' || key === 'sse_max_gap_ms' || key === 'sse_last_gap_ms') return 'upstream'
   if (key === 'conversation_stream_ms') return 'upstream'
   if (key === 'resolve_ms') return 'resolve'
   if (key === 'download_ms') return 'download'
@@ -1379,7 +1411,8 @@ function proxySourceLabel(value: unknown): string {
   if (!source) return ''
   if (source.includes('account_group')) return '账号组'
   if (source.includes('account')) return '账号'
-  if (source.includes('global')) return '全局'
+  if (source.includes('default')) return '默认'
+  if (source.includes('global')) return '默认'
   if (source.includes('runtime_resource')) return '资源代理'
   if (source.includes('runtime')) return 'Runtime'
   if (source.includes('explicit')) return '指定'
@@ -2200,6 +2233,10 @@ onBeforeUnmount(() => {
   background: rgb(20 184 166 / 0.72);
 }
 
+.detail-timeline-segments__segment--network {
+  background: rgb(14 165 233 / 0.68);
+}
+
 .detail-timeline-segments__segment--upstream {
   background: rgb(99 102 241 / 0.72);
 }
@@ -2261,6 +2298,10 @@ onBeforeUnmount(() => {
 
 .detail-timeline-segments__legend-item--prepare i {
   background: rgb(20 184 166);
+}
+
+.detail-timeline-segments__legend-item--network i {
+  background: rgb(14 165 233);
 }
 
 .detail-timeline-segments__legend-item--upstream i {
@@ -2421,6 +2462,10 @@ onBeforeUnmount(() => {
 
 .detail-timeline__step--prepare .detail-timeline__bar span {
   background: rgb(20 184 166 / 0.76);
+}
+
+.detail-timeline__step--network .detail-timeline__bar span {
+  background: rgb(14 165 233 / 0.7);
 }
 
 .detail-timeline__step--upstream .detail-timeline__bar span {
