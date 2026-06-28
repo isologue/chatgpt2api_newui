@@ -29,6 +29,7 @@ _outlook_token_state_lock = Lock()
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {"used", "in_use", "login_required", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "login_required", "token_invalid", "failed"}
+OUTLOOK_CREDENTIAL_FATAL_STATES = {"login_required", "token_invalid"}
 
 
 def _load_ddg_aliases() -> set[str]:
@@ -121,6 +122,31 @@ def _outlook_entry_available(entry: dict[str, Any] | None) -> bool:
     return True
 
 
+def _outlook_credential_state(store: dict[str, dict[str, Any]], credential: dict[str, Any]) -> str:
+    """返回地址自身状态；如果原登录邮箱 token 已失效，则别名也继承该致命状态。"""
+    key = str(credential.get("email") or "").strip().lower()
+    entry = store.get(key) if key else None
+    state = str(entry.get("state") or "") if isinstance(entry, dict) else ""
+    if state:
+        return state
+    login_email = str(credential.get("login_email") or credential.get("alias_of") or "").strip().lower()
+    if login_email and login_email != key:
+        parent = store.get(login_email)
+        parent_state = str(parent.get("state") or "") if isinstance(parent, dict) else ""
+        if parent_state in OUTLOOK_CREDENTIAL_FATAL_STATES:
+            return parent_state
+    return ""
+
+
+def _outlook_credential_available(store: dict[str, dict[str, Any]], credential: dict[str, Any]) -> bool:
+    key = str(credential.get("email") or "").strip().lower()
+    entry = store.get(key) if key else None
+    if not _outlook_entry_available(entry):
+        return False
+    state = _outlook_credential_state(store, credential)
+    return state not in OUTLOOK_CREDENTIAL_FATAL_STATES
+
+
 def _set_outlook_token_state(address: str, state: str, reason: str = "") -> None:
     target = str(address or "").strip().lower()
     if not target:
@@ -165,17 +191,23 @@ def reset_outlook_token_pool_state(scope: str = "all") -> int:
         return count
 
 
-def prune_outlook_unused_credentials(credentials: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
+def prune_outlook_unused_credentials(credentials: list[dict[str, str]], entry: dict | None = None) -> tuple[list[dict[str, str]], int]:
     """Return credentials with recorded state, plus the number pruned as unused."""
     with _outlook_token_state_lock:
         store = _load_outlook_token_state()
     kept: list[dict[str, str]] = []
     removed = 0
     for credential in credentials:
-        key = str(credential.get("email") or "").strip().lower()
-        entry = store.get(key) if key else None
-        state = str(entry.get("state") or "") if isinstance(entry, dict) else ""
-        if state in OUTLOOK_RECORDED_STATES:
+        expanded = expand_outlook_aliases([credential], entry)
+        has_recorded = False
+        for item in expanded:
+            key = str(item.get("email") or "").strip().lower()
+            state_entry = store.get(key) if key else None
+            state = str(state_entry.get("state") or "") if isinstance(state_entry, dict) else ""
+            if state in OUTLOOK_RECORDED_STATES:
+                has_recorded = True
+                break
+        if has_recorded:
             kept.append(credential)
         else:
             removed += 1
@@ -188,8 +220,7 @@ def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None) -> dict[s
     counts = {"unused": 0, "in_use": 0, "used": 0, "login_required": 0, "token_invalid": 0, "failed": 0}
     if pool:
         for credential in pool:
-            entry = store.get(str(credential.get("email") or "").strip().lower())
-            state = str(entry.get("state") or "") if isinstance(entry, dict) else ""
+            state = _outlook_credential_state(store, credential)
             if state in counts:
                 counts[state] += 1
             else:
@@ -1398,6 +1429,102 @@ def inspect_outlook_credentials(text: str) -> dict[str, Any]:
     return _parse_outlook_credentials_with_report(text)[1]
 
 
+def _normalize_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _normalize_int(value: Any, default: int = 0, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def outlook_alias_supported(email: str) -> bool:
+    _, sep, domain = str(email or "").strip().lower().partition("@")
+    if not sep:
+        return False
+    return (
+        domain == "outlook.com"
+        or domain == "hotmail.com"
+        or domain == "live.com"
+        or domain == "msn.com"
+        or domain.startswith("hotmail.")
+        or domain.startswith("outlook.")
+    )
+
+
+def outlook_alias_address(email: str, tag: str) -> str:
+    local, sep, domain = str(email or "").strip().partition("@")
+    if not sep:
+        return email
+    base_local = local.split("+", 1)[0]
+    return f"{base_local}+{tag}@{domain}"
+
+
+def outlook_alias_tag(prefix: str, index: int) -> str:
+    clean_prefix = re.sub(r"[^A-Za-z0-9._-]+", "", str(prefix or "").strip()) or "c2api"
+    return f"{clean_prefix}{index}"
+
+
+def expand_outlook_aliases(credentials: list[dict[str, str]], entry: dict | None = None) -> list[dict[str, str]]:
+    source = entry if isinstance(entry, dict) else {}
+    enabled = _normalize_bool(source.get("alias_enabled"), False)
+    per_email = _normalize_int(source.get("alias_per_email"), 0, 0, 200)
+    include_original = _normalize_bool(source.get("alias_include_original"), True)
+    prefix = str(source.get("alias_prefix") or "c2api").strip() or "c2api"
+    if not enabled or per_email <= 0:
+        return credentials
+
+    expanded: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for credential in credentials:
+        original = str(credential.get("login_email") or credential.get("email") or "").strip()
+        if include_original and credential.get("email"):
+            key = str(credential["email"]).strip().lower()
+            if key not in seen:
+                expanded.append(dict(credential))
+                seen.add(key)
+        if not outlook_alias_supported(original):
+            continue
+        for index in range(1, per_email + 1):
+            alias_email = outlook_alias_address(original, outlook_alias_tag(prefix, index))
+            key = alias_email.lower()
+            if key in seen:
+                continue
+            expanded.append({
+                **credential,
+                "email": alias_email,
+                "login_email": original,
+                "alias_of": original,
+            })
+            seen.add(key)
+    return expanded
+
+
+def outlook_alias_preview(entry: dict | None, limit: int = 5) -> list[str]:
+    source = entry if isinstance(entry, dict) else {}
+    credentials = parse_outlook_credentials(str(source.get("mailboxes") or ""))
+    expanded = expand_outlook_aliases(credentials[:1], source)
+    return [str(item.get("email") or "").strip() for item in expanded[: max(0, limit)] if item.get("email")]
+
+
 def _is_outlook_token_rate_limited(status_code: int, detail: str) -> bool:
     text = str(detail or "").lower()
     return status_code == 429 or "aadsts90055" in text or "excessive request rate" in text
@@ -1417,12 +1544,13 @@ def _retry_after_seconds(resp: Any, fallback: float) -> float:
     return fallback
 
 
-def _normalize_outlook_pool(value: Any) -> list[dict[str, str]]:
-    """邮箱池既支持纯文本（每行一条），也支持已解析的对象列表。"""
+def _normalize_outlook_pool(value: Any, entry: dict | None = None) -> list[dict[str, str]]:
+    """邮箱池既支持纯文本，也支持对象列表；按 provider 配置展开 Outlook 加号别名。"""
+    source = entry if isinstance(entry, dict) else {}
+    items: list[dict[str, str]] = []
     if isinstance(value, str):
-        return parse_outlook_credentials(value)
-    if isinstance(value, list):
-        items: list[dict[str, str]] = []
+        items = parse_outlook_credentials(value)
+    elif isinstance(value, list):
         for item in value:
             if isinstance(item, str):
                 items.extend(parse_outlook_credentials(item))
@@ -1431,9 +1559,18 @@ def _normalize_outlook_pool(value: Any) -> list[dict[str, str]]:
                 client_id = _clean_outlook_value(item.get("client_id") or "")
                 refresh_token = _clean_outlook_value(item.get("refresh_token") or "")
                 if "@" in email and client_id and refresh_token:
-                    items.append({"email": email, "password": _clean_outlook_value(item.get("password") or ""), "client_id": client_id, "refresh_token": refresh_token})
-        return items
-    return []
+                    login_email = _clean_outlook_value(item.get("login_email") or item.get("alias_of") or email)
+                    payload = {
+                        "email": email,
+                        "password": _clean_outlook_value(item.get("password") or ""),
+                        "client_id": client_id,
+                        "refresh_token": refresh_token,
+                    }
+                    if login_email and login_email != email:
+                        payload["login_email"] = login_email
+                        payload["alias_of"] = _clean_outlook_value(item.get("alias_of") or login_email)
+                    items.append(payload)
+    return expand_outlook_aliases(items, source)
 
 
 class OutlookTokenProvider(BaseMailProvider):
@@ -1449,7 +1586,7 @@ class OutlookTokenProvider(BaseMailProvider):
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.label = str(entry.get("label") or self.provider_ref)
-        self.pool = _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool"))
+        self.pool = _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool"), entry)
         self.mode = str(entry.get("mode") or "auto").strip().lower() or "auto"
         if self.mode not in {"graph", "imap", "auto"}:
             self.mode = "auto"
@@ -1512,7 +1649,7 @@ class OutlookTokenProvider(BaseMailProvider):
             raise RuntimeError("OutlookToken 邮箱池为空，请在邮箱配置中导入 email----password----client_id----refresh_token")
         with _outlook_token_state_lock:
             store = _load_outlook_token_state()
-            credential = next((item for item in self.pool if _outlook_entry_available(store.get(item["email"].strip().lower()))), None)
+            credential = next((item for item in self.pool if _outlook_credential_available(store, item)), None)
             if credential is None:
                 raise RuntimeError(f"[{self.label}] OutlookToken 邮箱池暂无可用邮箱（共 {len(self.pool)} 个，已用尽或全部占用/失效），请导入新邮箱或重置池状态")
             store[credential["email"].strip().lower()] = {"state": "in_use", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1521,6 +1658,8 @@ class OutlookTokenProvider(BaseMailProvider):
             "provider": self.name,
             "provider_ref": self.provider_ref,
             "address": credential["email"],
+            "login_email": credential.get("login_email") or credential["email"],
+            "alias_of": credential.get("alias_of", ""),
             "label": self.label,
             "password": credential.get("password", ""),
             "client_id": credential["client_id"],
@@ -1593,7 +1732,7 @@ class OutlookTokenProvider(BaseMailProvider):
 
     def _imap_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
         """返回最近 N 封邮件，最新在前。"""
-        auth_string = f"user={mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
+        auth_string = f"user={mailbox.get('login_email') or mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
         imap = imaplib.IMAP4_SSL(self.imap_host)
         try:
             imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
@@ -1865,8 +2004,14 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         _set_outlook_token_state(address, "failed", reason[:300])
     elif isinstance(error, OutlookTokenError) or "OutlookToken 刷新失败" in reason or "access_token" in reason:
         _set_outlook_token_state(address, "token_invalid", reason[:300])
+        login_email = str(mailbox.get("login_email") or mailbox.get("alias_of") or "").strip()
+        if login_email and login_email.lower() != address.lower():
+            _set_outlook_token_state(login_email, "token_invalid", reason[:300])
     elif "登录流" in reason or "login flow" in reason or "login_required" in reason:
         _set_outlook_token_state(address, "login_required", reason[:300])
+        login_email = str(mailbox.get("login_email") or mailbox.get("alias_of") or "").strip()
+        if login_email and login_email.lower() != address.lower():
+            _set_outlook_token_state(login_email, "login_required", reason[:300])
     else:
         _set_outlook_token_state(address, "failed", reason[:300])
 

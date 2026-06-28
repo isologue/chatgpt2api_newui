@@ -122,12 +122,16 @@ class RegisterService:
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
             pool_text = str(provider.get("mailboxes") or "")
-            credentials = mail_provider.parse_outlook_credentials(pool_text)
+            base_credentials = mail_provider.parse_outlook_credentials(pool_text)
+            credentials = mail_provider.expand_outlook_aliases(base_credentials, provider)
             provider["mailboxes"] = ""
             provider["mailboxes_count"] = len(credentials)
+            provider["mailboxes_base_count"] = len(base_credentials)
+            provider["mailboxes_alias_count"] = max(0, len(credentials) - len(base_credentials))
             provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
             provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
             provider["mailboxes_parse_stats"] = mail_provider.inspect_outlook_credentials(pool_text)
+            provider["alias_preview"] = mail_provider.outlook_alias_preview({**provider, "mailboxes": pool_text})
             if index in self._last_outlook_import_reports:
                 provider["mailboxes_import_stats"] = self._last_outlook_import_reports[index]
 
@@ -184,7 +188,7 @@ class RegisterService:
                 provider["mailboxes"] = _merge_outlook_pool(old_text, "")
             else:
                 provider["mailboxes"] = ""
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_import_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_import_stats", "alias_preview"):
                 provider.pop(key, None)
         self._last_outlook_import_reports = next_import_reports
 
@@ -200,11 +204,11 @@ class RegisterService:
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
             credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials)
+            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials, provider)
             if removed:
                 provider["mailboxes"] = _serialize_outlook_pool(kept)
                 total_removed += removed
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_import_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_import_stats", "alias_preview"):
                 provider.pop(key, None)
         return total_removed
 

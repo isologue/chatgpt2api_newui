@@ -534,6 +534,47 @@
                     </label>
                   </div>
 
+                  <div class="register-provider-section register-provider-section--soft">
+                    <div class="register-provider-section-title">加号别名</div>
+                    <div class="register-form-grid register-form-grid--three">
+                      <label class="register-checkbox-field register-checkbox-field--compact register-field--full">
+                        <Checkbox v-model="provider.alias_enabled" :disabled="registerConfig.enabled">
+                          启用 Outlook / Hotmail 加号别名
+                        </Checkbox>
+                      </label>
+
+                      <label class="register-field">
+                        <span class="register-label">每个邮箱别名数</span>
+                        <Input
+                          v-model.number="provider.alias_per_email"
+                          type="number"
+                          min="0"
+                          max="200"
+                          block
+                          :disabled="registerConfig.enabled || !provider.alias_enabled"
+                        />
+                      </label>
+
+                      <label class="register-field">
+                        <span class="register-label">别名前缀</span>
+                        <Input
+                          v-model.trim="provider.alias_prefix"
+                          block
+                          root-class="font-mono"
+                          placeholder="c2api"
+                          :disabled="registerConfig.enabled || !provider.alias_enabled"
+                        />
+                      </label>
+
+                      <label class="register-checkbox-field register-checkbox-field--compact">
+                        <Checkbox v-model="provider.alias_include_original" :disabled="registerConfig.enabled || !provider.alias_enabled">
+                          包含原邮箱
+                        </Checkbox>
+                      </label>
+                    </div>
+                    <p class="register-preview-line">{{ outlookAliasHint(provider) }}</p>
+                  </div>
+
                   <label class="register-field">
                     <span class="register-label">邮箱池导入</span>
                     <textarea
@@ -789,10 +830,10 @@ const providerTypeKeys: Record<string, string[]> = {
   gptmail: ['key_mode', 'api_key', 'default_domain', 'local_compose'],
   yyds_mail: ['api_base', 'api_key', 'domain', 'subdomain', 'wildcard'],
   ddg_mail: ['api_base', 'ddg_token', 'cf_inbox_jwt', 'admin_password', 'cf_api_key', 'cf_auth_mode', 'cf_create_path', 'cf_messages_path'],
-  outlook_token: ['mailboxes', 'mode', 'imap_host', 'message_limit'],
+  outlook_token: ['mailboxes', 'mode', 'imap_host', 'message_limit', 'alias_enabled', 'alias_per_email', 'alias_prefix', 'alias_include_original'],
 }
 const providerLocalOnlyKeys: Record<string, string[]> = {
-  outlook_token: ['mailboxes_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats', 'mailboxes_import_stats'],
+  outlook_token: ['mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats', 'mailboxes_import_stats', 'alias_preview'],
 }
 
 const registerProviders = computed(() => registerConfig.value?.mail.providers || [])
@@ -929,6 +970,10 @@ function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
         mode: 'auto',
         imap_host: 'outlook.office365.com',
         message_limit: 10,
+        alias_enabled: false,
+        alias_per_email: 5,
+        alias_prefix: 'c2api',
+        alias_include_original: true,
       }
     default:
       return base
@@ -1185,6 +1230,41 @@ function outlookPoolSummary(provider: RegisterProvider) {
     failed,
     abnormal: inUse + loginRequired + tokenInvalid + failed,
   }
+}
+
+function outlookAliasSummary(provider: RegisterProvider) {
+  const base = numeric(provider.mailboxes_base_count || provider.mailboxes_count)
+  const alias = numeric(provider.mailboxes_alias_count)
+  const perEmail = numeric(provider.alias_per_email)
+  const includeOriginal = provider.alias_include_original !== false
+  const multiplier = provider.alias_enabled ? perEmail + (includeOriginal ? 1 : 0) : 1
+  const pending = pendingOutlookCount(provider)
+  return {
+    enabled: Boolean(provider.alias_enabled),
+    base,
+    alias,
+    perEmail,
+    includeOriginal,
+    multiplier,
+    pending,
+    pendingExpanded: provider.alias_enabled ? pending * multiplier : pending,
+  }
+}
+
+function outlookAliasHint(provider: RegisterProvider) {
+  const summary = outlookAliasSummary(provider)
+  if (!summary.enabled) return '未启用加号别名，注册时直接使用导入邮箱。'
+  const prefix = String(provider.alias_prefix || 'c2api').trim() || 'c2api'
+  const preview = Array.isArray(provider.alias_preview) && provider.alias_preview.length
+    ? provider.alias_preview.join('、')
+    : `name+${prefix}1@hotmail.com`
+  if (summary.pending > 0) {
+    return `保存后本次导入约展开为 ${summary.pendingExpanded} 个注册地址；登录和收信仍使用原邮箱凭据。示例：${preview}`
+  }
+  if (summary.base > 0) {
+    return `已保存 ${summary.base} 个原邮箱，当前规则生成 ${summary.alias} 个别名地址。示例：${preview}`
+  }
+  return `保存后会为 Outlook / Hotmail 地址生成 name+${prefix}1@hotmail.com 这类别名；登录和收信仍使用原邮箱。`
 }
 
 function outlookPoolHint(provider: RegisterProvider) {
@@ -1557,10 +1637,13 @@ function sanitizeProvider(provider: RegisterProvider): RegisterProvider {
   }
 
   delete output.mailboxes_count
+  delete output.mailboxes_base_count
+  delete output.mailboxes_alias_count
   delete output.mailboxes_preview
   delete output.mailboxes_stats
   delete output.mailboxes_parse_stats
   delete output.mailboxes_import_stats
+  delete output.alias_preview
   delete output.provider_ref
   return output
 }

@@ -46,7 +46,14 @@ export type RegisterProvider = {
   expiry_time?: number
   mailboxes?: string
   mailboxes_count?: number
+  mailboxes_base_count?: number
+  mailboxes_alias_count?: number
   mailboxes_preview?: string[]
+  alias_enabled?: boolean
+  alias_per_email?: number
+  alias_prefix?: string
+  alias_include_original?: boolean
+  alias_preview?: string[]
   mailboxes_stats?: {
     unused?: number
     in_use?: number
