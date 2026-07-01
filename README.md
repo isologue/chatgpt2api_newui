@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" />
 </p>
-<p align="center"><strong>当前稳定版本：v2.4.7</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.4.7">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
+<p align="center"><strong>当前稳定版本：v2.5.0</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.5.0">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
 
 ---
 
@@ -38,7 +38,7 @@
 
 - OpenAI 兼容接口，可对接常见 OpenAI SDK、上游网关或客户端。
 - ChatGPT 官网图片链路，覆盖图片生成、图片编辑、多图组图编辑和图片任务追踪。
-- Vue 管理控制台，包含概览中心、账号管理、日志管理、图片管理、代理管理、注册账号、图像创作、调试中心和系统设置。
+- Vue 管理控制台，包含概览中心、账号管理、日志管理、图片管理、代理管理、注册账号、对话画图、调试中心和系统设置。
 - 多账号调度，支持账号导入、刷新、重新登录、额度读取、异常账号处理和批量管理。
 - 注册账号链路，支持临时邮箱 / Outlook Token 邮箱读取、验证码等待、注册进度和实时日志。
 - 配置管理，覆盖用户密钥、WebDAV、AI 审核、R2 备份、CPA / Sub2API 连接和运行参数。
@@ -51,7 +51,7 @@
 ```mermaid
 flowchart TB
   Admin["管理员"] --> Console["Vue 管理控制台"]
-  User["普通用户"] --> ImageStudio["图像创作"]
+  User["普通用户"] --> ImageStudio["对话画图"]
   Client["OpenAI 兼容客户端"] --> Gateway["ChatGPT2API 网关"]
 
   subgraph ConsoleModules["控制台模块"]
@@ -99,7 +99,7 @@ curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/main/deploy/ins
 固定安装当前稳定版：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.4.7/deploy/install.sh | sudo bash -s -- --branch v2.4.7
+curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.5.0/deploy/install.sh | sudo bash -s -- --branch v2.5.0
 ```
 
 ### Docker 运行
