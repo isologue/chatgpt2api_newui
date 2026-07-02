@@ -83,6 +83,14 @@
                   placement="top"
                 />
               </div>
+              <div class="chat-select-wrap chat-select-wrap--effort">
+                <GroupedSelectMenu
+                  v-model="chatReasoningEffortValue"
+                  :options="chatReasoningEffortOptions"
+                  selected-indicator="none"
+                  placement="top"
+                />
+              </div>
             </template>
 
             <template v-else>
@@ -254,6 +262,7 @@ const props = defineProps<{
   mode: StudioComposeMode
   text: string
   chatModel: string
+  chatReasoningEffort: string
   imageForm: StudioImageForm
   chatModelOptions: string[]
   imageModelOptions: string[]
@@ -268,6 +277,7 @@ const emit = defineEmits<{
   'update:mode': [mode: StudioComposeMode]
   'update:text': [text: string]
   'update:chatModel': [model: string]
+  'update:chatReasoningEffort': [effort: string]
   'update:imageModel': [model: string]
   'update:imageSize': [size: string]
   'update:imageQuality': [quality: string]
@@ -307,6 +317,14 @@ const chatModelValue = computed({
   set: (value: string | string[]) => emit('update:chatModel', String(Array.isArray(value) ? value[0] : value || 'auto')),
 })
 
+const chatReasoningEffortValue = computed({
+  get: () => props.chatReasoningEffort || 'default',
+  set: (value: string | string[]) => {
+    const next = String(Array.isArray(value) ? value[0] : value || 'default')
+    emit('update:chatReasoningEffort', next === 'default' ? '' : next)
+  },
+})
+
 const imageModelValue = computed({
   get: () => props.imageForm.model,
   set: (value: string | string[]) => emit('update:imageModel', String(Array.isArray(value) ? value[0] : value || '')),
@@ -316,6 +334,14 @@ const chatModelSelectOptions = computed(() => props.chatModelOptions.map((model)
   label: model === 'auto' ? '自动模型' : model,
   value: model,
 })))
+
+const chatReasoningEffortOptions = [
+  { label: '默认思考', value: 'default' },
+  { label: '低', value: 'low' },
+  { label: '中', value: 'medium' },
+  { label: '高', value: 'high' },
+  { label: '扩展', value: 'extended' },
+]
 
 const imageModelSelectOptions = computed(() => props.imageModelOptions.map((model) => ({
   label: model,
@@ -574,6 +600,11 @@ onBeforeUnmount(() => {
 .chat-select-wrap {
   min-width: 9rem;
   max-width: min(18rem, 45vw);
+}
+
+.chat-select-wrap--effort {
+  min-width: 7rem;
+  max-width: 9rem;
 }
 
 .chat-input-status {

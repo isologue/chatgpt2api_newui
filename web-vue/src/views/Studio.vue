@@ -93,6 +93,7 @@
         v-model:mode="composeMode"
         v-model:text="composerText"
         v-model:chat-model="chatModel"
+        v-model:chat-reasoning-effort="chatReasoningEffort"
         :image-form="imageForm"
         :chat-model-options="chatModelOptions"
         :image-model-options="imageModelOptions"
@@ -207,6 +208,7 @@ type StudioMessageListExpose = { scrollToBottom: () => Promise<void> | void }
 const messageListRef = ref<StudioMessageListExpose | null>(null)
 
 const chatModel = ref(getStringPreference(preferenceKeys.studioChatModel, 'auto') || 'auto')
+const chatReasoningEffort = ref(getStringPreference(preferenceKeys.studioChatReasoningEffort, ''))
 const imageForm = reactive<StudioImageForm>({
   model: getStringPreference(preferenceKeys.studioImageModel, DEFAULT_IMAGE_MODEL) || DEFAULT_IMAGE_MODEL,
   size: DEFAULT_IMAGE_SIZE,
@@ -312,6 +314,7 @@ const imageModelOptions = computed(() => uniqueStrings([imageForm.model, DEFAULT
 
 watch(composeMode, (mode) => setStringPreference(preferenceKeys.studioActiveMode, mode))
 watch(chatModel, (model) => setStringPreference(preferenceKeys.studioChatModel, model || 'auto'))
+watch(chatReasoningEffort, (effort) => setStringPreference(preferenceKeys.studioChatReasoningEffort, effort || ''))
 watch(conversations, schedulePersistConversations)
 watch(conversationNotices, schedulePersistConversationNotices)
 watch(activeConversationId, schedulePersistActiveConversationId)
@@ -887,6 +890,7 @@ async function sendTextMessage(conversation: StudioConversation) {
     await streamChatCompletion({
       model: chatModel.value,
       messages: buildChatMessages(conversation, assistantMessage.id),
+      reasoningEffort: chatReasoningEffort.value,
       signal: controller.signal,
       onDelta: (delta) => {
         scheduleDeltaFlush(delta)

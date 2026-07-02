@@ -133,6 +133,11 @@
       <div class="grid gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
         <div class="space-y-3">
           <Input v-model.trim="chatModel" type="text" placeholder="model，例如 auto" block />
+          <select v-model="chatReasoningEffort" class="debug-select" aria-label="思考强度">
+            <option v-for="option in reasoningEffortOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
           <textarea v-model.trim="chatInput" class="debug-textarea" rows="8" placeholder="输入消息"></textarea>
           <div v-if="chatError" class="debug-error">{{ chatError }}</div>
           <CodeBlock :content="chatRawJson" />
@@ -182,12 +187,20 @@ const searchElapsedMs = ref(0)
 const searchElapsedLabel = computed(() => `${(searchElapsedMs.value / 1000).toFixed(2)}s`)
 
 const chatModel = ref('auto')
+const chatReasoningEffort = ref('')
 const chatInput = ref('你好，先记住我的项目叫 chatgpt2api。')
 const chatMessages = ref<DebugChatMessage[]>([])
 const chatRaw = ref<DebugChatCompletion | null>(null)
 const chatLoading = ref(false)
 const chatError = ref('')
 const chatRawJson = computed(() => JSON.stringify(chatRaw.value || { messages: [] }, null, 2))
+const reasoningEffortOptions = [
+  { label: '默认思考', value: '' },
+  { label: '低', value: 'low' },
+  { label: '中', value: 'medium' },
+  { label: '高', value: 'high' },
+  { label: '扩展', value: 'extended' },
+]
 
 const editablePrompt = ref('')
 const editableImages = ref('')
@@ -336,7 +349,7 @@ async function sendChat() {
   chatLoading.value = true
   chatError.value = ''
   try {
-    const result = await debugApi.chat(chatModel.value, nextMessages)
+    const result = await debugApi.chat(chatModel.value, nextMessages, chatReasoningEffort.value)
     chatRaw.value = result
     chatMessages.value = [
       ...nextMessages,
@@ -428,6 +441,23 @@ function openUrl(url: string) {
   font-size: 13px;
   line-height: 1.65;
   outline: none;
+}
+
+.debug-select {
+  width: 100%;
+  height: 2.5rem;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  padding: 0 12px;
+  color: hsl(var(--foreground));
+  font-size: 13px;
+  outline: none;
+}
+
+.debug-select:focus {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.12);
 }
 
 .debug-textarea:focus {

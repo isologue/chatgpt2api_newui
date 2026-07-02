@@ -4,6 +4,7 @@ import type { DebugChatMessage } from './debug'
 export interface ChatStreamInput {
   model: string
   messages: DebugChatMessage[]
+  reasoningEffort?: string
   signal?: AbortSignal
   onDelta?: (delta: string) => void
 }
@@ -116,6 +117,7 @@ export async function streamChatCompletion(input: ChatStreamInput): Promise<Chat
       model: input.model.trim() || 'auto',
       messages: input.messages,
       stream: true,
+      ...(input.reasoningEffort ? { reasoning_effort: input.reasoningEffort } : {}),
     }),
     signal: input.signal,
   })

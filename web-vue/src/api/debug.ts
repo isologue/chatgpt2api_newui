@@ -64,11 +64,12 @@ function endpointForEditableKind(kind: DebugEditableKind) {
 export const debugApi = {
   search: async (prompt: string) => apiClient.post<{ prompt: string }, DebugSearchResult>('/v1/search', { prompt }),
 
-  chat: async (model: string, messages: DebugChatMessage[]) => apiClient.post<Record<string, unknown>, DebugChatCompletion>(
+  chat: async (model: string, messages: DebugChatMessage[], reasoningEffort = '') => apiClient.post<Record<string, unknown>, DebugChatCompletion>(
     '/v1/chat/completions',
     {
       model: model.trim() || 'auto',
       messages,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     },
   ),
 
