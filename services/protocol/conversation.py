@@ -1148,6 +1148,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
+        active_backend: OpenAIBackendAPI | None = None
         try:
             _remember_text_account(backend, token)
             active_backend = OpenAIBackendAPI(access_token=token)
@@ -1181,6 +1182,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             if token and not getattr(exc, "account_email", ""):
                 setattr(exc, "account_email", _text_account_email(token))
             raise
+        finally:
+            if active_backend is not None:
+                active_backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -2300,6 +2304,8 @@ def _generate_single_image(
         finally:
             if egress_acquired and backend is not None:
                 proxy_settings.release_image_egress(backend.proxy_profile)
+            if backend is not None:
+                backend.close()
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:

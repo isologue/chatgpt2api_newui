@@ -600,6 +600,7 @@ class ImageTaskService:
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
+        backend = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
@@ -675,6 +676,9 @@ class ImageTaskService:
                 error=error_message,
                 extra=error_details,
             )
+        finally:
+            if backend is not None:
+                backend.close()
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

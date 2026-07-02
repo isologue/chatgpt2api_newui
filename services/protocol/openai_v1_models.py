@@ -37,7 +37,8 @@ def _append_models(data: list[Any], seen: set[str], models: object) -> None:
 
 def _append_upstream_models(data: list[Any], seen: set[str]) -> None:
     try:
-        result = OpenAIBackendAPI().list_models()
+        with OpenAIBackendAPI() as backend:
+            result = backend.list_models()
     except Exception:
         return
     upstream_data = result.get("data")

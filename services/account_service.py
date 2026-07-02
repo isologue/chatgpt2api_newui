@@ -1124,12 +1124,14 @@ class AccountService:
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(active_token).get_user_info()
+            with OpenAIBackendAPI(active_token) as backend:
+                result = backend.get_user_info()
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                    with OpenAIBackendAPI(refreshed_token) as backend:
+                        result = backend.get_user_info()
                 except InvalidAccessTokenError as retry_exc:
                     self.handle_invalid_token(
                         refreshed_token,
