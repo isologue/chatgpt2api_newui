@@ -3,6 +3,9 @@
     <PagePanel class="gallery-hero">
       <PanelHeader title="图片管理">
         <template #actions>
+          <Button size="sm" variant="outline" :disabled="isLoading" @click="openStorageModal">
+            存储管理
+          </Button>
           <Button size="sm" variant="outline" :disabled="isLoading" @click="refreshAll">
             {{ isLoading ? '刷新中...' : '刷新' }}
           </Button>
@@ -183,6 +186,113 @@
       @close="operationProgress.open = false"
     />
 
+    <ModalShell
+      :open="isStorageModalOpen"
+      max-width="38rem"
+      close-on-backdrop
+      @close="closeStorageModal"
+    >
+      <div class="gallery-storage-modal">
+        <header class="gallery-storage-header">
+          <div>
+            <p class="ui-section-kicker">磁盘与图库</p>
+            <h3>存储管理</h3>
+            <p>查看图片占用、磁盘剩余空间，并执行简单清理。</p>
+          </div>
+          <Button size="sm" variant="ghost" icon-only aria-label="关闭存储管理" @click="closeStorageModal">
+            <Icon icon="lucide:x" class="h-4 w-4" />
+          </Button>
+        </header>
+
+        <ModalBody density="normal">
+          <div v-if="storageActionError" class="gallery-storage-alert is-error">
+            <Icon icon="lucide:circle-alert" class="h-4 w-4" />
+            <span>{{ storageActionError }}</span>
+          </div>
+          <div v-else-if="storageActionMessage" class="gallery-storage-alert is-success">
+            <Icon icon="lucide:circle-check" class="h-4 w-4" />
+            <span>{{ storageActionMessage }}</span>
+          </div>
+
+          <div class="gallery-storage-grid">
+            <div class="gallery-storage-card">
+              <span>磁盘总量</span>
+              <strong>{{ storageStats ? formatMb(storageStats.disk_total_mb) : '-' }}</strong>
+            </div>
+            <div class="gallery-storage-card">
+              <span>已用空间</span>
+              <strong>{{ storageStats ? formatMb(storageStats.disk_used_mb) : '-' }}</strong>
+            </div>
+            <div class="gallery-storage-card">
+              <span>剩余空间</span>
+              <strong>{{ storageStats ? formatMb(storageStats.disk_free_mb) : '-' }}</strong>
+            </div>
+            <div class="gallery-storage-card">
+              <span>图库占用</span>
+              <strong>{{ storageStats ? formatSize(storageStats.image_size_bytes) : formatSize(totalSize) }}</strong>
+            </div>
+          </div>
+
+          <div class="gallery-storage-meter" aria-label="磁盘使用率">
+            <div class="gallery-storage-meter__bar">
+              <span :style="{ width: storageUsageBarWidth }"></span>
+            </div>
+            <div class="gallery-storage-meter__meta">
+              <span>磁盘使用率</span>
+              <strong>{{ storageUsagePercent }}</strong>
+            </div>
+          </div>
+
+          <div class="gallery-storage-summary">
+            <div>
+              <span>图库文件</span>
+              <strong>{{ storageStats ? `${storageStats.image_count} 个` : `${counts.all} 个` }}</strong>
+            </div>
+            <div>
+              <span>当前筛选结果</span>
+              <strong>{{ totalItems }} 个 / {{ formatSize(totalSize) }}</strong>
+            </div>
+          </div>
+
+          <div class="gallery-storage-target">
+            <div>
+              <span>按目标剩余空间清理</span>
+              <p>输入希望保留的磁盘剩余空间，系统会从旧图片开始清理。</p>
+            </div>
+            <Input
+              :model-value="targetFreeMb"
+              type="number"
+              min="1"
+              placeholder="500"
+              root-class="gallery-storage-target-input"
+              @update:model-value="targetFreeMb = String($event)"
+            />
+            <div class="gallery-storage-target-actions">
+              <Button size="sm" variant="ghost" :disabled="isStorageBusy" @click="handleCleanupToTarget(true)">
+                预估
+              </Button>
+              <Button size="sm" variant="outline" :disabled="isStorageBusy" @click="handleCleanupToTarget(false)">
+                清理到目标
+              </Button>
+            </div>
+          </div>
+        </ModalBody>
+
+        <ModalFooter align="between" compact>
+          <Button size="sm" variant="ghost" :disabled="isStorageBusy" @click="refreshStorageStats">
+            {{ isStorageBusy ? '处理中...' : '刷新统计' }}
+          </Button>
+          <div class="gallery-storage-actions">
+            <Button size="sm" variant="outline" :disabled="isStorageBusy" @click="handleCompressStorage">
+              压缩图片
+            </Button>
+            <Button size="sm" variant="outline" :disabled="isStorageBusy" @click="handleCleanupExpired">
+              清理过期
+            </Button>
+          </div>
+        </ModalFooter>
+      </div>
+    </ModalShell>
   </div>
 </template>
 
@@ -202,6 +312,9 @@ import FilterToolbar from '@/components/ai/FilterToolbar.vue'
 import GalleryImageCard from '@/components/ai/GalleryImageCard.vue'
 import ListPagination from '@/components/ai/ListPagination.vue'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
+import ModalBody from '@/components/ai/ModalBody.vue'
+import ModalFooter from '@/components/ai/ModalFooter.vue'
+import ModalShell from '@/components/ai/ModalShell.vue'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
@@ -245,6 +358,11 @@ const allTags = ref<string[]>([])
 const selectedPaths = ref<Set<string>>(new Set())
 const brokenImagePaths = ref<Set<string>>(new Set())
 const storageStats = ref<ImageStorageStats | null>(null)
+const isStorageModalOpen = ref(false)
+const isStorageBusy = ref(false)
+const storageActionMessage = ref('')
+const storageActionError = ref('')
+const targetFreeMb = ref('500')
 const operationProgress = reactive({
   open: false,
   title: '',
@@ -266,6 +384,13 @@ const paginationSummary = computed(() => `第 ${currentPage.value} / ${pageCount
 const selectedCount = computed(() => selectedPaths.value.size)
 const allVisibleSelected = computed(() => files.value.length > 0 && files.value.every((file) => selectedPaths.value.has(file.path)))
 const draftTags = computed(() => parseTags(tagDraft.value))
+const storageUsagePercent = computed(() => {
+  const stats = storageStats.value
+  if (!stats || stats.disk_total_mb <= 0) return '-'
+  const percent = Math.min(100, Math.max(0, (stats.disk_used_mb / stats.disk_total_mb) * 100))
+  return `${percent.toFixed(1)}%`
+})
+const storageUsageBarWidth = computed(() => (storageUsagePercent.value === '-' ? '0%' : storageUsagePercent.value))
 let latestLoadToken = 0
 let copyResetTimer: number | null = null
 let searchTimer: number | null = null
@@ -320,6 +445,131 @@ async function loadGallery() {
 
 async function refreshAll() {
   await loadGallery()
+}
+
+async function refreshStorageStats(options: { lock?: boolean } = {}) {
+  const shouldLock = options.lock !== false
+  if (shouldLock) isStorageBusy.value = true
+  storageActionError.value = ''
+  try {
+    storageStats.value = await galleryApi.getStorage()
+  } catch (error: any) {
+    storageActionError.value = error?.message || '刷新存储统计失败'
+    toast.error(storageActionError.value, '刷新失败')
+  } finally {
+    if (shouldLock) isStorageBusy.value = false
+  }
+}
+
+function openStorageModal() {
+  isStorageModalOpen.value = true
+  storageActionMessage.value = ''
+  storageActionError.value = ''
+  void refreshStorageStats()
+}
+
+function closeStorageModal() {
+  if (isStorageBusy.value) return
+  isStorageModalOpen.value = false
+}
+
+async function handleCompressStorage() {
+  const confirmed = await confirmDialog.ask({
+    title: '压缩图片',
+    message: '将尝试压缩本地图片以释放空间。该操作可能需要一点时间，确定继续吗？',
+    confirmText: '开始压缩',
+    cancelText: '取消',
+  })
+  if (!confirmed) return
+
+  isStorageBusy.value = true
+  storageActionMessage.value = '正在压缩图片...'
+  storageActionError.value = ''
+  try {
+    const result = await galleryApi.compressStorage()
+    storageActionMessage.value = `压缩完成：处理 ${Number(result.compressed || 0)} 张，节省 ${formatSize(Number(result.saved_bytes || 0))}。`
+    toast.success(storageActionMessage.value, '压缩完成')
+    await Promise.all([refreshStorageStats({ lock: false }), loadGallery()])
+  } catch (error: any) {
+    storageActionError.value = error?.message || '压缩图片失败'
+    toast.error(storageActionError.value, '压缩失败')
+  } finally {
+    isStorageBusy.value = false
+  }
+}
+
+async function handleCleanupExpired() {
+  const confirmed = await confirmDialog.ask({
+    title: '清理过期图片',
+    message: '将删除图库中已过期的图片记录和文件。此操作不可恢复，确定继续吗？',
+    confirmText: '清理过期',
+    cancelText: '取消',
+  })
+  if (!confirmed) return
+
+  isStorageBusy.value = true
+  storageActionMessage.value = '正在清理过期图片...'
+  storageActionError.value = ''
+  try {
+    const result = await galleryApi.cleanupExpired()
+    storageActionMessage.value = result.message || `已清理 ${Number(result.deleted || 0)} 张过期图片。`
+    toast.success(storageActionMessage.value, '清理完成')
+    await Promise.all([refreshStorageStats({ lock: false }), loadGallery()])
+  } catch (error: any) {
+    storageActionError.value = error?.message || '清理过期图片失败'
+    toast.error(storageActionError.value, '清理失败')
+  } finally {
+    isStorageBusy.value = false
+  }
+}
+
+async function handleCleanupToTarget(dryRun: boolean) {
+  const target = Number(targetFreeMb.value)
+  if (!Number.isFinite(target) || target < 1) {
+    storageActionError.value = '请输入有效的目标剩余空间。'
+    toast.error(storageActionError.value, '参数错误')
+    return
+  }
+
+  const normalizedTarget = Math.floor(target)
+  if (!dryRun) {
+    const confirmed = await confirmDialog.ask({
+      title: '清理到目标空间',
+      message: `将从旧图片开始清理，直到磁盘剩余空间尽量达到 ${formatMb(normalizedTarget)}。此操作不可恢复，确定继续吗？`,
+      confirmText: '开始清理',
+      cancelText: '取消',
+    })
+    if (!confirmed) return
+  }
+
+  isStorageBusy.value = true
+  storageActionMessage.value = dryRun ? '正在预估可清理图片...' : '正在清理到目标剩余空间...'
+  storageActionError.value = ''
+  try {
+    const result = await galleryApi.cleanupToTarget(normalizedTarget, dryRun)
+    const removed = Number(result.removed || 0)
+    const freedLabel = formatMb(Number(result.freed_mb || 0))
+    const currentLabel = formatMb(Number(result.current_free_mb || 0))
+    const targetLabel = formatMb(Number(result.target_free_mb || normalizedTarget))
+    if (dryRun) {
+      storageActionMessage.value = removed > 0
+        ? `预估会清理 ${removed} 张，预计释放 ${freedLabel}。当前剩余 ${currentLabel} / 目标 ${targetLabel}。`
+        : `无需清理：当前剩余 ${currentLabel}，已达到目标 ${targetLabel}。`
+      toast.success(storageActionMessage.value, '预估完成')
+      await refreshStorageStats({ lock: false })
+    } else {
+      storageActionMessage.value = removed > 0
+        ? `已清理 ${removed} 张，释放 ${freedLabel}。当前剩余 ${currentLabel} / 目标 ${targetLabel}。`
+        : `没有需要清理的图片。当前剩余 ${currentLabel} / 目标 ${targetLabel}。`
+      toast.success(storageActionMessage.value, '清理完成')
+      await Promise.all([refreshStorageStats({ lock: false }), loadGallery()])
+    }
+  } catch (error: any) {
+    storageActionError.value = error?.message || '按目标剩余空间清理失败'
+    toast.error(storageActionError.value, '清理失败')
+  } finally {
+    isStorageBusy.value = false
+  }
 }
 
 function resetAndLoad() {
@@ -590,6 +840,10 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
+function formatMb(value: number): string {
+  return formatSize(Number(value || 0) * 1024 * 1024)
+}
+
 function formatTimeRemaining(seconds: number): string {
   if (seconds <= 0) return '已过期'
   const d = Math.floor(seconds / 86400)
@@ -730,6 +984,175 @@ onBeforeUnmount(() => {
   border-radius: 0;
 }
 
+.gallery-storage-modal {
+  background: hsl(var(--card));
+}
+
+.gallery-storage-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid hsl(var(--border));
+  padding: 16px 20px 14px;
+}
+
+.gallery-storage-header h3 {
+  margin-top: 4px;
+  color: hsl(var(--foreground));
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.gallery-storage-header p:last-child {
+  margin-top: 4px;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.8125rem;
+}
+
+.gallery-storage-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.gallery-storage-alert.is-error {
+  border: 1px solid rgb(244 63 94 / 0.28);
+  background: rgb(244 63 94 / 0.08);
+  color: rgb(190 18 60);
+}
+
+.gallery-storage-alert.is-success {
+  border: 1px solid rgb(16 185 129 / 0.24);
+  background: rgb(16 185 129 / 0.08);
+  color: rgb(4 120 87);
+}
+
+.gallery-storage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.gallery-storage-card {
+  min-width: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  background: hsl(var(--muted) / 0.24);
+  padding: 12px;
+}
+
+.gallery-storage-card span,
+.gallery-storage-summary span {
+  display: block;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+}
+
+.gallery-storage-card strong,
+.gallery-storage-summary strong {
+  display: block;
+  margin-top: 4px;
+  color: hsl(var(--foreground));
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.gallery-storage-meter {
+  margin-top: 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  padding: 12px;
+}
+
+.gallery-storage-meter__bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+}
+
+.gallery-storage-meter__bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, hsl(var(--primary)), rgb(20 184 166));
+  transition: width 0.2s ease;
+}
+
+.gallery-storage-meter__meta,
+.gallery-storage-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gallery-storage-meter__meta {
+  margin-top: 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+}
+
+.gallery-storage-meter__meta strong {
+  color: hsl(var(--foreground));
+}
+
+.gallery-storage-summary {
+  margin-top: 12px;
+  border-radius: 14px;
+  background: hsl(var(--secondary) / 0.42);
+  padding: 12px;
+}
+
+.gallery-storage-target {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 7.5rem auto;
+  align-items: end;
+  gap: 10px;
+  margin-top: 12px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 14px;
+  background: hsl(var(--muted) / 0.18);
+  padding: 12px;
+}
+
+.gallery-storage-target span {
+  display: block;
+  color: hsl(var(--foreground));
+  font-size: 0.8125rem;
+  font-weight: 700;
+}
+
+.gallery-storage-target p {
+  margin-top: 4px;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+:deep(.gallery-storage-target-input) {
+  min-width: 0;
+}
+
+.gallery-storage-target-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.gallery-storage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .image-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
@@ -746,6 +1169,35 @@ onBeforeUnmount(() => {
   .gallery-content-toolbar {
     align-items: stretch;
     border-radius: var(--gallery-radius);
+  }
+
+  .gallery-storage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .gallery-storage-summary {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .gallery-storage-target {
+    grid-template-columns: 1fr;
+  }
+
+  .gallery-storage-target-actions {
+    justify-content: stretch;
+  }
+
+  .gallery-storage-target-actions > * {
+    flex: 1 1 auto;
+  }
+
+  .gallery-storage-actions {
+    width: 100%;
+  }
+
+  .gallery-storage-actions > * {
+    flex: 1 1 auto;
   }
 
 }
