@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" />
 </p>
-<p align="center"><strong>当前稳定版本：v2.6.0</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.6.0">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
+<p align="center"><strong>当前稳定版本：v2.6.1</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.6.1">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
 
 ---
 
@@ -30,6 +30,8 @@
 
 本版本使用新的 Vue 控制台，主题和交互与原版前端不同；除前端实现差异外，接口、配置和部署口径会尽量保持与原版一致。
 
+在原版基础上，本分支重点扩展了多出口代理组、备用出口、图片链路诊断、对话画图 WebUI、远程账号导入、注册邮箱链路、图片存储管理和搜索/推理强度等能力，目标是在保持 OpenAI 兼容入口的同时，提供更适合自托管、多账号和高并发图片场景的管理体验。
+
 发布仓库只保留主服务、Vue 控制台和必要部署文件；旧版前端、测试文件、临时文档和运行产物不进入发布内容。
 
 ---
@@ -37,13 +39,13 @@
 ## 核心能力
 
 - OpenAI 兼容接口：覆盖图片生成、图片编辑、文本对话、Responses、Messages、网页搜索、PPT/PSD/可编辑文件任务等已实现链路，可接入常见 SDK、网关或客户端。
-- 对话画图工作台：把文本对话、搜索、文生图、图生图、多图参考、Markdown 渲染、官网式引用和图片任务进度放在同一会话里。
+- 对话画图工作台：把文本对话、搜索、文生图、图生图、多图参考、Markdown 渲染、官网式引用、推理强度和图片任务进度放在同一会话里。
 - 图片链路诊断：记录账号、出口、conversation id、上游原始错误、SSE/轮询/下载阶段耗时，支持实时监控和调用日志排查。
 - 多账号调度：支持账号导入、刷新、额度读取、分组、代理优先级、异常账号自动移除和批量管理。
 - 远程账号导入：支持本地 CPA JSON、远程 CPA、Sub2API、access token 导入；Sub2API / CPA 可按远程分组折叠选择、全组选中、去重和批量导入。
 - 注册账号链路：支持临时邮箱、GPTMail、Outlook Token 邮箱池和 Microsoft plus alias，提供验证码等待、注册进度、邮箱池状态和实时日志。
-- 代理与稳定出口：支持账号代理、账号组代理、多出口代理组、备用出口、WARP / Privoxy / FlareSolverr 稳定代理运行时和 Cloudflare clearance 测试。
-- 管理控制台：包含概览中心、账号管理、日志管理、实时监控、图片管理、代理管理、注册账号、对话画图、调试中心和系统设置。
+- 代理与稳定出口：支持账号代理、账号组代理、多出口代理组、节点并发、备用出口、WARP / Privoxy / FlareSolverr 稳定代理运行时和 Cloudflare clearance 测试。
+- 管理控制台：包含概览中心、账号管理、日志管理、实时监控、图片管理/存储管理、代理管理、注册账号、对话画图、调试中心和系统设置。
 - 自托管部署：支持 Docker、一键脚本、JSON / SQLite / PostgreSQL / Git 账号存储后端、WebDAV 图片存储和 R2 备份。
 
 ---
@@ -104,7 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/main/deploy/ins
 固定安装当前稳定版：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.6.0/deploy/install.sh | sudo bash -s -- --branch v2.6.0
+curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.6.1/deploy/install.sh | sudo bash -s -- --branch v2.6.1
 ```
 
 ### Docker 运行
