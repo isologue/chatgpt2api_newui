@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity, resolve_image_base_url
+from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import config
 from services.image_service import (
@@ -143,6 +144,11 @@ class RetentionCleanupRequest(BaseModel):
     image_retention_days: int | None = None
 
 
+class AccountCleanupRequest(BaseModel):
+    auto_remove_invalid_accounts: bool | None = None
+    auto_remove_rate_limited_accounts: bool | None = None
+
+
 def _clean_text(value: object) -> str:
     return str(value or "").strip()
 
@@ -248,6 +254,17 @@ def _retention_cleanup_payload(body: RetentionCleanupRequest | None = None, *, d
         "total_removed": total_removed,
         "total_size_bytes": total_size,
     }
+
+
+def _account_cleanup_payload(body: AccountCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
+    body = body or AccountCleanupRequest()
+    kwargs = {
+        "remove_invalid": body.auto_remove_invalid_accounts,
+        "remove_rate_limited": body.auto_remove_rate_limited_accounts,
+    }
+    if dry_run:
+        return account_service.preview_auto_remove_accounts(**kwargs)
+    return account_service.cleanup_auto_remove_accounts(**kwargs)
 
 
 def _proxy_profile_id(value: object) -> str:
@@ -653,6 +670,16 @@ def create_router(app_version: str) -> APIRouter:
     async def run_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=False)
+
+    @router.post("/api/settings/account-cleanup/preview")
+    async def preview_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=True)
+
+    @router.post("/api/settings/account-cleanup/run")
+    async def run_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=False)
 
     @router.get("/api/model-catalog")
     async def model_catalog(authorization: str | None = Header(default=None)):

@@ -42,6 +42,20 @@ export interface RetentionCleanupResult {
   total_size_bytes: number
 }
 
+export interface AccountCleanupRequest {
+  auto_remove_invalid_accounts?: boolean
+  auto_remove_rate_limited_accounts?: boolean
+}
+
+export interface AccountCleanupResult {
+  dry_run: boolean
+  invalid: number
+  rate_limited: number
+  total_removed: number
+  auto_remove_invalid_accounts: boolean
+  auto_remove_rate_limited_accounts: boolean
+}
+
 export interface BackupState {
   running?: boolean
   last_status?: string
@@ -463,4 +477,10 @@ export const settingsApi = {
 
   runRetentionCleanup: (payload: RetentionCleanupRequest = {}) =>
     apiClient.post<RetentionCleanupRequest, RetentionCleanupResult>('/api/settings/retention-cleanup/run', payload),
+
+  previewAccountCleanup: (payload: AccountCleanupRequest = {}) =>
+    apiClient.post<AccountCleanupRequest, AccountCleanupResult>('/api/settings/account-cleanup/preview', payload),
+
+  runAccountCleanup: (payload: AccountCleanupRequest = {}) =>
+    apiClient.post<AccountCleanupRequest, AccountCleanupResult>('/api/settings/account-cleanup/run', payload),
 }

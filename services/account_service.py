@@ -887,6 +887,96 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    def _auto_remove_tokens_locked(
+        self,
+        *,
+        remove_invalid: bool,
+        remove_rate_limited: bool,
+    ) -> tuple[list[str], list[str]]:
+        invalid_tokens = [
+            token
+            for item in self._accounts.values()
+            if remove_invalid
+               and item.get("status") == "异常"
+               and (token := item.get("access_token") or "")
+        ]
+        rate_limited_tokens = [
+            token
+            for item in self._accounts.values()
+            if remove_rate_limited
+               and item.get("status") == "限流"
+               and (token := item.get("access_token") or "")
+        ]
+        return invalid_tokens, rate_limited_tokens
+
+    def preview_auto_remove_accounts(
+        self,
+        *,
+        remove_invalid: bool | None = None,
+        remove_rate_limited: bool | None = None,
+    ) -> dict[str, Any]:
+        remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
+        remove_rate_limited = (
+            config.auto_remove_rate_limited_accounts
+            if remove_rate_limited is None
+            else bool(remove_rate_limited)
+        )
+        with self._lock:
+            invalid_tokens, rate_limited_tokens = self._auto_remove_tokens_locked(
+                remove_invalid=remove_invalid,
+                remove_rate_limited=remove_rate_limited,
+            )
+        invalid = len(invalid_tokens)
+        rate_limited = len(rate_limited_tokens)
+        return {
+            "dry_run": True,
+            "invalid": invalid,
+            "rate_limited": rate_limited,
+            "total_removed": invalid + rate_limited,
+            "auto_remove_invalid_accounts": remove_invalid,
+            "auto_remove_rate_limited_accounts": remove_rate_limited,
+        }
+
+    def cleanup_auto_remove_accounts(
+        self,
+        *,
+        remove_invalid: bool | None = None,
+        remove_rate_limited: bool | None = None,
+    ) -> dict[str, Any]:
+        remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
+        remove_rate_limited = (
+            config.auto_remove_rate_limited_accounts
+            if remove_rate_limited is None
+            else bool(remove_rate_limited)
+        )
+        with self._lock:
+            invalid_tokens, rate_limited_tokens = self._auto_remove_tokens_locked(
+                remove_invalid=remove_invalid,
+                remove_rate_limited=remove_rate_limited,
+            )
+
+        target_tokens = list(dict.fromkeys([*invalid_tokens, *rate_limited_tokens]))
+        result = self.delete_accounts(target_tokens, return_items=False) if target_tokens else {"removed": 0}
+        removed = int(result.get("removed") or 0)
+        if removed:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "按账号自动移除策略清理账号",
+                {
+                    "removed": removed,
+                    "invalid": len(invalid_tokens),
+                    "rate_limited": len(rate_limited_tokens),
+                },
+            )
+        return {
+            "dry_run": False,
+            "invalid": len(invalid_tokens),
+            "rate_limited": len(rate_limited_tokens),
+            "total_removed": removed,
+            "auto_remove_invalid_accounts": remove_invalid,
+            "auto_remove_rate_limited_accounts": remove_rate_limited,
+        }
+
     def list_normal_tokens(self) -> list[str]:
         with self._lock:
             return [

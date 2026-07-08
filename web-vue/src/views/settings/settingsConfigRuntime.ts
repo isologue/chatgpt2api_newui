@@ -5,6 +5,8 @@ import {
   prepareSettingsForEdit,
   prepareSettingsPatch,
   settingsApi,
+  type AccountCleanupRequest,
+  type AccountCleanupResult,
   type RetentionCleanupRequest,
   type RetentionCleanupResult,
 } from '@/api/settings'
@@ -44,7 +46,18 @@ function cleanupRequest(settings: Settings): RetentionCleanupRequest {
   }
 }
 
+function accountCleanupRequest(settings: Settings): AccountCleanupRequest {
+  return {
+    auto_remove_invalid_accounts: Boolean(settings.auto_remove_invalid_accounts),
+    auto_remove_rate_limited_accounts: Boolean(settings.auto_remove_rate_limited_accounts),
+  }
+}
+
 function hasRetentionCleanupTargets(result: RetentionCleanupResult): boolean {
+  return Number(result.total_removed || 0) > 0
+}
+
+function hasAccountCleanupTargets(result: AccountCleanupResult): boolean {
   return Number(result.total_removed || 0) > 0
 }
 
@@ -59,6 +72,19 @@ function retentionCleanupMessage(result: RetentionCleanupResult): string {
 
 function cleanupDoneMessage(result: RetentionCleanupResult): string {
   return `清理完成：删除 ${result.total_removed || 0} 项，释放 ${formatBytes(result.total_size_bytes)}`
+}
+
+function accountCleanupMessage(result: AccountCleanupResult): string {
+  return [
+    `按当前账号策略检测到 ${result.total_removed} 个可移除账号。`,
+    `异常账号：${result.invalid || 0} 个。`,
+    `额度耗尽账号：${result.rate_limited || 0} 个。`,
+    '是否立即移除这些账号？正常账号不会受影响。',
+  ].join('\n')
+}
+
+function accountCleanupDoneMessage(result: AccountCleanupResult): string {
+  return `账号清理完成：移除 ${result.total_removed || 0} 个账号`
 }
 
 export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) {
@@ -152,6 +178,36 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
     }
   }
 
+  async function offerAccountCleanup() {
+    if (!localSettings.value) return
+    const payload = accountCleanupRequest(localSettings.value)
+    if (!payload.auto_remove_invalid_accounts && !payload.auto_remove_rate_limited_accounts) return
+
+    let preview: AccountCleanupResult
+    try {
+      preview = await settingsApi.previewAccountCleanup(payload)
+    } catch (error) {
+      toast.warning(`账号清理检测失败：${errorMessage(error, '无法检测可移除账号')}`)
+      return
+    }
+    if (!hasAccountCleanupTargets(preview)) return
+
+    const confirmed = await confirmDialog.ask({
+      title: '检测到可移除账号',
+      message: accountCleanupMessage(preview),
+      confirmText: '立即移除',
+      cancelText: '稍后处理',
+    })
+    if (!confirmed) return
+
+    try {
+      const result = await settingsApi.runAccountCleanup(payload)
+      toast.success(accountCleanupDoneMessage(result))
+    } catch (error) {
+      toast.error(`账号清理失败：${errorMessage(error, '无法移除账号')}`)
+    }
+  }
+
   async function reloadSettings() {
     await settingsReloadQuery.run(
       async () => {
@@ -179,6 +235,7 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
     isSaving.value = true
     try {
       await persistSettings(true)
+      await offerAccountCleanup()
       await offerRetentionCleanup()
     } catch (error) {
       toast.error(errorMessage(error, '保存失败'))
