@@ -125,6 +125,12 @@ def get_model_catalog() -> dict[str, Any]:
     image_models = _unique(image_models)
     all_models = _unique([*chat_models, *image_models])
 
+    # Convert model names to external display format (gpt-5-5 -> gpt-5.5)
+    from utils.helper import model_to_dot
+    chat_models = [model_to_dot(m) for m in chat_models]
+    image_models = [model_to_dot(m) for m in image_models]
+    all_models = [model_to_dot(m) for m in all_models]
+
     return {
         "object": "model_catalog",
         "chat_models": chat_models,

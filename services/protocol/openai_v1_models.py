@@ -5,12 +5,13 @@ from typing import Any
 from services.account_service import account_service
 from services.model_catalog_service import get_model_catalog
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, model_to_dot
 
 
 def _model_item(model: str) -> dict[str, Any]:
+    display = model_to_dot(model)
     return {
-        "id": model,
+        "id": display,
         "object": "model",
         "created": 0,
         "owned_by": "chatgpt2api",

@@ -30,7 +30,7 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, model_from_dot, model_to_dot, parse_image_count
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -50,7 +50,7 @@ def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | Non
         "id": completion_id or f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion.chunk",
         "created": created or int(time.time()),
-        "model": model,
+        "model": model_to_dot(model),
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
 
@@ -175,7 +175,7 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    model = str(body.get("model") or "auto").strip() or "auto"
+    model = model_from_dot(str(body.get("model") or "auto").strip() or "auto")
     messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
     if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})

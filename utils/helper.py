@@ -27,6 +27,24 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+
+# --- Model name mapping: external (dot) <-> internal (dash) ---
+# External: gpt-5.5 (OpenAI official style)  Internal: gpt-5-5 (backend routing)
+_MODEL_DOT_RE = re.compile(r"^(gpt-\d)-(\d)")
+
+
+def model_to_dot(name: str) -> str:
+    """Convert internal model name to external display format.
+    gpt-5-5 -> gpt-5.5, gpt-5-3-mini -> gpt-5.3-mini"""
+    return _MODEL_DOT_RE.sub(r"\1.\2", name)
+
+
+def model_from_dot(name: str) -> str:
+    """Convert external model name to internal routing format.
+    gpt-5.5 -> gpt-5-5, gpt-5.3-mini -> gpt-5-3-mini"""
+    return re.sub(r"^(gpt-\d)\.(\d)", r"\1-\2", name)
+
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
