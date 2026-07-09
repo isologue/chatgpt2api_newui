@@ -48,6 +48,7 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _POOL_HEALTH_REFRESH_BATCH_SIZE = 10
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -338,6 +339,12 @@ class AccountService:
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
+        normalized["last_remote_checked_at"] = normalized.get("last_remote_checked_at") or None
+        normalized["last_remote_check_attempt_at"] = normalized.get("last_remote_check_attempt_at") or None
+        normalized["last_remote_check_error"] = normalized.get("last_remote_check_error") or None
+        normalized["last_remote_check_error_at"] = normalized.get("last_remote_check_error_at") or None
+        normalized["last_remote_check_event"] = normalized.get("last_remote_check_event") or None
+        normalized["last_remote_check_result"] = normalized.get("last_remote_check_result") or None
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
@@ -986,6 +993,163 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    @classmethod
+    def _pool_health_freshness_seconds(cls, freshness_seconds: int | float | None = None) -> int:
+        if freshness_seconds is not None:
+            try:
+                return max(60, int(float(freshness_seconds)))
+            except (TypeError, ValueError):
+                pass
+        return max(60, int(config.refresh_account_interval_minute) * 60)
+
+    @classmethod
+    def _remote_check_is_fresh(cls, account: dict, now: datetime, freshness_seconds: int) -> bool:
+        checked_at = cls._parse_time(account.get("last_remote_checked_at"))
+        return checked_at is not None and (now - checked_at).total_seconds() <= freshness_seconds
+
+    @classmethod
+    def _remote_check_attempt_is_recent(cls, account: dict, now: datetime, freshness_seconds: int) -> bool:
+        attempted_at = cls._parse_time(account.get("last_remote_check_attempt_at"))
+        return attempted_at is not None and (now - attempted_at).total_seconds() <= freshness_seconds
+
+    @classmethod
+    def _pool_health_metrics_from_accounts(
+        cls,
+        accounts: list[dict],
+        *,
+        now: datetime,
+        freshness_seconds: int,
+    ) -> dict[str, Any]:
+        local_normal = [item for item in accounts if item.get("status") == "正常"]
+        confirmed_normal = [
+            item
+            for item in local_normal
+            if cls._remote_check_is_fresh(item, now, freshness_seconds)
+        ]
+        latest_checked_at = ""
+        for item in accounts:
+            checked_at = cls._parse_time(item.get("last_remote_checked_at"))
+            if checked_at is None:
+                continue
+            value = checked_at.isoformat()
+            if not latest_checked_at or value > latest_checked_at:
+                latest_checked_at = value
+        return {
+            "current_quota": sum(
+                int(item.get("quota") or 0)
+                for item in confirmed_normal
+                if not item.get("image_quota_unknown")
+            ),
+            "current_available": len(confirmed_normal),
+            "estimated_quota": sum(
+                int(item.get("quota") or 0)
+                for item in local_normal
+                if not item.get("image_quota_unknown")
+            ),
+            "estimated_available": len(local_normal),
+            "unconfirmed_available": max(0, len(local_normal) - len(confirmed_normal)),
+            "unknown_quota_count": sum(1 for item in confirmed_normal if item.get("image_quota_unknown")),
+            "pool_freshness_seconds": freshness_seconds,
+            "pool_last_checked_at": latest_checked_at,
+        }
+
+    @classmethod
+    def _pool_health_stale_tokens(
+        cls,
+        accounts: list[dict],
+        *,
+        now: datetime,
+        freshness_seconds: int,
+    ) -> list[str]:
+        stale: list[tuple[float, str]] = []
+        for item in accounts:
+            token = str(item.get("access_token") or "").strip()
+            if not token or item.get("status") != "正常":
+                continue
+            if cls._remote_check_is_fresh(item, now, freshness_seconds):
+                continue
+            if cls._remote_check_attempt_is_recent(item, now, freshness_seconds):
+                continue
+            checked_at = cls._parse_time(item.get("last_remote_checked_at"))
+            sort_key = checked_at.timestamp() if checked_at else 0.0
+            stale.append((sort_key, token))
+        stale.sort(key=lambda item: item[0])
+        return [token for _, token in stale]
+
+    @staticmethod
+    def _pool_health_target_reached(
+        metrics: dict[str, Any],
+        *,
+        target_quota: int | None = None,
+        target_available: int | None = None,
+    ) -> bool:
+        if target_quota is not None and int(metrics.get("current_quota") or 0) >= max(1, int(target_quota)):
+            return True
+        if target_available is not None and int(metrics.get("current_available") or 0) >= max(1, int(target_available)):
+            return True
+        return False
+
+    def evaluate_account_pool(
+        self,
+        *,
+        refresh_stale: bool = False,
+        target_quota: int | None = None,
+        target_available: int | None = None,
+        freshness_seconds: int | float | None = None,
+    ) -> dict[str, Any]:
+        """Return registration-facing account pool metrics from remotely confirmed data.
+
+        Local quota is useful for display, but registration stop decisions should not
+        trust stale local quota.  This method refreshes only stale normal accounts,
+        in small batches, until the requested target is confirmed or no eligible
+        stale accounts remain.
+        """
+        freshness = self._pool_health_freshness_seconds(freshness_seconds)
+        refreshed = 0
+        refresh_errors: list[dict[str, Any]] = []
+
+        while True:
+            now = datetime.now(timezone.utc)
+            accounts = self.list_accounts()
+            metrics = self._pool_health_metrics_from_accounts(
+                accounts,
+                now=now,
+                freshness_seconds=freshness,
+            )
+            if not refresh_stale:
+                return {
+                    **metrics,
+                    "pool_refreshed": refreshed,
+                    "pool_refresh_errors": refresh_errors,
+                }
+            if self._pool_health_target_reached(
+                metrics,
+                target_quota=target_quota,
+                target_available=target_available,
+            ):
+                return {
+                    **metrics,
+                    "pool_refreshed": refreshed,
+                    "pool_refresh_errors": refresh_errors,
+                }
+
+            stale_tokens = self._pool_health_stale_tokens(
+                accounts,
+                now=now,
+                freshness_seconds=freshness,
+            )
+            if not stale_tokens:
+                return {
+                    **metrics,
+                    "pool_refreshed": refreshed,
+                    "pool_refresh_errors": refresh_errors,
+                }
+
+            batch = stale_tokens[: self._POOL_HEALTH_REFRESH_BATCH_SIZE]
+            result = self.refresh_accounts(batch, remove_invalid=False)
+            refreshed += int(result.get("refreshed") or 0)
+            refresh_errors.extend(result.get("errors") or [])
+
     @staticmethod
     def _account_payload_token(item: dict) -> str:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()
@@ -1121,7 +1285,8 @@ class AccountService:
             return dict(account)
         return None
 
-    def _record_refresh_success(self, access_token: str) -> None:
+    def _record_refresh_success(self, access_token: str, event: str = "fetch_remote_info") -> None:
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1132,9 +1297,38 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["last_remote_checked_at"] = now
+            next_item["last_remote_check_attempt_at"] = now
+            next_item["last_remote_check_error"] = None
+            next_item["last_remote_check_error_at"] = None
+            next_item["last_remote_check_event"] = event
+            next_item["last_remote_check_result"] = "ok"
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
+
+    def _record_remote_check_error(
+        self,
+        access_token: str,
+        event: str,
+        error: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["last_remote_check_attempt_at"] = now
+            next_item["last_remote_check_error"] = str(error or "remote check failed")
+            next_item["last_remote_check_error_at"] = now
+            next_item["last_remote_check_event"] = event
+            next_item["last_remote_check_result"] = "error"
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[access_token] = account
+                self._save_accounts()
 
     def _record_invalid_token_seen(
         self,
@@ -1155,6 +1349,12 @@ class AccountService:
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
+            next_item["last_remote_checked_at"] = now.isoformat()
+            next_item["last_remote_check_attempt_at"] = now.isoformat()
+            next_item["last_remote_check_error"] = str(error or "invalid access token")
+            next_item["last_remote_check_error_at"] = now.isoformat()
+            next_item["last_remote_check_event"] = event
+            next_item["last_remote_check_result"] = "invalid"
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1230,6 +1430,9 @@ class AccountService:
                         remove=remove_invalid,
                     )
                     raise
+                except Exception as retry_exc:
+                    self._record_remote_check_error(refreshed_token, event, str(retry_exc))
+                    raise
                 active_token = refreshed_token
             else:
                 self.handle_invalid_token(
@@ -1239,7 +1442,10 @@ class AccountService:
                     remove=remove_invalid,
                 )
                 raise
-        self._record_refresh_success(active_token)
+        except Exception as exc:
+            self._record_remote_check_error(active_token, event, str(exc))
+            raise
+        self._record_refresh_success(active_token, event)
         updated = self.update_account(active_token, result)
         if updated is not None:
             return updated
