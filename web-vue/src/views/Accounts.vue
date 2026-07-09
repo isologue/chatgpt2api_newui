@@ -959,6 +959,31 @@ const refreshProgressItems = computed(() => [
     label: '状态',
     value: refreshProgressStatusText.value,
   },
+  {
+    key: 'normal',
+    label: '正常',
+    value: refreshProgress.value?.status_counts?.['正常'] ?? 0,
+  },
+  {
+    key: 'limited',
+    label: '限流',
+    value: refreshProgress.value?.status_counts?.['限流'] ?? 0,
+  },
+  {
+    key: 'suspicious',
+    label: '存疑',
+    value: refreshProgress.value?.status_counts?.['存疑'] ?? 0,
+  },
+  {
+    key: 'abnormal',
+    label: '异常',
+    value: refreshProgress.value?.status_counts?.['异常'] ?? 0,
+  },
+  {
+    key: 'disabled',
+    label: '禁用',
+    value: refreshProgress.value?.status_counts?.['禁用'] ?? 0,
+  },
 ])
 
 const bindAccountGroupBatchItems = computed<AccountActionMenuItem[]>(() => {

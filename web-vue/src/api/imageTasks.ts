@@ -64,6 +64,7 @@ export interface ImageQuotaSummary {
   unknown_quota_count: number
   active_accounts: number
   limited_accounts: number
+  suspicious_accounts?: number
   abnormal_accounts: number
   disabled_accounts: number
   available: boolean
@@ -295,6 +296,7 @@ function normalizeQuotaSummary(response: Partial<ImageQuotaSummary>): ImageQuota
     unknown_quota_count: unknown,
     active_accounts: numberValue(response.active_accounts),
     limited_accounts: numberValue(response.limited_accounts),
+    suspicious_accounts: numberValue(response.suspicious_accounts),
     abnormal_accounts: numberValue(response.abnormal_accounts),
     disabled_accounts: numberValue(response.disabled_accounts),
     available: typeof response.available === 'boolean' ? response.available : totalQuota > 0 || unlimited > 0 || unknown > 0,

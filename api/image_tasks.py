@@ -39,6 +39,7 @@ def _image_quota_payload(stats: dict) -> dict[str, object]:
         "unknown_quota_count": unknown,
         "active_accounts": max(0, int(stats.get("active") or 0)),
         "limited_accounts": max(0, int(stats.get("limited") or 0)),
+        "suspicious_accounts": max(0, int(stats.get("suspicious") or 0)),
         "abnormal_accounts": max(0, int(stats.get("abnormal") or 0)),
         "disabled_accounts": max(0, int(stats.get("disabled") or 0)),
         "available": total_quota > 0 or unlimited > 0 or unknown > 0,

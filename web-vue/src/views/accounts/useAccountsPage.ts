@@ -243,6 +243,7 @@ export function useAccountsPage() {
   const accountStatusOptions = [
     { label: '正常', value: '正常' },
     { label: '限流', value: '限流' },
+    { label: '存疑', value: '存疑' },
     { label: '异常', value: '异常' },
     { label: '禁用', value: '禁用' },
   ] as const
@@ -261,6 +262,7 @@ export function useAccountsPage() {
     { label: '全部状态', value: 'all' },
     { label: '正常', value: 'normal' },
     { label: '受限', value: 'limited' },
+    { label: '存疑', value: 'suspicious' },
     { label: '异常', value: 'abnormal' },
     { label: '禁用', value: 'disabled' },
   ] as const

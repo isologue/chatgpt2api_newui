@@ -2,7 +2,7 @@
 import type { ProxyGroup } from './proxy'
 
 export type AccountLane = 'fast' | 'thinking' | 'pro'
-export type AccountBackendStatus = '正常' | '限流' | '异常' | '禁用'
+export type AccountBackendStatus = '正常' | '限流' | '存疑' | '异常' | '禁用'
 
 export interface Account {
   id: string
@@ -17,12 +17,13 @@ export interface Account {
   quota?: number
   image_quota_unknown?: boolean
   name: string
-  status?: 'ready' | 'incomplete' | 'disabled' | 'invalid' | 'auto_disabled' | 'cooling' | 'backoff'
+  status?: 'ready' | 'incomplete' | 'disabled' | 'invalid' | 'suspicious' | 'auto_disabled' | 'cooling' | 'backoff'
   status_reason?: string
   status_reason_code?:
     | 'disabled'
     | 'snlm0e_refresh_failed'
     | 'account_invalid'
+    | 'account_suspected'
     | 'pro_cooldown'
     | 'video_cooldown'
     | 'lane_backoff'
@@ -218,10 +219,11 @@ type AccountImportCleanupResponse = {
 
 const DEFAULT_LANES: AccountLane[] = ['fast', 'thinking', 'pro']
 const EMPTY_MODEL_IDS: Record<AccountLane, string> = { fast: '', thinking: '', pro: '' }
-export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '异常', '禁用'] as const
+export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '存疑', '异常', '禁用'] as const
 const STATUS_NORMAL: AccountBackendStatus = '正常'
 const STATUS_DISABLED: AccountBackendStatus = '禁用'
 const STATUS_LIMITED: AccountBackendStatus = '限流'
+const STATUS_SUSPICIOUS: AccountBackendStatus = '存疑'
 const STATUS_INVALID: AccountBackendStatus = '异常'
 
 const accountTokenById = new Map<string, string>()
@@ -301,6 +303,16 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
       status_reason: lastRefreshError || '账号鉴权异常',
       status_reason_code: 'account_invalid',
       last_error_kind: 'auth_invalid',
+    }
+  }
+
+  if (rawStatus === STATUS_SUSPICIOUS || rawStatus.toLowerCase() === 'suspicious') {
+    return {
+      enabled: true,
+      status: 'suspicious',
+      status_reason: cleanString(item.last_suspect_reason) || lastRefreshError || '账号调用失败，等待刷新确认',
+      status_reason_code: 'account_suspected',
+      last_error_kind: 'upstream_error',
     }
   }
 
@@ -414,7 +426,7 @@ export type AccountListParams = {
   page?: number
   page_size?: number
   keyword?: string
-  status?: 'all' | 'normal' | 'limited' | 'abnormal' | 'disabled'
+  status?: 'all' | 'normal' | 'limited' | 'suspicious' | 'abnormal' | 'disabled'
   group_id?: string
 }
 

@@ -88,6 +88,7 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 def _account_watcher_refresh_tokens(
         limited_tokens: list[str],
+        suspicious_tokens: list[str],
         expiring_tokens: list[str],
 ) -> list[str]:
     """Accounts that really need periodic upstream refresh.
@@ -96,7 +97,7 @@ def _account_watcher_refresh_tokens(
     every normal account on every watcher tick creates a large amount of
     upstream traffic under load, without improving image dispatch.
     """
-    return list(dict.fromkeys([*limited_tokens, *expiring_tokens]))
+    return list(dict.fromkeys([*suspicious_tokens, *limited_tokens, *expiring_tokens]))
 
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
@@ -106,15 +107,17 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
         while not stop_event.is_set():
             try:
                 limited_tokens = account_service.list_limited_tokens()
+                suspicious_tokens = account_service.list_suspicious_tokens()
                 normal_tokens = account_service.list_normal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = _account_watcher_refresh_tokens(limited_tokens, expiring_tokens)
-                expiring_token_set = set(expiring_tokens)
-                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+                tokens = _account_watcher_refresh_tokens(limited_tokens, suspicious_tokens, expiring_tokens)
+                refresh_token_set = set(tokens)
+                keepalive_tokens = [token for token in keepalive_tokens if token not in refresh_token_set]
                 if tokens:
                     print(
                         "[account-watcher] checking "
+                        f"{len(suspicious_tokens)} suspicious accounts, "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(expiring_tokens)} expiring access tokens "
                         f"(skipping {len(normal_tokens)} normal accounts)"

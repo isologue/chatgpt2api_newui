@@ -40,10 +40,11 @@ function adaptDashboardToStats(dashboard: DashboardResponse): AdminStats {
   }
   const active = Number(accounts.active || 0)
   const limited = Number(accounts.limited || 0)
+  const suspicious = Number(accounts.suspicious || 0)
   const abnormal = Number(accounts.abnormal || 0)
   const disabled = Number(accounts.disabled || 0)
   const total = Number(accounts.total || 0)
-  const failedAccounts = abnormal + disabled
+  const failedAccounts = suspicious + abnormal + disabled
   const idleAccounts = Math.max(total - active - limited - failedAccounts, 0)
   const successCount = Number(logs.success || 0)
   const failedCount = Number(logs.failed || 0)
@@ -52,6 +53,7 @@ function adaptDashboardToStats(dashboard: DashboardResponse): AdminStats {
   return {
     total_accounts: total,
     active_accounts: active,
+    suspicious_accounts: suspicious,
     abnormal_accounts: abnormal,
     disabled_accounts: disabled,
     failed_accounts: failedAccounts,

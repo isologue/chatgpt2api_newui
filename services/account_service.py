@@ -41,6 +41,11 @@ class ImageAccountSelectionError(RuntimeError):
 
 
 class AccountService:
+    STATUS_NORMAL = "正常"
+    STATUS_LIMITED = "限流"
+    STATUS_ABNORMAL = "异常"
+    STATUS_DISABLED = "禁用"
+    STATUS_SUSPICIOUS = "存疑"
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
@@ -65,7 +70,6 @@ class AccountService:
         self._lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
-        self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
@@ -149,14 +153,19 @@ class AccountService:
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
+        if account.get("status") in {
+            AccountService.STATUS_DISABLED,
+            AccountService.STATUS_LIMITED,
+            AccountService.STATUS_ABNORMAL,
+            AccountService.STATUS_SUSPICIOUS,
+        }:
             return False
         if bool(account.get("image_quota_unknown")):
             return True
         # quota 是展示/预估值，不能作为持久调度开关。
         # 只有远程确认后写入的“限流”状态才代表图片额度耗尽；否则 quota=0 也要允许进入预检，
         # 避免本地扣减或额度重置不同步时把账号锁死在候选池外。
-        return account.get("status") == "正常" or int(account.get("quota") or 0) > 0
+        return account.get("status") == AccountService.STATUS_NORMAL or int(account.get("quota") or 0) > 0
 
     @classmethod
     def _is_unlimited_image_quota_account(cls, account: dict) -> bool:
@@ -303,7 +312,7 @@ class AccountService:
         derived_quota, derived_restore_at, derived_unknown = self._extract_image_quota_from_limits(limits_progress)
         has_explicit_quota = self._has_value(normalized.get("quota"))
         normalized["type"] = normalized.get("type") or "free"
-        normalized["status"] = normalized.get("status") or "正常"
+        normalized["status"] = normalized.get("status") or self.STATUS_NORMAL
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -321,7 +330,7 @@ class AccountService:
             normalized["source_type"] == "codex"
             and normalized["quota"] == 0
             and not limits_progress
-            and normalized.get("status") not in {"限流", "异常", "禁用"}
+            and normalized.get("status") not in {self.STATUS_LIMITED, self.STATUS_ABNORMAL, self.STATUS_DISABLED, self.STATUS_SUSPICIOUS}
             and not normalized.get("last_token_refresh_at")
             and not normalized.get("last_used_at")
         ):
@@ -341,8 +350,65 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["last_suspect_reason"] = normalized.get("last_suspect_reason") or None
+        normalized["last_suspect_at"] = normalized.get("last_suspect_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
+
+    @classmethod
+    def _account_created_sort_key(cls, account: dict) -> tuple[float, str]:
+        created_at = cls._parse_time(account.get("created_at"))
+        created_ts = created_at.timestamp() if created_at is not None else 0.0
+        return (-created_ts, str(account.get("access_token") or ""))
+
+    @classmethod
+    def _sorted_accounts_newest_first(cls, accounts: list[dict]) -> list[dict]:
+        return sorted(accounts, key=cls._account_created_sort_key)
+
+    @classmethod
+    def _is_free_account(cls, account: dict | None) -> bool:
+        return (cls._normalize_account_type((account or {}).get("type")) or "").lower() == "free"
+
+    @staticmethod
+    def _is_token_invalid_text(message: str) -> bool:
+        text = str(message or "").lower()
+        return (
+            "token_invalidated" in text
+            or "token_revoked" in text
+            or "authentication token has been invalidated" in text
+            or "invalidated oauth token" in text
+            or "invalid access token" in text
+            or "token invalidated" in text
+        )
+
+    @classmethod
+    def is_auth_invalid_error(cls, error: object) -> bool:
+        if error is None:
+            return False
+        if cls._is_token_invalid_text(str(error or "")):
+            return True
+        status_code = int(getattr(error, "status_code", 0) or 0)
+        code = str(getattr(error, "code", "") or "").strip().lower()
+        return status_code == 401 or code in {"invalid_access_token", "token_invalidated", "token_revoked"}
+
+    @classmethod
+    def should_mark_free_account_suspicious(cls, error: object) -> bool:
+        if error is None:
+            return False
+        if cls.is_auth_invalid_error(error):
+            return False
+        class_name = type(error).__name__.lower()
+        if class_name in {"requestcancellederror", "imagecontentpolicyerror", "imagetextreplyerror"}:
+            return False
+        status_code = int(getattr(error, "status_code", 0) or 0)
+        code = str(getattr(error, "code", "") or "").strip().lower()
+        if status_code == 499:
+            return False
+        if code in {"content_policy_violation", "request_cancelled", "upstream_text_reply", "unsupported_model"}:
+            return False
+        if 400 <= status_code < 500:
+            return False
+        return True
 
     @staticmethod
     def _jwt_exp(access_token: str) -> int:
@@ -444,7 +510,7 @@ class AccountService:
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
         if not str(account.get("refresh_token") or "").strip():
             return None
-        if account.get("status") == "禁用":
+        if account.get("status") == self.STATUS_DISABLED:
             return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
@@ -619,9 +685,10 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
+        items = self._sorted_accounts_newest_first(list(self._accounts.values()))
         return [
             token
-            for item in self._accounts.values()
+            for item in items
             if self._is_image_account_available(item)
                and self._account_matches_plan_type(item, plan_type)
                and self._account_matches_any_plan_type(item, plan_types)
@@ -657,8 +724,7 @@ class AccountService:
                     raise self._no_ready_candidate_error(plan_type, source_type, plan_types, excluded_tokens)
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
+                    access_token = tokens[0]
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -694,7 +760,7 @@ class AccountService:
             ):
                 continue
             matched += 1
-            if str(item.get("status") or "") == "限流":
+            if str(item.get("status") or "") == self.STATUS_LIMITED:
                 limited += 1
         if matched > 0 and limited == matched:
             return ImageAccountSelectionError(
@@ -768,7 +834,7 @@ class AccountService:
                     and self._account_matches_source_type(account or {}, source_type)
             ):
                 return str((account or {}).get("access_token") or access_token)
-            if str((account or {}).get("status") or "") == "限流":
+            if str((account or {}).get("status") or "") == self.STATUS_LIMITED:
                 saw_remote_quota_exhausted = True
             else:
                 saw_unavailable_failure = True
@@ -788,15 +854,14 @@ class AccountService:
         with self._lock:
             candidates = [
                 token
-                for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
+                for account in self._sorted_accounts_newest_first(list(self._accounts.values()))
+                if account.get("status") not in {self.STATUS_DISABLED, self.STATUS_ABNORMAL, self.STATUS_SUSPICIOUS}
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]
             if not candidates:
                 return ""
-            access_token = candidates[self._index % len(candidates)]
-            self._index += 1
+            access_token = candidates[0]
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
     def mark_text_used(self, access_token: str) -> None:
@@ -814,6 +879,58 @@ class AccountService:
                 return
             self._accounts[access_token] = account
             self._save_accounts()
+
+    def mark_free_account_suspicious(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        quiet: bool = False,
+    ) -> dict | None:
+        if not access_token:
+            return None
+        reason = str(error or "system failure") or "system failure"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None or not self._is_free_account(current):
+                return None
+            next_item = dict(current)
+            next_item["status"] = self.STATUS_SUSPICIOUS
+            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_suspect_reason"] = reason
+            next_item["last_suspect_at"] = now
+            next_item["last_refresh_error"] = reason
+            next_item["last_refresh_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+        if not quiet:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "标记存疑账号",
+                {"source": event, "token": anonymize_token(access_token), "error": reason},
+            )
+        return self.get_account(access_token)
+
+    def handle_request_failure(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        quiet: bool = False,
+    ) -> bool:
+        if not access_token:
+            return False
+        account = self.get_account(access_token)
+        if account is None or not self._is_free_account(account):
+            return False
+        if not self.should_mark_free_account_suspicious(error):
+            return False
+        return self.mark_free_account_suspicious(access_token, event, error, quiet=quiet) is not None
 
     def remove_invalid_token(
         self,
@@ -852,7 +969,16 @@ class AccountService:
             log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
                             {"source": event, "token": anonymize_token(access_token), "error": str(error or "")})
         elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
+            self.update_account(
+                access_token,
+                {
+                    "status": self.STATUS_ABNORMAL,
+                    "quota": 0,
+                    "last_suspect_reason": None,
+                    "last_suspect_at": None,
+                },
+                quiet=quiet,
+            )
         return removed
 
     def get_account(self, access_token: str) -> dict | None:
@@ -883,7 +1009,16 @@ class AccountService:
             return [
                 token
                 for item in self._accounts.values()
-                if item.get("status") == "限流"
+                if item.get("status") == self.STATUS_LIMITED
+                   and (token := item.get("access_token") or "")
+            ]
+
+    def list_suspicious_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == self.STATUS_SUSPICIOUS
                    and (token := item.get("access_token") or "")
             ]
 
@@ -892,7 +1027,7 @@ class AccountService:
             return [
                 token
                 for item in self._accounts.values()
-                if item.get("status") == "正常"
+                if item.get("status") == self.STATUS_NORMAL
                    and (token := item.get("access_token") or "")
             ]
 
@@ -998,10 +1133,6 @@ class AccountService:
                 if old not in target_set and new not in target_set
             }
             if removed:
-                if self._accounts:
-                    self._index %= len(self._accounts)
-                else:
-                    self._index = 0
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()] if return_items else []
@@ -1018,7 +1149,11 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+            if (
+                account.get("status") == self.STATUS_LIMITED
+                and config.auto_remove_rate_limited_accounts
+                and current.get("status") != self.STATUS_SUSPICIOUS
+            ):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除额度耗尽账号", {"token": anonymize_token(access_token)})
@@ -1042,6 +1177,8 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["last_suspect_reason"] = None
+            next_item["last_suspect_at"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1059,12 +1196,14 @@ class AccountService:
             if current is None:
                 return True
             next_item = dict(current)
-            next_item["status"] = "异常"
+            next_item["status"] = self.STATUS_ABNORMAL
             next_item["quota"] = 0
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
+            next_item["last_suspect_reason"] = None
+            next_item["last_suspect_at"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1076,7 +1215,36 @@ class AccountService:
             )
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def _mark_suspicious_refresh_failure_as_abnormal(self, access_token: str, event: str, error: object) -> dict | None:
+        if not access_token:
+            return None
+        reason = str(error or "refresh failed") or "refresh failed"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None or current.get("status") != self.STATUS_SUSPICIOUS:
+                return None
+            next_item = dict(current)
+            next_item["status"] = self.STATUS_ABNORMAL
+            next_item["quota"] = 0
+            next_item["last_refresh_error"] = reason
+            next_item["last_refresh_error_at"] = now
+            next_item["last_suspect_reason"] = None
+            next_item["last_suspect_at"] = None
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "存疑账号刷新失败转异常",
+            {"source": event, "token": anonymize_token(access_token), "error": reason},
+        )
+        return self.get_account(access_token)
+
+    def mark_image_result(self, access_token: str, success: bool, *, error: object | None = None, event: str = "image_stream") -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
@@ -1098,9 +1266,9 @@ class AccountService:
                         # 下一次调度会进入远程预检，由 get_user_info 的结果决定是否写入“限流”。
                         next_item["image_quota_unknown"] = True
                         next_item["last_quota_estimated_empty_at"] = datetime.now(timezone.utc).isoformat()
-                if next_item.get("status") == "限流":
+                if next_item.get("status") == self.STATUS_LIMITED:
                     # 如果极端竞态下限流账号仍然成功出图，说明远程额度已恢复。
-                    next_item["status"] = "正常"
+                    next_item["status"] = self.STATUS_NORMAL
                     next_item["image_quota_unknown"] = True
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
@@ -1109,8 +1277,11 @@ class AccountService:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
-            return dict(account)
-        return None
+            result = dict(account)
+        if not success and error is not None:
+            self.handle_request_failure(access_token, event, error, quiet=True)
+            return self.get_account(access_token) or result
+        return result
 
     def fetch_remote_info(
         self,
@@ -1122,6 +1293,7 @@ class AccountService:
             raise ValueError("access_token is required")
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        suspicious_before_refresh = bool((self.get_account(active_token) or self.get_account(access_token) or {}).get("status") == self.STATUS_SUSPICIOUS)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             with OpenAIBackendAPI(active_token) as backend:
@@ -1149,6 +1321,10 @@ class AccountService:
                     remove=remove_invalid,
                 )
                 raise
+        except Exception as exc:
+            if suspicious_before_refresh:
+                self._mark_suspicious_refresh_failure_as_abnormal(active_token, event, exc)
+            raise
         self._record_refresh_success(active_token)
         updated = self.update_account(active_token, result)
         if updated is not None:
@@ -1167,14 +1343,14 @@ class AccountService:
                 "processed": 0,
                 "done": False,
                 "error": None,
-                "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
+                "status_counts": {"正常": 0, "限流": 0, "存疑": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
         """刷新单个账号后，更新进度计数。"""
         account = self.get_account(token)
-        status = str(account.get("status") or "正常").strip() if account else "异常"
+        status = str(account.get("status") or self.STATUS_NORMAL).strip() if account else self.STATUS_ABNORMAL
         quota = max(0, int(account.get("quota") or 0)) if account else 0
 
         with self._refresh_progress_lock:
@@ -1325,11 +1501,12 @@ class AccountService:
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
-        abnormal = sum(1 for a in items if a.get("status") == "异常")
-        disabled = sum(1 for a in items if a.get("status") == "禁用")
-        normal_items = [a for a in items if a.get("status") == "正常"]
+        active = sum(1 for a in items if a.get("status") == self.STATUS_NORMAL)
+        limited = sum(1 for a in items if a.get("status") == self.STATUS_LIMITED)
+        suspicious = sum(1 for a in items if a.get("status") == self.STATUS_SUSPICIOUS)
+        abnormal = sum(1 for a in items if a.get("status") == self.STATUS_ABNORMAL)
+        disabled = sum(1 for a in items if a.get("status") == self.STATUS_DISABLED)
+        normal_items = [a for a in items if a.get("status") == self.STATUS_NORMAL]
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in normal_items)
         unlimited = sum(1 for a in normal_items if self._is_unlimited_image_quota_account(a))
         unknown_quota = sum(
@@ -1352,6 +1529,7 @@ class AccountService:
             "cumulative_total": self._cumulative_total,
             "active": active,
             "limited": limited,
+            "suspicious": suspicious,
             "abnormal": abnormal,
             "disabled": disabled,
             "total_quota": total_quota,

@@ -315,6 +315,7 @@ export interface AdminStatsTrend {
 export interface AdminStats {
   total_accounts: number
   active_accounts: number
+  suspicious_accounts?: number
   abnormal_accounts: number
   disabled_accounts: number
   failed_accounts: number
@@ -416,6 +417,7 @@ export interface DashboardAccountStats {
   cumulative_total?: number
   active: number
   limited: number
+  suspicious?: number
   abnormal: number
   disabled: number
   total_quota: number

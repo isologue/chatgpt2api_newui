@@ -2,7 +2,7 @@ import type { Account, AccountLane } from '@/api/accounts'
 import { proxyReferenceLabel } from '@/api/proxy'
 
 export type QuotaKey = 'fast' | 'thinking' | 'pro' | 'image' | 'music' | 'video'
-export type AccountStatusFilter = 'all' | 'normal' | 'limited' | 'abnormal' | 'disabled'
+export type AccountStatusFilter = 'all' | 'normal' | 'limited' | 'suspicious' | 'abnormal' | 'disabled'
 
 export type QuotaLine = {
   used: number
@@ -328,6 +328,7 @@ export function statusText(item: Account): string {
 
   if (!item.enabled || item.status === 'disabled') return '已禁用'
   if (item.status === 'incomplete') return '不完整'
+  if (item.status === 'suspicious' || reasonCode === 'account_suspected') return '存疑'
   if (
     item.status === 'invalid' ||
     reasonCode === 'snlm0e_refresh_failed' ||
@@ -364,6 +365,7 @@ export function statusCategory(item: Account): Exclude<AccountStatusFilter, 'all
   const text = statusText(item)
   if (text === '已禁用') return 'disabled'
   if (text === '正常') return 'normal'
+  if (text === '存疑') return 'suspicious'
   if (text === '受限' || text.includes('避让')) return 'limited'
   return 'abnormal'
 }
@@ -371,6 +373,7 @@ export function statusCategory(item: Account): Exclude<AccountStatusFilter, 'all
 export function statusClass(item: Account): string {
   const text = statusText(item)
   if (text === '正常') return PILL_TONE_CLASS.success
+  if (text === '存疑') return PILL_TONE_CLASS.info
   if (text === '受限' || text.includes('避让')) return PILL_TONE_CLASS.warning
   if (text === '异常') return PILL_TONE_CLASS.danger
   if (text === '不完整') return PILL_TONE_CLASS.info
@@ -392,6 +395,7 @@ export function statusReason(item: Account): string {
   if (lastError) return lastError
   if (!item.enabled || item.status === 'disabled') return '账号已禁用'
   if (item.status === 'incomplete') return '配置不完整，请检查 access token、账号类型或代理'
+  if (item.status === 'suspicious') return '账号调用失败，等待刷新确认'
   if (item.status === 'invalid') return '账号鉴权异常'
   return '账号正常可用'
 }
@@ -406,6 +410,7 @@ export function statusRawError(item: Account): string {
 export function rowClass(item: Account): string {
   const category = statusCategory(item)
   if (category === 'disabled') return 'bg-muted/50'
+  if (category === 'suspicious') return 'bg-cyan-500/5'
   if (category === 'abnormal') return 'bg-rose-500/5'
   if (category === 'limited') return 'bg-amber-500/5'
   if (!item.access_token && !item.cookie) return 'bg-muted/30'

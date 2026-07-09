@@ -279,6 +279,7 @@ def _status_matches_filter(account: dict[str, Any], status_filter: str) -> bool:
     status_map = {
         "normal": "\u6b63\u5e38",
         "limited": "\u9650\u6d41",
+        "suspicious": "\u5b58\u7591",
         "abnormal": "\u5f02\u5e38",
         "disabled": "\u7981\u7528",
     }

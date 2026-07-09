@@ -1176,7 +1176,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             return
         except Exception as exc:
             error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
+            auth_invalid = token and account_service.is_auth_invalid_error(exc)
+            if token and not emitted and auth_invalid:
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
@@ -1185,6 +1186,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     token = account_service.get_text_access_token(attempted_tokens)
                 if token:
                     continue
+            if token and auth_invalid:
+                account_service.handle_invalid_token(token, "text_stream", error=error_message)
+            elif token:
+                account_service.handle_request_failure(token, "text_stream", exc)
             if token and not getattr(exc, "account_email", ""):
                 setattr(exc, "account_email", _text_account_email(token))
             raise
@@ -2064,7 +2069,18 @@ def _generate_single_image(
                     "account_email": account_email,
                 })
             if returned_message:
-                account_service.mark_image_result(token, False)
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    error=ImageGenerationError(
+                        "upstream returned a text reply instead of image output",
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="upstream_text_reply",
+                        account_email=account_email,
+                    ),
+                    event="image_stream",
+                )
                 if request.trace_image_perf:
                     _monitor_image_stage(
                         request,
@@ -2087,7 +2103,18 @@ def _generate_single_image(
                     })
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    error=ImageGenerationError(
+                        "upstream completed without generating images",
+                        status_code=502,
+                        error_type="server_error",
+                        code="no_image_generated",
+                        account_email=account_email,
+                    ),
+                    event="image_stream",
+                )
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -2123,7 +2150,7 @@ def _generate_single_image(
                 })
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if account_email:
                 setattr(exc, "account_email", account_email)
             raw_error = str(exc)
@@ -2159,7 +2186,7 @@ def _generate_single_image(
                     setattr(image_error, attr, getattr(exc, attr))
             raise image_error from exc
         except RequestCancelledError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2177,7 +2204,7 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2207,7 +2234,7 @@ def _generate_single_image(
                 raw_upstream_message=str(exc),
             ) from exc
         except ImageTextReplyError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             text_reply = str(exc) or "上游返回了文本回复而不是图片。"
             if request.trace_image_perf:
                 _monitor_image_stage(
@@ -2248,7 +2275,7 @@ def _generate_single_image(
                     setattr(image_error, attr, getattr(exc, attr))
             raise image_error from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -2275,6 +2302,7 @@ def _generate_single_image(
             last_error = str(exc)
             stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
             http_timing = _backend_http_timing_data(backend)
+            auth_invalid = account_service.is_auth_invalid_error(exc)
             if request.trace_image_perf and stream_error_ms > 0:
                 _monitor_image_stage(
                     request,
@@ -2297,12 +2325,16 @@ def _generate_single_image(
                 "index": index,
                 **http_timing,
             })
-            if not emitted_for_token and is_token_invalid_error(last_error):
+            if not emitted_for_token and auth_invalid:
                 account_service.mark_image_result(token, False)
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
                     continue
+                account_service.handle_invalid_token(token, "image_stream", error=last_error)
+                continue
+            if auth_invalid:
+                account_service.mark_image_result(token, False)
                 account_service.handle_invalid_token(token, "image_stream", error=last_error)
                 continue
             quick_timeout_retry_ms = min(30000, max(5000, int(config.image_stream_timeout_secs * 1000 * 0.2)))
@@ -2340,7 +2372,7 @@ def _generate_single_image(
                         fallback_from_egress_label=fallback_from_egress.get("egress_label", ""),
                     )
                 continue
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             raise ImageGenerationError(
                 image_stream_error_message(last_error),
                 account_email=account_email,

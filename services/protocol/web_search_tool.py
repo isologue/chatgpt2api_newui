@@ -155,7 +155,14 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 def run_web_search(query: str) -> dict[str, Any]:
     token = account_service.get_text_access_token()
-    with OpenAIBackendAPI(token) as backend:
-        result = backend.search(query)
+    try:
+        with OpenAIBackendAPI(token) as backend:
+            result = backend.search(query)
+    except Exception as exc:
+        if account_service.is_auth_invalid_error(exc):
+            account_service.handle_invalid_token(token, "web_search", error=str(exc))
+        else:
+            account_service.handle_request_failure(token, "web_search", exc)
+        raise
     account_service.mark_text_used(token)
     return result

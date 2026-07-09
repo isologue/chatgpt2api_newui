@@ -57,12 +57,12 @@ def _editable_access_token() -> str:
     accounts = [
         item for item in account_service.list_accounts()
         if _clean(item.get("access_token"))
-           and item.get("status") not in {"禁用", "异常"}
+           and item.get("status") not in {"禁用", "异常", "存疑"}
            and account_service._account_matches_any_plan_type(item, EDITABLE_FILE_PLAN_TYPES)
     ]
     if not accounts:
         raise RuntimeError("no available plus/team/pro account")
-    accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
+    accounts = account_service._sorted_accounts_newest_first(accounts)
     token = _clean(accounts[0].get("access_token"))
     return account_service.refresh_access_token(token, event="editable_file_task") or token
 

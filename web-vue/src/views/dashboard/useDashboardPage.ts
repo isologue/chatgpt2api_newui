@@ -97,6 +97,14 @@ export function useDashboardPage() {
         iconColor: 'text-rose-600'
       },
       {
+        label: '存疑账号',
+        value: '0',
+        meta: '',
+        icon: 'lucide:help-circle',
+        iconBg: 'bg-cyan-100',
+        iconColor: 'text-cyan-600'
+      },
+      {
         label: '禁用账号',
         value: '0',
         meta: '',
@@ -109,8 +117,8 @@ export function useDashboardPage() {
         value: '0',
         meta: '',
         icon: 'lucide:coins',
-        iconBg: 'bg-cyan-100',
-        iconColor: 'text-cyan-600'
+        iconBg: 'bg-violet-100',
+        iconColor: 'text-violet-600'
       },
     ]
   }
@@ -506,10 +514,11 @@ export function useDashboardPage() {
     stats.value[1].value = formatStatNumber(overview.active_accounts)
     stats.value[2].value = formatStatNumber(overview.rate_limited_accounts)
     stats.value[3].value = formatStatNumber(overview.abnormal_accounts)
-    stats.value[4].value = formatStatNumber(overview.disabled_accounts)
+    stats.value[4].value = formatStatNumber(overview.suspicious_accounts || 0)
+    stats.value[5].value = formatStatNumber(overview.disabled_accounts)
     const totalQuota = Number(overview.total_quota || 0)
-    stats.value[5].value = formatStatNumber(totalQuota)
-    stats.value[5].meta = ''
+    stats.value[6].value = formatStatNumber(totalQuota)
+    stats.value[6].meta = ''
   }
 
   function getTrendPayload(overview: OverviewPayload) {
