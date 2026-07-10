@@ -21,6 +21,41 @@ export interface ImageStorageSyncResult {
   failed: number
 }
 
+export interface RetentionCleanupRequest {
+  log_retention_days?: number
+  image_retention_days?: number
+}
+
+export interface RetentionCleanupSection {
+  removed: number
+  kept?: number
+  removed_size_bytes: number
+  retention_days: number
+  dry_run: boolean
+}
+
+export interface RetentionCleanupResult {
+  dry_run: boolean
+  logs: RetentionCleanupSection
+  images: RetentionCleanupSection
+  total_removed: number
+  total_size_bytes: number
+}
+
+export interface AccountCleanupRequest {
+  auto_remove_invalid_accounts?: boolean
+  auto_remove_rate_limited_accounts?: boolean
+}
+
+export interface AccountCleanupResult {
+  dry_run: boolean
+  invalid: number
+  rate_limited: number
+  total_removed: number
+  auto_remove_invalid_accounts: boolean
+  auto_remove_rate_limited_accounts: boolean
+}
+
 export interface BackupState {
   running?: boolean
   last_status?: string
@@ -90,7 +125,6 @@ const SETTINGS_SAVE_KEYS = [
   'global_system_prompt',
   'sensitive_words',
   'ai_review',
-  'public_display',
   'image_generation',
   'quota_limits',
   'runtime_capacity',
@@ -194,7 +228,6 @@ function normalizeImageErrorMessages(raw: unknown): ImageErrorMessages {
 export function normalizeSettings(raw: RawSettings | null | undefined): Settings {
   const source = { ...(raw || {}) }
   const basic = source.basic && typeof source.basic === 'object' ? source.basic : {}
-  const publicDisplay = source.public_display && typeof source.public_display === 'object' ? source.public_display : {}
   const imageStorage = source.image_storage && typeof source.image_storage === 'object' ? source.image_storage : {}
   const aiReview = source.ai_review && typeof source.ai_review === 'object' ? source.ai_review : {}
   const backup = source.backup && typeof source.backup === 'object' ? source.backup : {}
@@ -246,10 +279,6 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       base_url: cleanString(source.base_url ?? basic.base_url),
       proxy: cleanString(source.proxy ?? basic.proxy),
       image_expire_hours: numberValue(source.image_retention_days ?? basic.image_expire_hours, 15, 1),
-    },
-    public_display: {
-      logo_url: cleanString(publicDisplay.logo_url),
-      chat_url: cleanString(publicDisplay.chat_url),
     },
     image_generation: {
       enabled: boolValue(source.image_generation?.enabled, true),
@@ -354,7 +383,6 @@ function toBackendSettings(settings: Settings): RawSettings {
     global_system_prompt: cleanString(normalized.global_system_prompt),
     sensitive_words: Array.isArray(normalized.sensitive_words) ? [...normalized.sensitive_words] : [],
     ai_review: cloneRawSettings(normalized.ai_review),
-    public_display: cloneRawSettings(normalized.public_display),
     image_generation: cloneRawSettings(normalized.image_generation),
     quota_limits: cloneRawSettings(normalized.quota_limits),
     runtime_capacity: cloneRawSettings(normalized.runtime_capacity),
@@ -436,4 +464,16 @@ export const settingsApi = {
 
   syncImageStorage: () =>
     apiClient.post<Record<string, never>, { result: ImageStorageSyncResult }>('/api/image-storage/sync', {}),
+
+  previewRetentionCleanup: (payload: RetentionCleanupRequest = {}) =>
+    apiClient.post<RetentionCleanupRequest, RetentionCleanupResult>('/api/settings/retention-cleanup/preview', payload),
+
+  runRetentionCleanup: (payload: RetentionCleanupRequest = {}) =>
+    apiClient.post<RetentionCleanupRequest, RetentionCleanupResult>('/api/settings/retention-cleanup/run', payload),
+
+  previewAccountCleanup: (payload: AccountCleanupRequest = {}) =>
+    apiClient.post<AccountCleanupRequest, AccountCleanupResult>('/api/settings/account-cleanup/preview', payload),
+
+  runAccountCleanup: (payload: AccountCleanupRequest = {}) =>
+    apiClient.post<AccountCleanupRequest, AccountCleanupResult>('/api/settings/account-cleanup/run', payload),
 }

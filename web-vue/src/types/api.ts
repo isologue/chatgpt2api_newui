@@ -103,10 +103,6 @@ export interface Settings {
     proxy?: string
     image_expire_hours?: number
   }
-  public_display: {
-    logo_url?: string
-    chat_url?: string
-  }
   image_generation: {
     enabled: boolean
     supported_models: string[]
@@ -279,28 +275,6 @@ export interface AdminLogsResponse extends LogsResponse {
   stats: AdminLogStats
 }
 
-export type PublicLogStatus = 'success' | 'error' | 'timeout' | 'in_progress'
-
-export interface PublicLogEvent {
-  time: string
-  type: 'start' | 'select' | 'retry' | 'switch' | 'complete'
-  status?: 'success' | 'error' | 'timeout'
-  content: string
-}
-
-export interface PublicLogGroup {
-  request_id: string
-  start_time: string
-  status: PublicLogStatus
-  events: PublicLogEvent[]
-}
-
-export interface PublicLogsResponse {
-  total: number
-  logs: PublicLogGroup[]
-  error?: string
-}
-
 export interface AdminStatsTrend {
   labels: string[]
   total_requests: number[]
@@ -337,41 +311,6 @@ export interface AdminStats {
     conversation_id?: string
   }>
   trend: AdminStatsTrend
-}
-
-export interface PublicStats {
-  total_visitors: number
-  total_requests: number
-  requests_per_minute: number
-  load_status: 'low' | 'medium' | 'high'
-  load_color: string
-}
-
-export interface PublicDisplay {
-  logo_url?: string
-  chat_url?: string
-}
-
-export interface UptimeHeartbeat {
-  time: string
-  success: boolean
-  latency_ms?: number | null
-  status_code?: number | null
-  level?: 'up' | 'down' | 'warn'
-}
-
-export interface UptimeService {
-  name: string
-  status: 'up' | 'down' | 'warn' | 'unknown'
-  uptime: number
-  total: number
-  success: number
-  heartbeats: UptimeHeartbeat[]
-}
-
-export interface UptimeResponse {
-  services: Record<string, UptimeService>
-  updated_at: string
 }
 
 export interface LoginRequest {

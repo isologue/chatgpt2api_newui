@@ -11,9 +11,11 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity, resolve_image_base_url
+from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import config
 from services.image_service import (
+    cleanup_image_retention,
     compress_images,
     delete_images,
     delete_to_target,
@@ -22,6 +24,7 @@ from services.image_service import (
     get_image_response,
     get_thumbnail_response,
     list_images,
+    preview_image_retention_cleanup,
     storage_stats,
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
@@ -66,7 +69,6 @@ SETTINGS_UPDATE_KEYS = {
     "global_system_prompt",
     "sensitive_words",
     "ai_review",
-    "public_display",
     "image_generation",
     "quota_limits",
     "runtime_capacity",
@@ -134,6 +136,16 @@ class LogDeleteRequest(BaseModel):
     ids: list[str] = []
 class BackupDeleteRequest(BaseModel):
     key: str = ""
+
+
+class RetentionCleanupRequest(BaseModel):
+    log_retention_days: int | None = None
+    image_retention_days: int | None = None
+
+
+class AccountCleanupRequest(BaseModel):
+    auto_remove_invalid_accounts: bool | None = None
+    auto_remove_rate_limited_accounts: bool | None = None
 
 
 def _clean_text(value: object) -> str:
@@ -224,6 +236,34 @@ def _config_write_error_message(exc: OSError) -> str:
         "请检查文件权限、Docker volume 挂载或文件是否被其它程序占用。"
         f"原始错误：{exc}"
     )
+
+
+def _retention_cleanup_payload(body: RetentionCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
+    body = body or RetentionCleanupRequest()
+    log_days = body.log_retention_days or config.log_retention_days
+    image_days = body.image_retention_days or config.image_retention_days
+    logs = log_service.preview_cleanup_old(log_days) if dry_run else log_service.cleanup_old(log_days)
+    images = preview_image_retention_cleanup(image_days) if dry_run else cleanup_image_retention(image_days)
+    total_removed = int(logs.get("removed") or 0) + int(images.get("removed") or 0)
+    total_size = int(logs.get("removed_size_bytes") or 0) + int(images.get("removed_size_bytes") or 0)
+    return {
+        "dry_run": dry_run,
+        "logs": {**logs, "retention_days": int(log_days)},
+        "images": {**images, "retention_days": int(image_days)},
+        "total_removed": total_removed,
+        "total_size_bytes": total_size,
+    }
+
+
+def _account_cleanup_payload(body: AccountCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
+    body = body or AccountCleanupRequest()
+    kwargs = {
+        "remove_invalid": body.auto_remove_invalid_accounts,
+        "remove_rate_limited": body.auto_remove_rate_limited_accounts,
+    }
+    if dry_run:
+        return account_service.preview_auto_remove_accounts(**kwargs)
+    return account_service.cleanup_auto_remove_accounts(**kwargs)
 
 
 def _proxy_profile_id(value: object) -> str:
@@ -509,93 +549,6 @@ def create_router(app_version: str) -> APIRouter:
     async def get_version():
         return {"version": app_version}
 
-    @router.get("/public/stats")
-    async def public_stats():
-        from services.account_service import account_service as acct_svc
-
-        stats = acct_svc.get_stats()
-        logs = log_service.list(type=LOG_TYPE_CALL, limit=500)
-        recent_cutoff = _beijing_now_naive() - timedelta(minutes=1)
-        recent = [
-            item for item in logs
-            if (_parse_log_time(_detail_value(item, "started_at", item.get("time"))) or datetime.min) >= recent_cutoff
-        ]
-        rpm = len(recent)
-        load_status = "high" if rpm >= 60 else "medium" if rpm >= 20 else "low"
-        load_color = {"high": "#ef4444", "medium": "#f59e0b", "low": "#22c55e"}[load_status]
-        return {
-            "total_visitors": int(stats.get("total") or 0),
-            "total_requests": len(logs),
-            "requests_per_minute": rpm,
-            "load_status": load_status,
-            "load_color": load_color,
-        }
-
-    @router.get("/public/display")
-    async def public_display():
-        public = config.get().get("public_display")
-        data = public if isinstance(public, dict) else {}
-        return {
-            "logo_url": str(data.get("logo_url") or ""),
-            "chat_url": str(data.get("chat_url") or ""),
-        }
-
-    @router.get("/public/log")
-    async def public_log(limit: int = Query(default=20, ge=1, le=100)):
-        items = log_service.list(type=LOG_TYPE_CALL, limit=limit)
-        groups = []
-        for item in items:
-            status = _clean_text(_detail_value(item, "status", item.get("status"))).lower()
-            failed = status in {"failed", "error", "fail"} or bool(_detail_value(item, "error"))
-            groups.append(
-                {
-                    "request_id": str(item.get("id") or ""),
-                    "start_time": str(item.get("time") or _detail_value(item, "started_at")),
-                    "status": "error" if failed else "success",
-                    "events": [
-                        {
-                            "time": str(item.get("time") or _detail_value(item, "started_at")),
-                            "type": "complete",
-                            "status": "error" if failed else "success",
-                            "content": str(item.get("summary") or _detail_value(item, "endpoint") or "调用日志"),
-                        }
-                    ],
-                }
-            )
-        return {"total": len(groups), "logs": groups}
-
-    @router.get("/public/uptime")
-    async def public_uptime(days: int = Query(default=90, ge=1, le=365)):
-        storage = config.get_storage_backend()
-        try:
-            storage_health = storage.health_check()
-            storage_ok = bool(storage_health.get("ok", True)) if isinstance(storage_health, dict) else True
-        except Exception:
-            storage_health = {}
-            storage_ok = False
-        now = beijing_now().isoformat(timespec="seconds")
-        return {
-            "updated_at": now,
-            "services": {
-                "api": {
-                    "name": "API",
-                    "status": "up",
-                    "uptime": 100,
-                    "total": 1,
-                    "success": 1,
-                    "heartbeats": [{"time": now, "success": True, "latency_ms": 0, "level": "up"}],
-                },
-                "storage": {
-                    "name": "Storage",
-                    "status": "up" if storage_ok else "warn",
-                    "uptime": 100 if storage_ok else 0,
-                    "total": 1,
-                    "success": 1 if storage_ok else 0,
-                    "heartbeats": [{"time": now, "success": storage_ok, "latency_ms": 0, "level": "up" if storage_ok else "warn"}],
-                },
-            },
-        }
-
     @router.get("/api/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -619,6 +572,26 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail={"error": _config_write_error_message(exc)}) from exc
+
+    @router.post("/api/settings/retention-cleanup/preview")
+    async def preview_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=True)
+
+    @router.post("/api/settings/retention-cleanup/run")
+    async def run_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=False)
+
+    @router.post("/api/settings/account-cleanup/preview")
+    async def preview_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=True)
+
+    @router.post("/api/settings/account-cleanup/run")
+    async def run_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=False)
 
     @router.get("/api/model-catalog")
     async def model_catalog(authorization: str | None = Header(default=None)):

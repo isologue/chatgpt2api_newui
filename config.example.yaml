@@ -134,10 +134,6 @@ basic:
   proxy: ""
   image_expire_hours: 15
 
-public_display:
-  logo_url: ""
-  chat_url: ""
-
 image_generation:
   enabled: true
   supported_models: []

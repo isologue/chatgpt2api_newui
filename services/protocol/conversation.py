@@ -25,7 +25,7 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
-from utils.image_tokens import count_image_content_tokens
+from utils.image_tokens import count_image_content_tokens, image_size_from_bytes
 from utils.log import logger
 from utils.diagnostics import diagnostic_excerpt
 
@@ -491,6 +491,30 @@ def is_token_invalid_error(message: str) -> bool:
     )
 
 
+def should_refresh_image_account(message: object) -> bool:
+    text = str(message or "")
+    lower = text.lower()
+    return (
+        is_token_invalid_error(text)
+        or _is_image_quota_error(lower)
+        or any(
+            marker in lower
+            for marker in (
+                "status=429",
+                "status_code=429",
+                "http 429",
+                "rate limit exceeded",
+                "rate_limit_exceeded",
+                "rate_limited",
+                "quota exceeded",
+                "quota_exceeded",
+                "image quota",
+                "too many requests",
+            )
+        )
+    )
+
+
 def is_tls_connection_error(message: str) -> bool:
     """检测 TLS/SSL 连接错误，这类错误通常可以通过重试解决。"""
     text = str(message or "").lower()
@@ -724,17 +748,17 @@ def format_image_result(
         if not b64_json:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
+        image_bytes = base64.b64decode(b64_json)
+        stored_url = save_image_bytes(image_bytes, base_url)
+        asset: dict[str, Any] = {"revised_prompt": revised_prompt}
         if response_format == "b64_json":
-            data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+            asset["b64_json"] = b64_json
         else:
-            data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+            asset["url"] = stored_url
+        dimensions = image_size_from_bytes(image_bytes)
+        if dimensions:
+            asset["width"], asset["height"] = dimensions
+        data.append(asset)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
@@ -1912,6 +1936,26 @@ def _generate_single_image(
         emitted_for_token = False
         returned_message = False
         returned_result = False
+        image_slot_finalized = False
+
+        def finalize_image_slot(
+            success: bool,
+            *,
+            refresh_account: bool = False,
+            error: object | None = None,
+        ) -> None:
+            nonlocal image_slot_finalized
+            if image_slot_finalized:
+                return
+            image_slot_finalized = True
+            account_service.mark_image_result(
+                token,
+                success,
+                refresh_account=refresh_account,
+            )
+            if not success and error is not None:
+                account_service.handle_request_failure(token, "image_stream", error, quiet=True)
+
         account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
@@ -2069,17 +2113,10 @@ def _generate_single_image(
                     "account_email": account_email,
                 })
             if returned_message:
-                account_service.mark_image_result(
-                    token,
+                message_text = outputs[-1].text if outputs else ""
+                finalize_image_slot(
                     False,
-                    error=ImageGenerationError(
-                        "upstream returned a text reply instead of image output",
-                        status_code=400,
-                        error_type="invalid_request_error",
-                        code="upstream_text_reply",
-                        account_email=account_email,
-                    ),
-                    event="image_stream",
+                    refresh_account=should_refresh_image_account(message_text),
                 )
                 if request.trace_image_perf:
                     _monitor_image_stage(
@@ -2103,18 +2140,14 @@ def _generate_single_image(
                     })
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(
-                    token,
-                    False,
-                    error=ImageGenerationError(
-                        "upstream completed without generating images",
-                        status_code=502,
-                        error_type="server_error",
-                        code="no_image_generated",
-                        account_email=account_email,
-                    ),
-                    event="image_stream",
+                no_image_error = ImageGenerationError(
+                    "upstream completed without generating images",
+                    status_code=502,
+                    error_type="server_error",
+                    code="no_image_generated",
+                    account_email=account_email,
                 )
+                finalize_image_slot(False, error=no_image_error)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -2127,7 +2160,7 @@ def _generate_single_image(
                     )
                 return outputs
             _cleanup_image_conversations_after_success(backend, outputs)
-            account_service.mark_image_result(token, True)
+            finalize_image_slot(True)
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2150,11 +2183,15 @@ def _generate_single_image(
                 })
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if account_email:
                 setattr(exc, "account_email", account_email)
             raw_error = str(exc)
             upstream_error = getattr(exc, "upstream_error", "") or getattr(exc, "last_task_error", "") or raw_error
+            finalize_image_slot(
+                False,
+                refresh_account=should_refresh_image_account(upstream_error),
+                error=exc,
+            )
             logger.warning({
                 "event": "image_poll_timeout",
                 "request_token": token,
@@ -2186,7 +2223,7 @@ def _generate_single_image(
                     setattr(image_error, attr, getattr(exc, attr))
             raise image_error from exc
         except RequestCancelledError as exc:
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
+            finalize_image_slot(False, error=exc)
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2204,7 +2241,7 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
+            finalize_image_slot(False, error=exc)
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2234,7 +2271,7 @@ def _generate_single_image(
                 raw_upstream_message=str(exc),
             ) from exc
         except ImageTextReplyError as exc:
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
+            finalize_image_slot(False, error=exc)
             text_reply = str(exc) or "上游返回了文本回复而不是图片。"
             if request.trace_image_perf:
                 _monitor_image_stage(
@@ -2275,10 +2312,14 @@ def _generate_single_image(
                     setattr(image_error, attr, getattr(exc, attr))
             raise image_error from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            finalize_image_slot(
+                False,
+                refresh_account=should_refresh_image_account(error_text),
+                error=exc,
+            )
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2326,7 +2367,7 @@ def _generate_single_image(
                 **http_timing,
             })
             if not emitted_for_token and auth_invalid:
-                account_service.mark_image_result(token, False)
+                finalize_image_slot(False)
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -2334,7 +2375,7 @@ def _generate_single_image(
                 account_service.handle_invalid_token(token, "image_stream", error=last_error)
                 continue
             if auth_invalid:
-                account_service.mark_image_result(token, False)
+                finalize_image_slot(False)
                 account_service.handle_invalid_token(token, "image_stream", error=last_error)
                 continue
             quick_timeout_retry_ms = min(30000, max(5000, int(config.image_stream_timeout_secs * 1000 * 0.2)))
@@ -2372,7 +2413,11 @@ def _generate_single_image(
                         fallback_from_egress_label=fallback_from_egress.get("egress_label", ""),
                     )
                 continue
-            account_service.mark_image_result(token, False, error=exc, event="image_stream")
+            finalize_image_slot(
+                False,
+                refresh_account=should_refresh_image_account(last_error),
+                error=exc,
+            )
             raise ImageGenerationError(
                 image_stream_error_message(last_error),
                 account_email=account_email,
@@ -2489,13 +2534,6 @@ def _image_stream_payload(output: ImageOutput, event_type: str, payload: dict[st
     return item
 
 
-def _image_stream_partial_count(value: object) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def stream_image_chunks(
     outputs: Iterable[ImageOutput],
     event_prefix: str = "image_generation",
@@ -2503,7 +2541,8 @@ def stream_image_chunks(
     partial_images: object = 0,
 ) -> Iterator[dict[str, Any]]:
     prefix = str(event_prefix or "image_generation").strip() or "image_generation"
-    emit_partial = _image_stream_partial_count(partial_images) > 0
+    # ChatGPT Web only gives us final image bytes here. Emitting those bytes as a
+    # synthetic partial_image makes some clients display the same image twice.
     for output in outputs:
         if output.kind == "result":
             for item_index, item in enumerate(output.data):
@@ -2512,15 +2551,6 @@ def stream_image_chunks(
                 b64_json = str(item.get("b64_json") or "").strip()
                 if not b64_json:
                     continue
-                if emit_partial:
-                    yield _image_stream_payload(
-                        output,
-                        f"{prefix}.partial_image",
-                        {
-                            "b64_json": b64_json,
-                            "partial_image_index": max(0, item_index),
-                        },
-                    )
                 completed: dict[str, Any] = {"b64_json": b64_json}
                 if usage_builder:
                     usage = usage_builder([item])
