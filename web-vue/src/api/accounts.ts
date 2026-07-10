@@ -2,12 +2,15 @@
 import type { ProxyGroup } from './proxy'
 
 export type AccountLane = 'fast' | 'thinking' | 'pro'
-export type AccountBackendStatus = '正常' | '限流' | '存疑' | '异常' | '禁用'
+export type AccountBackendStatus = '正常' | '限流' | '异常' | '禁用'
+export type AccountStatusCategory = 'normal' | 'limited' | 'abnormal' | 'disabled'
 
 export interface Account {
   id: string
   access_token?: string
   backend_status?: string
+  status_category?: AccountStatusCategory
+  status_label?: string
   email?: string
   user_id?: string
   type?: string
@@ -23,6 +26,7 @@ export interface Account {
     | 'disabled'
     | 'snlm0e_refresh_failed'
     | 'account_invalid'
+    | 'account_suspected'
     | 'account_suspected'
     | 'pro_cooldown'
     | 'video_cooldown'
@@ -219,10 +223,12 @@ type AccountImportCleanupResponse = {
 
 const DEFAULT_LANES: AccountLane[] = ['fast', 'thinking', 'pro']
 const EMPTY_MODEL_IDS: Record<AccountLane, string> = { fast: '', thinking: '', pro: '' }
-export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '存疑', '异常', '禁用'] as const
+export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '异常', '禁用'] as const
+const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'abnormal', 'disabled'] as const
 const STATUS_NORMAL: AccountBackendStatus = '正常'
 const STATUS_DISABLED: AccountBackendStatus = '禁用'
 const STATUS_LIMITED: AccountBackendStatus = '限流'
+const STATUS_SUSPICIOUS: AccountBackendStatus = '存疑'
 const STATUS_SUSPICIOUS: AccountBackendStatus = '存疑'
 const STATUS_INVALID: AccountBackendStatus = '异常'
 
@@ -290,7 +296,7 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
     return {
       enabled: false,
       status: 'disabled',
-      status_reason: '账号已禁用',
+      status_reason: '账号禁用',
       status_reason_code: 'disabled',
       last_error_kind: '',
     }
@@ -346,6 +352,13 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
   }
 }
 
+function normalizeAccountStatusCategory(value: unknown): AccountStatusCategory | undefined {
+  const raw = cleanString(value)
+  return ACCOUNT_STATUS_CATEGORY_VALUES.includes(raw as AccountStatusCategory)
+    ? raw as AccountStatusCategory
+    : undefined
+}
+
 function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<string>): Account {
   const accessToken = cleanString(item.access_token || item.accessToken)
   const id = displayIdForAccount(item, index, usedIds)
@@ -368,6 +381,8 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
     id,
     access_token: accessToken,
     backend_status: rawStatus || STATUS_NORMAL,
+    status_category: normalizeAccountStatusCategory(item.status_category),
+    status_label: cleanString(item.status_label),
     email,
     user_id: userId,
     type,
