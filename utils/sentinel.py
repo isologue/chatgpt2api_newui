@@ -150,6 +150,9 @@ def build_sentinel_token(
     token = str(data.get("token") or "").strip()
     if resp.status_code != 200 or not token:
         raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+    # --- Sentinel 'so' field ---
+    # so-token is used for OpenAI-Sentinel-SO-Token header, PoW-like (seed+difficulty).
+    # Legacy build_sentinel_token doesn't return it; use build_sentinel_with_so_token.
     pow_data = data.get("proofofwork") or {}
     p_value = (
         generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
@@ -234,17 +237,30 @@ def build_sentinel_with_so_token(
     )
 
     turnstile_data = data.get("turnstile") or {}
-    so_token = ""
+    # turnstile_token: fills sentinel JSON "t" field (backward compat)
+    turnstile_token = ""
     if turnstile_data.get("required") and turnstile_data.get("dx"):
-        # 等待 5000ms 以模拟浏览器采集过程（对齐官方 SDK 行为）
-        time.sleep(5.0)
-        so_token = solve_turnstile_token(str(turnstile_data.get("dx") or ""), requirements_token) or ""
-        if not so_token:
-            raise RuntimeError("sentinel_so_token_failed")
+        turnstile_token = solve_turnstile_token(str(turnstile_data.get("dx") or ""), requirements_token) or ""
+        if not turnstile_token:
+            raise RuntimeError("sentinel_turnstile_token_failed")
 
-    # Sentinel token 包含所有字段（向后兼容）
-    sentinel_value = json.dumps({"p": p_value, "t": so_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    # Handle "so" field from Sentinel response: generates OpenAI-Sentinel-SO-Token header value
+    # Uses PoW-like generation (seed + difficulty), reusing SDK generate_token logic
+    so_data = data.get("so") or {}
+    so_header_token = ""
+    if so_data.get("required") and so_data.get("seed"):
+        so_header_token = generator.generate_token(
+            str(so_data.get("seed") or ""),
+            str(so_data.get("difficulty") or "0"),
+        )
+
+    # 5000ms observer sleep to match browser frontend SDK behavior
+    needs_observer_wait = bool(turnstile_data.get("required")) or bool(so_data.get("required"))
+    if needs_observer_wait:
+        time.sleep(5.0)
+
+    sentinel_value = json.dumps({"p": p_value, "t": turnstile_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
     # oai-sc cookie = "0" + sentinel token "c" value
     oai_sc_value = "0" + token
 
-    return sentinel_value, so_token, oai_sc_value
+    return sentinel_value, so_header_token, oai_sc_value

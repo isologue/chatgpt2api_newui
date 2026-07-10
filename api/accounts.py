@@ -291,7 +291,7 @@ def _int_value(value: object) -> int:
         return 0
 
 
-def _account_status_category(account: dict[str, Any]) -> Literal["normal", "limited", "abnormal", "disabled"]:
+def _account_status_category(account: dict[str, Any]) -> Literal["normal", "limited", "suspicious", "abnormal", "disabled"]:
     status = _clean_text(account.get("status"))
     status_key = status.lower()
     reason_code = _clean_text(account.get("status_reason_code")).lower()
@@ -347,6 +347,9 @@ def _account_status_category(account: dict[str, Any]) -> Literal["normal", "limi
         or _clean_text(account.get("last_token_refresh_error"))
     ):
         return "abnormal"
+
+    if status in {"存疑"} or status_key in {"suspicious", "suspected"}:
+        return "suspicious"
 
     lane_backoff_summary = account.get("lane_backoff_summary")
     if isinstance(lane_backoff_summary, dict) and _truthy_value(lane_backoff_summary.get("active")):
