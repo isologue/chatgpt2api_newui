@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from threading import Event, Thread
 
@@ -11,6 +12,7 @@ from services.config import config
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
+_ACCOUNT_WATCHER_CONFIG_CHANGED = Event()
 
 
 def extract_bearer_token(authorization: str | None) -> str:
@@ -100,9 +102,36 @@ def _account_watcher_refresh_tokens(
     return list(dict.fromkeys([*suspicious_tokens, *limited_tokens, *expiring_tokens]))
 
 
-def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
+def notify_account_watcher_config_changed() -> None:
+    """Wake the account watcher so a saved interval takes effect immediately."""
+    _ACCOUNT_WATCHER_CONFIG_CHANGED.set()
 
+
+def _account_watcher_interval_seconds() -> int:
+    # Also notices config.json changes written by another worker/process.
+    config.reload_if_changed()
+    return max(60, int(config.refresh_account_interval_minute) * 60)
+
+
+def _wait_for_account_watcher_tick(stop_event: Event) -> bool:
+    """Wait for the next tick, resetting the deadline when settings change."""
+    interval_seconds = _account_watcher_interval_seconds()
+    deadline = time.monotonic() + interval_seconds
+    while not stop_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        changed = _ACCOUNT_WATCHER_CONFIG_CHANGED.wait(timeout=min(remaining, 1.0))
+        if changed:
+            _ACCOUNT_WATCHER_CONFIG_CHANGED.clear()
+        current_interval_seconds = _account_watcher_interval_seconds()
+        if changed or current_interval_seconds != interval_seconds:
+            interval_seconds = current_interval_seconds
+            deadline = time.monotonic() + interval_seconds
+    return False
+
+
+def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
@@ -130,7 +159,8 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
-            stop_event.wait(interval_seconds)
+            if not _wait_for_account_watcher_tick(stop_event):
+                break
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()
