@@ -1366,17 +1366,29 @@ class AccountService:
             )
         return True
 
+    def _refresh_account_after_image_failure(self, access_token: str) -> None:
+        try:
+            self.fetch_remote_info(access_token, "image_failure")
+        except Exception as exc:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "图片失败后刷新账号失败",
+                {"token": anonymize_token(access_token), "error": str(exc)},
+            )
+
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
+        now = datetime.now(timezone.utc)
+        should_refresh_after_failure = False
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_used_at"] = now.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             image_quota_unknown = bool(next_item.get("image_quota_unknown"))
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
@@ -1387,20 +1399,23 @@ class AccountService:
                         # 本地扣减到 0 只能说明“展示值需要远程刷新”，不能直接证明账号已限流。
                         # 下一次调度会进入远程预检，由 get_user_info 的结果决定是否写入“限流”。
                         next_item["image_quota_unknown"] = True
-                        next_item["last_quota_estimated_empty_at"] = datetime.now(timezone.utc).isoformat()
+                        next_item["last_quota_estimated_empty_at"] = now.isoformat()
                 if next_item.get("status") == "限流":
                     # 如果极端竞态下限流账号仍然成功出图，说明远程额度已恢复。
                     next_item["status"] = "正常"
                     next_item["image_quota_unknown"] = True
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                should_refresh_after_failure = True
             account = self._normalize_account(next_item)
             if account is None:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
-            return dict(account)
-        return None
+            result = dict(account)
+        if should_refresh_after_failure:
+            self._refresh_account_after_image_failure(access_token)
+        return result
 
     def fetch_remote_info(
         self,
