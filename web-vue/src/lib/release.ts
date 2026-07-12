@@ -4,6 +4,32 @@ export type ReleaseInfo = {
   items: { type: string; content: string }[]
 }
 
+export type ReleaseInlineSegment = {
+  kind: 'text' | 'code'
+  content: string
+}
+
+export function splitReleaseInlineCode(value: string): ReleaseInlineSegment[] {
+  const source = String(value || '')
+  const segments: ReleaseInlineSegment[] = []
+  const pattern = /`([^`\n]+)`/g
+  let cursor = 0
+
+  for (const match of source.matchAll(pattern)) {
+    const index = match.index ?? 0
+    if (index > cursor) {
+      segments.push({ kind: 'text', content: source.slice(cursor, index) })
+    }
+    segments.push({ kind: 'code', content: match[1] })
+    cursor = index + match[0].length
+  }
+
+  if (cursor < source.length) {
+    segments.push({ kind: 'text', content: source.slice(cursor) })
+  }
+  return segments.length ? segments : [{ kind: 'text', content: source }]
+}
+
 export function parseChangelog(content: string): ReleaseInfo[] {
   return content
     .split(/^## /m)

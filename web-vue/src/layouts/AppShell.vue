@@ -533,7 +533,18 @@
               >
                 {{ item.type }}
               </MetaChip>
-              <span class="min-w-0 flex-1 text-foreground/85">{{ item.content }}</span>
+              <span class="min-w-0 flex-1 text-foreground/85">
+                <template
+                  v-for="(segment, segmentIndex) in splitReleaseInlineCode(item.content)"
+                  :key="`${release.version}-${index}-${segmentIndex}`"
+                >
+                  <code
+                    v-if="segment.kind === 'code'"
+                    class="rounded bg-muted px-1 py-0.5 font-mono text-[0.9em] text-foreground"
+                  >{{ segment.content }}</code>
+                  <span v-else>{{ segment.content }}</span>
+                </template>
+              </span>
             </div>
           </div>
         </div>
@@ -588,6 +599,7 @@ import {
   latestReleasedVersion,
   normalizeVersionTag,
   parseChangelog,
+  splitReleaseInlineCode,
   type ReleaseInfo,
 } from '@/lib/release'
 import type { Settings } from '@/types/api'
