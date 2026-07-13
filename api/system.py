@@ -10,7 +10,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.support import require_admin, require_identity, resolve_image_base_url
+from api.support import (
+    notify_account_watcher_config_changed,
+    require_admin,
+    require_identity,
+    resolve_image_base_url,
+)
 from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import config
@@ -574,7 +579,14 @@ def create_router(app_version: str) -> APIRouter:
             updates = {key: value for key, value in incoming.items() if key in SETTINGS_UPDATE_KEYS}
             if not updates:
                 return {"config": config.get()}
-            return {"config": config.update(updates)}
+            previous_refresh_interval = config.refresh_account_interval_minute
+            updated_config = config.update(updates)
+            if (
+                "refresh_account_interval_minute" in updates
+                and config.refresh_account_interval_minute != previous_refresh_interval
+            ):
+                notify_account_watcher_config_changed()
+            return {"config": updated_config}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except OSError as exc:

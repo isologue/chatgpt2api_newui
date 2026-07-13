@@ -54,6 +54,21 @@ export type AccountProgressMetricItem = {
   value: string | number
 }
 
+const IMAGE_UNAVAILABLE_HINTS = [
+  '不能创建图片',
+  '无法生成更多图像',
+  '今天无法为您生成更多图像',
+  '请明天再来',
+  "can't create any",
+  'cannot create any',
+  "can't seem to create any",
+  "image creation isn't available",
+  'image creation may not be available',
+  'unable to generate more images',
+  "can't generate more images",
+  'generate more images today',
+]
+
 const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'suspicious', 'abnormal', 'disabled'] as const
 const ACCOUNT_STATUS_LABELS: Record<Exclude<AccountStatusFilter, 'all'>, string> = {
   normal: '正常',
@@ -115,6 +130,11 @@ export function accountRowSignature(item: Account): string {
     item.enabled ? 1 : 0,
     item.is_demo ? 1 : 0,
   ].map(signatureValue).join('|')
+}
+
+function includesHint(input: unknown, hints: string[]): boolean {
+  const text = String(input || '').toLowerCase()
+  return Boolean(text) && hints.some((hint) => text.includes(hint.toLowerCase()))
 }
 
 function normalizeLimit(value: unknown): number {
@@ -242,7 +262,9 @@ const GROUPS: GroupDefinition[] = [
 
       if (
         item.status_reason_code === 'image_generation_unavailable' ||
-        String(item.last_error_kind || '') === 'media_generation_unavailable'
+        String(item.last_error_kind || '') === 'media_generation_unavailable' ||
+        includesHint(item.status_reason, IMAGE_UNAVAILABLE_HINTS) ||
+        includesHint(item.last_error, IMAGE_UNAVAILABLE_HINTS)
       ) {
         const detail = String(item.status_reason || item.last_error || '').trim()
         return {
@@ -379,11 +401,47 @@ const ACCOUNT_PLAN_LABELS: Record<string, string> = {
 export function statusCategory(item: Account): Exclude<AccountStatusFilter, 'all'> {
   const category = accountStatusCategoryValue(item)
   if (category) return category
+
   const backendStatus = cleanString(item.backend_status)
-  if (backendStatus === '限流') return 'limited'
-  if (backendStatus === '存疑') return 'suspicious'
-  if (backendStatus === '异常') return 'abnormal'
-  if (backendStatus === '禁用') return 'disabled'
+  const status = cleanString(item.status).toLowerCase()
+  const reasonCode = cleanString(item.status_reason_code).toLowerCase()
+  const errorKind = cleanString(item.last_error_kind).toLowerCase()
+
+  if (!item.enabled || status === 'disabled' || backendStatus === '禁用') return 'disabled'
+  if (backendStatus === '存疑' || status === 'suspicious' || reasonCode === 'account_suspected') return 'suspicious'
+  if (
+    backendStatus === '异常' ||
+    status === 'abnormal' ||
+    status === 'invalid' ||
+    status === 'incomplete' ||
+    reasonCode === 'snlm0e_refresh_failed' ||
+    reasonCode === 'account_invalid' ||
+    reasonCode === 'parse_failure' ||
+    reasonCode === 'upstream_error' ||
+    errorKind === 'auth_invalid' ||
+    errorKind === 'parse_failure' ||
+    errorKind === 'upstream_error'
+  ) return 'abnormal'
+  if (
+    backendStatus === '限流' ||
+    status === 'limited' ||
+    status === 'rate_limited' ||
+    status === 'cooling' ||
+    status === 'backoff' ||
+    reasonCode === 'lane_backoff' ||
+    reasonCode === 'pro_cooldown' ||
+    reasonCode === 'video_cooldown' ||
+    reasonCode === 'image_generation_unavailable' ||
+    reasonCode === 'image_degraded_to_fast' ||
+    reasonCode === 'lane_degraded' ||
+    reasonCode === 'text_pending' ||
+    errorKind === 'quota_exhausted' ||
+    errorKind === 'media_pending' ||
+    errorKind === 'media_generation_unavailable' ||
+    errorKind === 'media_degraded' ||
+    errorKind === 'lane_degraded' ||
+    errorKind === 'text_pending'
+  ) return 'limited'
   return 'normal'
 }
 
