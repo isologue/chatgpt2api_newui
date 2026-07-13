@@ -1,0 +1,680 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from curl_cffi.requests import exceptions as curl_exceptions
+
+from utils.helper import UpstreamHTTPError
+
+
+@dataclass(frozen=True)
+class FailurePolicy:
+    scope: str
+    capability: str | None
+    retryable: bool
+    status_code: int
+    error_type: str
+    public_message: str
+    account_failure: bool = False
+    refresh_account: bool = False
+
+
+@dataclass(frozen=True)
+class ImageFailure:
+    code: str
+    scope: str
+    capability: str | None
+    retryable: bool
+    retry_after: int | None
+    status_code: int
+    error_type: str
+    public_message: str
+    account_failure: bool = False
+    refresh_account: bool = False
+    raw_detail: Any = field(default=None, compare=False, repr=False)
+
+    def with_raw_detail(self, raw_detail: Any) -> "ImageFailure":
+        return replace(self, raw_detail=raw_detail)
+
+    def diagnostic_fields(self) -> dict[str, Any]:
+        return {
+            "failure_code": self.code,
+            "failure_scope": self.scope,
+            "failure_capability": self.capability,
+            "failure_retryable": self.retryable,
+            "failure_account_failure": self.account_failure,
+            "failure_retry_after": self.retry_after,
+        }
+
+
+FAILURE_POLICIES: dict[str, FailurePolicy] = {
+    "upstream_error": FailurePolicy(
+        "transient", None, False, 502, "server_error",
+        "The upstream image request failed. Please try again.",
+        account_failure=True,
+    ),
+    "internal_error": FailurePolicy(
+        "internal", None, False, 500, "server_error",
+        "An internal image processing error occurred. Please try again.",
+    ),
+    "upstream_unavailable": FailurePolicy(
+        "transient", None, True, 502, "server_error",
+        "The upstream image service is temporarily unavailable. Please try again.",
+        account_failure=True,
+    ),
+    "upstream_connection_failed": FailurePolicy(
+        "transient", None, True, 502, "server_error",
+        "Could not connect to the upstream image service. Please try again.",
+        account_failure=True,
+    ),
+    "upstream_connection_timeout": FailurePolicy(
+        "transient", None, True, 504, "server_error",
+        "The upstream image service timed out. Please try again.",
+        account_failure=True,
+    ),
+    "upstream_rate_limited": FailurePolicy(
+        "transient", "image_generation", True, 429, "rate_limit_error",
+        "The upstream image service is busy. Please try again shortly.",
+        account_failure=True,
+        refresh_account=True,
+    ),
+    "image_poll_timeout": FailurePolicy(
+        "transient", "image_generation", True, 502, "server_error",
+        "The image did not finish before the timeout. Please try again.",
+        account_failure=True,
+    ),
+    "image_stream_timeout": FailurePolicy(
+        "transient", "image_generation", True, 502, "server_error",
+        "The upstream image stream timed out. Please try again.",
+        account_failure=True,
+    ),
+    "image_stream_interrupted": FailurePolicy(
+        "transient", "image_generation", True, 502, "server_error",
+        "The upstream image stream was interrupted. Please try again.",
+        account_failure=True,
+    ),
+    "image_tool_error": FailurePolicy(
+        "account", "image_generation", True, 502, "server_error",
+        "The selected image account is temporarily unavailable. Please try again.",
+        account_failure=True,
+        refresh_account=True,
+    ),
+    "image_quota_exhausted": FailurePolicy(
+        "account", "image_generation", True, 429, "insufficient_quota",
+        "The selected image account has no image quota available.",
+        account_failure=True,
+        refresh_account=True,
+    ),
+    "file_upload_throttled": FailurePolicy(
+        "account", "file_upload", True, 429, "rate_limit_error",
+        "Reference image upload is temporarily unavailable. Please try again.",
+        account_failure=True,
+    ),
+    "auth_invalid": FailurePolicy(
+        "account", "auth", True, 401, "authentication_error",
+        "The selected image account is unavailable. Please try again.",
+        account_failure=True,
+        refresh_account=True,
+    ),
+    "content_policy_violation": FailurePolicy(
+        "request", None, False, 400, "invalid_request_error",
+        "The image request was rejected by the upstream safety system.",
+    ),
+    "invalid_image_input": FailurePolicy(
+        "request", None, False, 400, "invalid_request_error",
+        "The image request is invalid. Check the input and try again.",
+    ),
+    "upstream_text_reply": FailurePolicy(
+        "request", None, False, 502, "server_error",
+        "The upstream service returned text instead of an image.",
+    ),
+    "no_image_generated": FailurePolicy(
+        "request", None, False, 502, "server_error",
+        "The upstream service did not generate an image for this request.",
+    ),
+    "unsupported_model": FailurePolicy(
+        "request", None, False, 400, "invalid_request_error",
+        "This model does not support image generation.",
+    ),
+    "image_download_failed": FailurePolicy(
+        "delivery", None, False, 502, "server_error",
+        "The image was generated, but delivering the result failed. Please try again.",
+    ),
+    "task_interrupted": FailurePolicy(
+        "request", None, False, 503, "server_error",
+        "The image task was interrupted by a service restart. Please submit it again.",
+    ),
+    "no_available_account": FailurePolicy(
+        "transient", None, False, 503, "server_error",
+        "No image account is currently available. Please try again later.",
+    ),
+    "insufficient_quota": FailurePolicy(
+        "account", "image_generation", False, 429, "insufficient_quota",
+        "No image generation quota is currently available.",
+    ),
+}
+
+
+FAILURE_CODE_ALIASES = {
+    "connection_failed": "upstream_connection_failed",
+    "connection_timeout": "upstream_connection_timeout",
+    "image_stream_interrupted": "image_stream_interrupted",
+    "quota_exhausted": "insufficient_quota",
+    "token_invalid": "auth_invalid",
+    "token_invalidated": "auth_invalid",
+    "token_revoked": "auth_invalid",
+    "unsupported_image_model": "unsupported_model",
+    "upstream_timeout": "image_poll_timeout",
+}
+
+RATE_LIMIT_FAILURE_CODES = frozenset({
+    "429",
+    "file_upload_throttled",
+    "image_quota_exhausted",
+    "insufficient_quota",
+    "limited",
+    "quota_exhausted",
+    "rate_limit",
+    "rate_limited",
+    "upstream_rate_limited",
+    "限流",
+})
+
+FAILED_STATUSES = frozenset({"error", "fail", "failed", "limited", "rate_limited", "限流"})
+
+
+def is_structured_failure(
+    *,
+    status: Any = None,
+    error: Any = None,
+    error_code: Any = None,
+    failure_code: Any = None,
+) -> bool:
+    return str(status or "").strip().lower() in FAILED_STATUSES or any(
+        value not in (None, "")
+        for value in (error, error_code, failure_code)
+    )
+
+
+def is_rate_limit_failure_code(value: Any) -> bool:
+    return str(value or "").strip().lower() in RATE_LIMIT_FAILURE_CODES
+
+
+def image_failure(
+    code: str | None,
+    *,
+    retry_after: int | None = None,
+    raw_detail: Any = None,
+) -> ImageFailure:
+    normalized = str(code or "upstream_error").strip().lower()
+    normalized = FAILURE_CODE_ALIASES.get(normalized, normalized)
+    if normalized not in FAILURE_POLICIES:
+        normalized = "upstream_error"
+    policy = FAILURE_POLICIES[normalized]
+    return ImageFailure(
+        code=normalized,
+        scope=policy.scope,
+        capability=policy.capability,
+        retryable=policy.retryable,
+        retry_after=retry_after,
+        status_code=policy.status_code,
+        error_type=policy.error_type,
+        public_message=policy.public_message,
+        account_failure=policy.account_failure,
+        refresh_account=policy.refresh_account,
+        raw_detail=raw_detail,
+    )
+
+
+class ImageFailureError(RuntimeError):
+    failure_code = "upstream_error"
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        failure: ImageFailure | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        raw_message = str(message or "").strip()
+        self.failure = failure or image_failure(
+            self.failure_code,
+            retry_after=retry_after,
+            raw_detail=raw_message,
+        )
+        super().__init__(raw_message or self.failure.public_message)
+
+
+class InvalidAccessTokenError(ImageFailureError):
+    failure_code = "auth_invalid"
+
+
+class ImagePollTimeoutError(ImageFailureError):
+    failure_code = "image_poll_timeout"
+
+
+class ImageContentPolicyError(ImageFailureError):
+    failure_code = "content_policy_violation"
+
+
+class ImageTextReplyError(ImageFailureError):
+    failure_code = "upstream_text_reply"
+
+
+class ImageDownloadError(ImageFailureError):
+    failure_code = "image_download_failed"
+
+
+class ImageGenerationError(ImageFailureError):
+    def __init__(
+        self,
+        message: str = "",
+        status_code: int | None = None,
+        error_type: str | None = None,
+        code: str | None = None,
+        param: str | None = None,
+        account_email: str = "",
+        conversation_id: str = "",
+        raw_error: str = "",
+        upstream_error: str = "",
+        raw_upstream_message: str = "",
+        failure: ImageFailure | None = None,
+        image_attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        raw_message = str(message or "").strip()
+        resolved = failure or image_failure(code, raw_detail=raw_error or raw_message)
+        super().__init__(raw_message, failure=resolved)
+        self.status_code = int(status_code if status_code is not None else resolved.status_code)
+        self.error_type = str(error_type or resolved.error_type)
+        self.code = resolved.code
+        self.param = param
+        self.account_email = account_email
+        self.conversation_id = conversation_id
+        self.raw_error = raw_error or raw_message
+        self.upstream_error = upstream_error
+        self.raw_upstream_message = raw_upstream_message
+        self.image_attempts = [dict(item) for item in image_attempts or [] if isinstance(item, Mapping)]
+
+    def to_openai_error(self) -> dict[str, Any]:
+        return {
+            "error": {
+                "message": self.failure.public_message,
+                "type": self.error_type,
+                "param": self.param,
+                "code": self.code,
+            }
+        }
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _structured_codes(value: Any) -> set[str]:
+    codes: set[str] = set()
+    pending = [value]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, Mapping):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for key in ("code", "error_code", "type"):
+                candidate = current.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    codes.add(candidate.strip().lower())
+            pending.extend(
+                child
+                for child in current.values()
+                if isinstance(child, (Mapping, list, tuple))
+            )
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+    return codes
+
+
+QUOTA_CODES = {"insufficient_quota", "quota_exhausted", "image_quota_exhausted"}
+AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}
+POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
+
+
+def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
+    codes = _structured_codes(exc.body)
+    context = str(exc.context or "").strip().lower()
+    context_path = context.split("?", 1)[0].rstrip("/")
+    retry_after = exc.retry_after
+    if codes.intersection(POLICY_CODES):
+        return image_failure("content_policy_violation", raw_detail=exc.body)
+    if codes.intersection(AUTH_CODES) or exc.status_code == 401:
+        return image_failure("auth_invalid", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code == 403:
+        return image_failure("upstream_unavailable", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code == 429:
+        is_file_upload = (
+            context_path in {"/backend-api/files", "image_upload"}
+            or (
+                context_path.startswith("/backend-api/files/")
+                and context_path.endswith("/uploaded")
+            )
+        )
+        if is_file_upload:
+            return image_failure("file_upload_throttled", retry_after=retry_after, raw_detail=exc.body)
+        if codes.intersection(QUOTA_CODES):
+            return image_failure("image_quota_exhausted", retry_after=retry_after, raw_detail=exc.body)
+        return image_failure("upstream_rate_limited", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code in {408, 504}:
+        return image_failure("upstream_connection_timeout", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code >= 500:
+        return image_failure("upstream_unavailable", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code in {400, 404, 409, 413, 415, 422}:
+        return image_failure("invalid_image_input", raw_detail=exc.body)
+    return image_failure("upstream_error", retry_after=retry_after, raw_detail=exc.body)
+
+
+def classify_image_exception(exc: BaseException, *, code: str | None = None) -> ImageFailure:
+    failure = getattr(exc, "failure", None)
+    if isinstance(failure, ImageFailure):
+        return failure
+    if isinstance(exc, UpstreamHTTPError):
+        return classify_upstream_http_error(exc)
+    structured_code = code or getattr(exc, "code", None)
+    if isinstance(structured_code, str) and structured_code.strip().lower() in (
+        FAILURE_POLICIES.keys() | FAILURE_CODE_ALIASES.keys()
+    ):
+        return image_failure(structured_code, raw_detail=str(exc))
+    if code:
+        return image_failure(code, raw_detail=str(exc))
+    if isinstance(exc, (TimeoutError, curl_exceptions.Timeout)):
+        return image_failure("upstream_connection_timeout", raw_detail=str(exc))
+    if isinstance(
+        exc,
+        (
+            ConnectionError,
+            curl_exceptions.ConnectionError,
+            curl_exceptions.ProxyError,
+            curl_exceptions.SSLError,
+            curl_exceptions.RequestException,
+        ),
+    ):
+        return image_failure("upstream_connection_failed", raw_detail=str(exc))
+    # Unknown exceptions are local by default. Known upstream HTTP, transport,
+    # timeout, stream, poll, tool, quota, and auth failures are classified above
+    # (or carry a structured ImageFailure) and remain account-attributed.
+    return image_failure("internal_error", raw_detail=str(exc))
+
+
+def _message(value: Any) -> Mapping[str, Any]:
+    item = _mapping(value)
+    nested = item.get("message")
+    if isinstance(nested, Mapping):
+        return nested
+    nested_value = _mapping(item.get("v"))
+    nested = nested_value.get("message")
+    if isinstance(nested, Mapping):
+        return nested
+    return item
+
+
+def _message_text(message: Mapping[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    content_map = _mapping(content)
+    parts = content_map.get("parts")
+    if isinstance(parts, list):
+        return "".join(part for part in parts if isinstance(part, str)).strip()
+    return str(content_map.get("text") or "").strip()
+
+
+TERMINAL_MESSAGE_STATUSES = {
+    "complete",
+    "completed",
+    "done",
+    "finished",
+    "finished_successfully",
+    "finished_partial_completion",
+    "success",
+    "succeeded",
+}
+
+
+def is_terminal_message_status(value: Any) -> bool:
+    return str(value or "").strip().lower() in TERMINAL_MESSAGE_STATUSES
+
+
+def _message_has_image_output(message: Mapping[str, Any]) -> bool:
+    author = _mapping(message.get("author"))
+    metadata = _mapping(message.get("metadata"))
+    if str(author.get("role") or "").strip().lower() != "tool":
+        return False
+    if str(metadata.get("async_task_type") or "").strip().lower() != "image_gen":
+        return False
+
+    def has_pointer(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            pointer = value.get("asset_pointer")
+            if isinstance(pointer, str) and pointer.startswith(("file-service://", "sediment://")):
+                return True
+            return any(has_pointer(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(has_pointer(item) for item in value)
+        return False
+
+    return has_pointer(message.get("content"))
+
+
+def _message_is_image_generation_state(message: Mapping[str, Any]) -> bool:
+    metadata = _mapping(message.get("metadata"))
+
+    def field(name: str) -> str:
+        value = message.get(name)
+        if value in (None, ""):
+            value = metadata.get(name)
+        return str(value or "").strip().lower()
+
+    return (
+        field("turn_use_case") == "image gen"
+        or field("async_task_type") == "image_gen"
+        or field("message_type") in {"image_gen", "image_generation"}
+    )
+
+
+def classify_upstream_message(value: Any) -> ImageFailure | None:
+    outer = _mapping(value)
+    moderation = _mapping(outer.get("moderation_response"))
+    if outer.get("type") == "moderation" and moderation.get("blocked") is True:
+        return image_failure("content_policy_violation", raw_detail=value)
+
+    message = _message(value)
+    author = _mapping(message.get("author"))
+    metadata = _mapping(message.get("metadata"))
+    content = _mapping(message.get("content"))
+    role = str(author.get("role") or "").strip().lower()
+    content_type = str(content.get("content_type") or "").strip().lower()
+    status = str(message.get("status") or metadata.get("status") or "").strip().lower()
+    codes = _structured_codes({"metadata": metadata})
+    raw_detail = _message_text(message)
+
+    if codes.intersection(POLICY_CODES) or metadata.get("blocked") is True:
+        return image_failure("content_policy_violation", raw_detail=raw_detail or value)
+    if codes.intersection(AUTH_CODES):
+        return image_failure("auth_invalid", raw_detail=raw_detail or value)
+    if codes.intersection(QUOTA_CODES):
+        return image_failure("image_quota_exhausted", raw_detail=raw_detail or value)
+    if _message_has_image_output(message):
+        return None
+    if metadata.get("is_error") is True or (role == "tool" and content_type == "system_error"):
+        return image_failure("image_tool_error", raw_detail=raw_detail or value)
+    if _message_is_image_generation_state(message):
+        return None
+    if role == "assistant" and content_type == "text" and (
+        is_terminal_message_status(status) or message.get("end_turn") is True
+    ):
+        return image_failure("upstream_text_reply", raw_detail=raw_detail or value)
+    return None
+
+
+def merge_message_failure(
+    current: ImageFailure | None,
+    candidate: ImageFailure | None,
+) -> ImageFailure | None:
+    if candidate is None:
+        return current
+    if (
+        candidate.code == "upstream_text_reply"
+        and current is not None
+        and current.code != "upstream_text_reply"
+    ):
+        return current
+    return candidate
+
+
+def classify_task_failure(task: Any) -> ImageFailure | None:
+    task_map = _mapping(task)
+    image_message = task_map.get("image_gen_message")
+    if isinstance(image_message, Mapping):
+        return classify_upstream_message(image_message)
+    return None
+
+
+def classify_conversation_failure(data: Any) -> ImageFailure | None:
+    data_map = _mapping(data)
+    mapping = _mapping(data_map.get("mapping"))
+    messages: list[Mapping[str, Any]] = []
+    current_node = str(data_map.get("current_node") or "").strip()
+
+    if current_node and current_node in mapping:
+        lineage: list[Mapping[str, Any]] = []
+        visited: set[str] = set()
+        node_id = current_node
+        while node_id and node_id not in visited:
+            visited.add(node_id)
+            node = _mapping(mapping.get(node_id))
+            if not node:
+                break
+            message = _message(node)
+            if message:
+                lineage.append(message)
+            node_id = str(node.get("parent") or "").strip()
+        messages = list(reversed(lineage))
+    else:
+        ordered: list[tuple[float, str, Mapping[str, Any]]] = []
+        for raw_node_id, node in mapping.items():
+            message = _message(node)
+            if not message:
+                continue
+            try:
+                create_time = float(message.get("create_time") or 0.0)
+            except (TypeError, ValueError):
+                create_time = 0.0
+            ordered.append((create_time, str(raw_node_id), message))
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        messages = [message for _create_time, _node_id, message in ordered]
+
+    last_user_index = -1
+    for message_index, message in enumerate(messages):
+        role = str(_mapping(message.get("author")).get("role") or "").strip().lower()
+        if role == "user":
+            last_user_index = message_index
+    current_turn = messages[last_user_index + 1:]
+    if any(_message_has_image_output(message) for message in current_turn):
+        return None
+
+    failure: ImageFailure | None = None
+    for message in current_turn:
+        failure = merge_message_failure(failure, classify_upstream_message(message))
+    return failure
+
+
+def extract_message_facts(value: Any) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            message = item.get("message")
+            if isinstance(message, Mapping):
+                visit(message)
+            author = _mapping(item.get("author"))
+            content = _mapping(item.get("content"))
+            metadata = _mapping(item.get("metadata"))
+            if author.get("role") not in (None, ""):
+                facts["role"] = str(author.get("role") or "").strip().lower()
+            if content.get("content_type") not in (None, ""):
+                facts["content_type"] = str(content.get("content_type") or "").strip().lower()
+            if item.get("status") not in (None, ""):
+                facts["status"] = str(item.get("status") or "").strip().lower()
+            if item.get("end_turn") is True:
+                facts["end_turn"] = True
+            if metadata.get("is_error") is True:
+                facts["is_error"] = True
+            for name in ("turn_use_case", "async_task_type", "message_type"):
+                candidate = item.get(name)
+                if candidate in (None, ""):
+                    candidate = metadata.get(name)
+                if candidate not in (None, ""):
+                    facts[name] = str(candidate).strip().lower()
+            path = str(item.get("p") or "").strip().lower()
+            patch_value = item.get("v")
+            if path.endswith("/message/author/role") and isinstance(patch_value, str):
+                facts["role"] = patch_value.strip().lower()
+            elif path.endswith("/message/content/content_type") and isinstance(patch_value, str):
+                facts["content_type"] = patch_value.strip().lower()
+            elif path.endswith("/message/status") and isinstance(patch_value, str):
+                facts["status"] = patch_value.strip().lower()
+            elif path.endswith("/message/end_turn") and patch_value is True:
+                facts["end_turn"] = True
+            elif path.endswith("/message/metadata/is_error") and patch_value is True:
+                facts["is_error"] = True
+            else:
+                for name in ("turn_use_case", "async_task_type", "message_type"):
+                    if path.endswith(f"/message/metadata/{name}") and isinstance(patch_value, str):
+                        facts[name] = patch_value.strip().lower()
+                        break
+            for key, child in item.items():
+                if key not in {"message", "author", "content", "metadata"} and isinstance(child, (Mapping, list, tuple)):
+                    visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return facts
+
+
+def classify_message_facts(
+    *,
+    role: str = "",
+    content_type: str = "",
+    status: str = "",
+    end_turn: bool = False,
+    is_error: bool = False,
+    blocked: bool = False,
+    has_image_output: bool = False,
+    turn_use_case: str = "",
+    async_task_type: str = "",
+    message_type: str = "",
+) -> ImageFailure | None:
+    if blocked:
+        return image_failure("content_policy_violation")
+    if has_image_output:
+        return None
+    normalized_role = str(role or "").strip().lower()
+    normalized_content_type = str(content_type or "").strip().lower()
+    normalized_status = str(status or "").strip().lower()
+    if is_error or (normalized_role == "tool" and normalized_content_type == "system_error"):
+        return image_failure("image_tool_error")
+    if (
+        str(turn_use_case or "").strip().lower() == "image gen"
+        or str(async_task_type or "").strip().lower() == "image_gen"
+        or str(message_type or "").strip().lower() in {"image_gen", "image_generation"}
+    ):
+        return None
+    if normalized_role == "assistant" and normalized_content_type == "text" and (
+        end_turn or is_terminal_message_status(normalized_status)
+    ):
+        return image_failure("upstream_text_reply")
+    return None

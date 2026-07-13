@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
@@ -278,7 +278,6 @@ def _format_timeout_secs(value: float) -> str:
 def iter_sse_payloads(
     response: requests.Response,
     max_duration_secs: float | None = None,
-    cancel_checker: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     started_at = time.monotonic()
     timeout_secs = float(max_duration_secs or 0)
@@ -294,12 +293,6 @@ def iter_sse_payloads(
         return timeout_secs - (time.monotonic() - started_at)
 
     def _raise_if_timeout() -> None:
-        if cancel_checker is not None:
-            try:
-                cancel_checker()
-            except Exception:
-                _abort_stream_nonblocking()
-                raise
         remaining = _remaining_secs()
         if remaining is not None and remaining <= 0:
             _abort_stream_nonblocking()

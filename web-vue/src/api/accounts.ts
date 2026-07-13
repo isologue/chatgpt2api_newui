@@ -2,8 +2,9 @@
 import type { ProxyGroup } from './proxy'
 
 export type AccountLane = 'fast' | 'thinking' | 'pro'
-export type AccountBackendStatus = '正常' | '限流' | '异常' | '禁用'
-export type AccountStatusCategory = 'normal' | 'limited' | 'abnormal' | 'disabled'
+export type AccountSourceType = 'web' | 'codex'
+export type AccountBackendStatus = '正常' | '限流' | '存疑' | '异常' | '禁用'
+export type AccountStatusCategory = 'normal' | 'limited' | 'suspicious' | 'abnormal' | 'disabled'
 
 export interface Account {
   id: string
@@ -14,19 +15,22 @@ export interface Account {
   email?: string
   user_id?: string
   type?: string
-  source_type?: string
+  source_type?: AccountSourceType
   proxy?: string
   group_id?: string
   quota?: number
   image_quota_unknown?: boolean
+  last_remote_check_result?: '' | 'pending' | 'ok' | 'error' | 'invalid'
+  last_remote_check_error?: string
+  last_remote_check_attempt_at?: string
+  last_remote_checked_at?: string
   name: string
-  status?: 'ready' | 'incomplete' | 'disabled' | 'invalid' | 'suspicious' | 'auto_disabled' | 'cooling' | 'backoff'
+  status?: 'ready' | 'incomplete' | 'disabled' | 'invalid' | 'auto_disabled' | 'cooling' | 'backoff' | 'suspicious'
   status_reason?: string
   status_reason_code?:
     | 'disabled'
     | 'snlm0e_refresh_failed'
     | 'account_invalid'
-    | 'account_suspected'
     | 'account_suspected'
     | 'pro_cooldown'
     | 'video_cooldown'
@@ -223,12 +227,12 @@ type AccountImportCleanupResponse = {
 
 const DEFAULT_LANES: AccountLane[] = ['fast', 'thinking', 'pro']
 const EMPTY_MODEL_IDS: Record<AccountLane, string> = { fast: '', thinking: '', pro: '' }
-export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '异常', '禁用'] as const
-const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'abnormal', 'disabled'] as const
+export const ACCOUNT_BACKEND_STATUS_VALUES = ['正常', '限流', '存疑', '异常', '禁用'] as const
+export const ACCOUNT_SOURCE_TYPE_VALUES = ['web', 'codex'] as const
+const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'suspicious', 'abnormal', 'disabled'] as const
 const STATUS_NORMAL: AccountBackendStatus = '正常'
 const STATUS_DISABLED: AccountBackendStatus = '禁用'
 const STATUS_LIMITED: AccountBackendStatus = '限流'
-const STATUS_SUSPICIOUS: AccountBackendStatus = '存疑'
 const STATUS_SUSPICIOUS: AccountBackendStatus = '存疑'
 const STATUS_INVALID: AccountBackendStatus = '异常'
 
@@ -236,6 +240,11 @@ const accountTokenById = new Map<string, string>()
 
 function cleanString(value: unknown): string {
   return String(value || '').trim()
+}
+
+export function normalizeAccountSourceType(value: unknown): AccountSourceType {
+  const raw = cleanString(value).toLowerCase()
+  return ['codex', 'cpa', 'cpa_json', 'remote_cpa', 'sub2api'].includes(raw) ? 'codex' : 'web'
 }
 
 export function normalizeAccountBackendStatus(
@@ -287,53 +296,48 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
   Account,
   'enabled' | 'status' | 'status_reason' | 'status_reason_code' | 'last_error_kind'
 > {
-  const rawStatus = cleanString(item.status)
-  const quota = Number(item.quota ?? 0)
-  const imageQuotaUnknown = Boolean(item.image_quota_unknown)
-  const lastRefreshError = cleanString(item.last_refresh_error || item.last_token_refresh_error)
+  const category = accountStatusCategoryFromBackend(item)
+  const remoteCheckResult = cleanString(item.last_remote_check_result).toLowerCase()
+  const lastRefreshError = cleanString(
+    item.last_remote_check_error
+    || item.last_refresh_error
+    || item.last_token_refresh_error,
+  )
 
-  if (rawStatus === STATUS_DISABLED || rawStatus.toLowerCase() === 'disabled') {
+  if (category === 'disabled') {
     return {
       enabled: false,
       status: 'disabled',
-      status_reason: '账号禁用',
+      status_reason: '账号已手动禁用',
       status_reason_code: 'disabled',
       last_error_kind: '',
     }
   }
 
-  if (rawStatus === STATUS_INVALID || rawStatus.toLowerCase() === 'invalid') {
+  if (category === 'abnormal') {
     return {
       enabled: true,
       status: 'invalid',
-      status_reason: lastRefreshError || '账号鉴权异常',
+      status_reason: '远程确认账号登录态已失效',
       status_reason_code: 'account_invalid',
       last_error_kind: 'auth_invalid',
     }
   }
 
-  if (rawStatus === STATUS_SUSPICIOUS || rawStatus.toLowerCase() === 'suspicious') {
+  if (category === 'suspicious') {
     return {
       enabled: true,
       status: 'suspicious',
-      status_reason: cleanString(item.last_suspect_reason) || lastRefreshError || '账号调用失败，等待刷新确认',
+      status_reason:
+        cleanString(item.last_suspect_reason)
+        || lastRefreshError
+        || '账号调用失败，等待刷新确认',
       status_reason_code: 'account_suspected',
       last_error_kind: 'upstream_error',
     }
   }
 
-  const invalidCount = Number(item.invalid_count ?? 0) || 0
-  if (invalidCount >= 1 && lastRefreshError && rawStatus !== STATUS_LIMITED) {
-    return {
-      enabled: true,
-      status: 'invalid',
-      status_reason: '已检测到鉴权异常，已进入统一异常处理流程。',
-      status_reason_code: 'account_invalid',
-      last_error_kind: 'auth_invalid',
-    }
-  }
-
-  if (rawStatus === STATUS_LIMITED) {
+  if (category === 'limited') {
     return {
       enabled: true,
       status: 'cooling',
@@ -346,9 +350,13 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
   return {
     enabled: true,
     status: 'ready',
-    status_reason: lastRefreshError || (!imageQuotaUnknown && quota <= 0 ? '本地额度待远程刷新，以请求前预检结果为准' : ''),
+    status_reason: remoteCheckResult === 'pending'
+      ? '正在核验账号状态，完成后会自动恢复或按设置移除。'
+      : remoteCheckResult === 'error' || lastRefreshError
+        ? '最近一次账号检测失败，尚未确认账号失效。'
+        : '',
     status_reason_code: '',
-    last_error_kind: lastRefreshError ? 'upstream_error' : '',
+    last_error_kind: remoteCheckResult === 'error' || lastRefreshError ? 'upstream_error' : '',
   }
 }
 
@@ -359,30 +367,57 @@ function normalizeAccountStatusCategory(value: unknown): AccountStatusCategory |
     : undefined
 }
 
+const BACKEND_STATUS_BY_CATEGORY: Record<AccountStatusCategory, AccountBackendStatus> = {
+  normal: STATUS_NORMAL,
+  limited: STATUS_LIMITED,
+  suspicious: STATUS_SUSPICIOUS,
+  abnormal: STATUS_INVALID,
+  disabled: STATUS_DISABLED,
+}
+
+const CATEGORY_BY_BACKEND_STATUS: Record<AccountBackendStatus, AccountStatusCategory> = {
+  [STATUS_NORMAL]: 'normal',
+  [STATUS_LIMITED]: 'limited',
+  [STATUS_SUSPICIOUS]: 'suspicious',
+  [STATUS_INVALID]: 'abnormal',
+  [STATUS_DISABLED]: 'disabled',
+}
+
+function accountStatusCategoryFromBackend(item: BackendAccount): AccountStatusCategory {
+  return normalizeAccountStatusCategory(item.status_category)
+    || CATEGORY_BY_BACKEND_STATUS[normalizeAccountBackendStatus(item.status)]
+}
+
 function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<string>): Account {
   const accessToken = cleanString(item.access_token || item.accessToken)
   const id = displayIdForAccount(item, index, usedIds)
   if (accessToken) accountTokenById.set(id, accessToken)
 
   const quota = Math.max(0, Number(item.quota ?? 0) || 0)
-  const imageQuotaUnknown = Boolean(item.image_quota_unknown)
-  const rawStatus = cleanString(item.status)
+  const imageQuotaUnknown = item.image_quota_unknown !== false
+  const statusCategory = accountStatusCategoryFromBackend(item)
+  const backendStatus = BACKEND_STATUS_BY_CATEGORY[statusCategory]
   const status = backendStatusToFrontend(item)
   const createdAt = toTimestampSeconds(item.created_at)
   const updatedAt = toTimestampSeconds(item.updated_at || item.last_used_at || item.created_at)
   const restoreAt = toTimestampSeconds(item.restore_at || item.quota_restore_at || item.reset_at)
-  const lastRefreshError = cleanString(item.last_refresh_error || item.last_token_refresh_error)
-  const type = cleanString(item.type || item.plan_type || 'free')
-  const sourceType = cleanString(item.source_type || 'web')
+  const lastRemoteCheckResult = cleanString(item.last_remote_check_result).toLowerCase()
+  const lastRefreshError = cleanString(
+    item.last_remote_check_error
+    || item.last_refresh_error
+    || item.last_token_refresh_error,
+  )
+  const type = cleanString(item.type || item.plan_type)
+  const sourceType = normalizeAccountSourceType(item.source_type)
   const email = cleanString(item.email)
   const userId = cleanString(item.user_id)
 
   return {
     id,
     access_token: accessToken,
-    backend_status: rawStatus || STATUS_NORMAL,
-    status_category: normalizeAccountStatusCategory(item.status_category),
-    status_label: cleanString(item.status_label),
+    backend_status: backendStatus,
+    status_category: statusCategory,
+    status_label: cleanString(item.status_label) || backendStatus,
     email,
     user_id: userId,
     type,
@@ -391,7 +426,15 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
     group_id: cleanString(item.group_id),
     quota,
     image_quota_unknown: imageQuotaUnknown,
-    name: email || `${type} / ${sourceType}`,
+    last_remote_check_result: (
+      ['pending', 'ok', 'error', 'invalid'].includes(lastRemoteCheckResult)
+        ? lastRemoteCheckResult
+        : ''
+    ) as Account['last_remote_check_result'],
+    last_remote_check_error: cleanString(item.last_remote_check_error),
+    last_remote_check_attempt_at: cleanString(item.last_remote_check_attempt_at),
+    last_remote_checked_at: cleanString(item.last_remote_checked_at),
+    name: email || userId || id,
     cookie: maskToken(accessToken),
     snlm0e: '',
     push_id: '',
@@ -425,7 +468,7 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
         used: 0,
         limit: imageQuotaUnknown ? -1 : quota,
         remaining: imageQuotaUnknown ? -1 : quota,
-        limited: rawStatus === STATUS_LIMITED,
+        limited: statusCategory === 'limited',
       },
       music: { used: 0, limit: -1, remaining: -1, limited: false },
       video: { used: 0, limit: -1, remaining: -1, limited: false },
@@ -490,7 +533,7 @@ function accountFromPayload(payload: Partial<Account>) {
   return {
     access_token: accessToken,
     type: payload.type,
-    source_type: payload.source_type,
+    source_type: normalizeAccountSourceType(payload.source_type),
     proxy: payload.proxy,
     group_id: payload.group_id,
     quota: payload.quota,
@@ -681,7 +724,7 @@ export const accountsApi = {
 
   importAccounts: async (
     accountPayloads: AccountImportPayload[],
-    fallbackSourceType = 'manual',
+    fallbackSourceType: AccountSourceType = 'web',
     options: AccountImportOptions = {},
   ) => {
     const deduped = new Map<string, AccountImportPayload>()
@@ -692,7 +735,7 @@ export const accountsApi = {
       const nextPayload: AccountImportPayload = {
         ...payload,
         access_token: accessToken,
-        source_type: cleanString(payload.source_type) || fallbackSourceType,
+        source_type: normalizeAccountSourceType(cleanString(payload.source_type) || fallbackSourceType),
         status: cleanString(payload.status) || STATUS_NORMAL,
       }
       delete nextPayload.accessToken
@@ -727,12 +770,11 @@ export const accountsApi = {
     }
   },
 
-  importTokens: async (tokens: string[], sourceType: string) => {
+  importTokens: async (tokens: string[], sourceType: AccountSourceType) => {
     const accounts = Array.from(new Set(tokens.map((token) => cleanString(token)).filter(Boolean)))
       .map((accessToken) => ({
         access_token: accessToken,
-        type: 'free',
-        source_type: sourceType,
+        source_type: normalizeAccountSourceType(sourceType),
         status: STATUS_NORMAL,
       }))
     return accountsApi.importAccounts(accounts, sourceType)

@@ -1,4 +1,4 @@
-import type { Account, AccountGroup, AccountLane } from '@/api/accounts'
+﻿import { normalizeAccountSourceType, type Account, type AccountGroup, type AccountLane } from '@/api/accounts'
 import type { ProxyGroup } from '@/api/proxy'
 import { parseProxyReference, proxyReferenceLabel } from '@/api/proxy'
 import { PILL_TONE_CLASS } from '@/lib/pillTones'
@@ -54,25 +54,11 @@ export type AccountProgressMetricItem = {
   value: string | number
 }
 
-const IMAGE_UNAVAILABLE_HINTS = [
-  '不能创建图片',
-  '无法生成更多图像',
-  '今天无法为您生成更多图像',
-  '请明天再来',
-  "can't create any",
-  'cannot create any',
-  "can't seem to create any",
-  "image creation isn't available",
-  'image creation may not be available',
-  'unable to generate more images',
-  "can't generate more images",
-  'generate more images today',
-]
-
-const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'abnormal', 'disabled'] as const
+const ACCOUNT_STATUS_CATEGORY_VALUES = ['normal', 'limited', 'suspicious', 'abnormal', 'disabled'] as const
 const ACCOUNT_STATUS_LABELS: Record<Exclude<AccountStatusFilter, 'all'>, string> = {
   normal: '正常',
   limited: '限流',
+  suspicious: '存疑',
   abnormal: '异常',
   disabled: '禁用',
 }
@@ -120,16 +106,15 @@ export function accountRowSignature(item: Account): string {
     item.proxy,
     item.backend_status,
     item.image_quota_unknown ? 1 : 0,
+    item.last_remote_check_result,
+    boundedSignatureText(item.last_remote_check_error),
+    item.last_remote_check_attempt_at,
+    item.last_remote_checked_at,
     item.success_count || 0,
     item.failure_count || 0,
     item.enabled ? 1 : 0,
     item.is_demo ? 1 : 0,
   ].map(signatureValue).join('|')
-}
-
-function includesHint(input: unknown, hints: string[]): boolean {
-  const text = String(input || '').toLowerCase()
-  return Boolean(text) && hints.some((hint) => text.includes(hint.toLowerCase()))
 }
 
 function normalizeLimit(value: unknown): number {
@@ -257,9 +242,7 @@ const GROUPS: GroupDefinition[] = [
 
       if (
         item.status_reason_code === 'image_generation_unavailable' ||
-        String(item.last_error_kind || '') === 'media_generation_unavailable' ||
-        includesHint(item.status_reason, IMAGE_UNAVAILABLE_HINTS) ||
-        includesHint(item.last_error, IMAGE_UNAVAILABLE_HINTS)
+        String(item.last_error_kind || '') === 'media_generation_unavailable'
       ) {
         const detail = String(item.status_reason || item.last_error || '').trim()
         return {
@@ -380,67 +363,35 @@ export function quotaIssueDetailLines(item: Account): string[] {
 }
 
 export function statusText(item: Account): string {
-  const category = accountStatusCategoryValue(item)
-  if (category) return ACCOUNT_STATUS_LABELS[category]
+  return ACCOUNT_STATUS_LABELS[statusCategory(item)]
+}
 
-  const backendStatus = String(item.backend_status || '').trim()
-  const status = String(item.status || '').trim().toLowerCase()
-  const reasonCode = String(item.status_reason_code || '').toLowerCase()
-  const errorKind = String(item.last_error_kind || '').toLowerCase()
-
-  if (!item.enabled || status === 'disabled' || backendStatus === '禁用') return '禁用'
-  if (
-    backendStatus === '异常' ||
-    status === 'abnormal' ||
-    status === 'invalid' ||
-    status === 'incomplete' ||
-    reasonCode === 'snlm0e_refresh_failed' ||
-    reasonCode === 'account_invalid' ||
-    reasonCode === 'parse_failure' ||
-    reasonCode === 'upstream_error' ||
-    errorKind === 'auth_invalid' ||
-    errorKind === 'parse_failure' ||
-    errorKind === 'upstream_error'
-  ) return '异常'
-  if (
-    backendStatus === '限流' ||
-    status === 'limited' ||
-    status === 'rate_limited' ||
-    status === 'cooling' ||
-    status === 'backoff' ||
-    reasonCode === 'lane_backoff' ||
-    reasonCode === 'pro_cooldown' ||
-    reasonCode === 'video_cooldown' ||
-    reasonCode === 'image_generation_unavailable' ||
-    reasonCode === 'image_degraded_to_fast' ||
-    reasonCode === 'lane_degraded' ||
-    reasonCode === 'text_pending' ||
-    errorKind === 'quota_exhausted' ||
-    errorKind === 'media_pending' ||
-    errorKind === 'media_generation_unavailable' ||
-    errorKind === 'media_degraded' ||
-    errorKind === 'lane_degraded' ||
-    errorKind === 'text_pending'
-  ) return '限流'
-  return '正常'
+const ACCOUNT_PLAN_LABELS: Record<string, string> = {
+  free: 'Free',
+  plus: 'Plus',
+  pro: 'Pro',
+  prolite: 'ProLite',
+  team: 'Team',
+  business: 'Team',
+  enterprise: 'Enterprise',
 }
 
 export function statusCategory(item: Account): Exclude<AccountStatusFilter, 'all'> {
   const category = accountStatusCategoryValue(item)
   if (category) return category
-
-  const text = statusText(item)
-  if (text === '禁用') return 'disabled'
-  if (text === '正常') return 'normal'
-  if (text === '存疑') return 'suspicious'
-  if (text === '限流') return 'limited'
-  return 'abnormal'
+  const backendStatus = cleanString(item.backend_status)
+  if (backendStatus === '限流') return 'limited'
+  if (backendStatus === '存疑') return 'suspicious'
+  if (backendStatus === '异常') return 'abnormal'
+  if (backendStatus === '禁用') return 'disabled'
+  return 'normal'
 }
 
 export function statusClass(item: Account): string {
   const category = statusCategory(item)
   if (category === 'normal') return PILL_TONE_CLASS.success
   if (category === 'limited') return PILL_TONE_CLASS.warning
+  if (category === 'suspicious') return PILL_TONE_CLASS.info
   if (category === 'abnormal') return PILL_TONE_CLASS.danger
   if (category === 'disabled') return PILL_TONE_CLASS.neutral
   return PILL_TONE_CLASS.neutral
@@ -460,9 +411,9 @@ export function statusReason(item: Account): string {
   const lastError = String(item.last_error || '').trim()
   if (lastError) return lastError
   if (!item.enabled || item.status === 'disabled') return '账号禁用'
-  if (item.status === 'incomplete') return '配置不完整，请检查 access token、账号类型或代理'
-  if (item.status === 'suspicious') return '账号调用失败，等待刷新确认'
+  if (item.status === 'incomplete') return '配置不完整，请检查 access token、套餐或代理'
   if (item.status === 'invalid') return '账号鉴权异常'
+  if (item.status === 'suspicious' || statusCategory(item) === 'suspicious') return '账号调用失败，等待刷新确认'
   return '账号正常可用'
 }
 
@@ -476,8 +427,8 @@ export function statusRawError(item: Account): string {
 export function rowClass(item: Account): string {
   const category = statusCategory(item)
   if (category === 'disabled') return 'bg-muted/50'
-  if (category === 'suspicious') return 'bg-cyan-500/5'
   if (category === 'abnormal') return 'bg-rose-500/5'
+  if (category === 'suspicious') return 'bg-cyan-500/5'
   if (category === 'limited') return 'bg-amber-500/5'
   if (!item.access_token && !item.cookie) return 'bg-muted/30'
   return ''
@@ -573,9 +524,11 @@ export function accountSecondaryText(item: Account): string {
 }
 
 export function accountSourceText(item: Account): string {
-  const type = cleanString(item.type) || 'free'
-  const sourceType = cleanString(item.source_type) || 'web'
-  return `${type} / ${sourceType}`
+  const source = normalizeAccountSourceType(item.source_type) === 'codex' ? 'Codex' : 'Web'
+  const rawPlan = cleanString(item.type)
+  const planKey = rawPlan.toLowerCase().replaceAll('-', '').replaceAll('_', '').replaceAll(' ', '')
+  const plan = ACCOUNT_PLAN_LABELS[planKey] || rawPlan || '未知'
+  return `${source} · ${plan}`
 }
 
 export function accountProxyText(item: Account): string {

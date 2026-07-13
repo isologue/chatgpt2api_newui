@@ -1,4 +1,4 @@
-import { computed, ref, toRef } from 'vue'
+﻿import { computed, ref, toRef } from 'vue'
 import { accountsApi } from '@/api/accounts'
 import type {
   Account,
@@ -94,6 +94,7 @@ export function useAccountsPage() {
     { label: '全部状态', value: 'all' },
     { label: '正常', value: 'normal' },
     { label: '限流', value: 'limited' },
+    { label: '存疑', value: 'suspicious' },
     { label: '异常', value: 'abnormal' },
     { label: '禁用', value: 'disabled' },
   ] as const
