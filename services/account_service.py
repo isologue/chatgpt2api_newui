@@ -10,7 +10,7 @@ from threading import Condition, Lock, Thread
 from typing import Any
 
 from services.config import config
-from services.image_failure import ImageFailure, classify_image_exception
+from services.image_failure import ImageFailure, classify_image_exception, image_failure
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -42,6 +42,38 @@ class ImageAccountSelectionError(RuntimeError):
         super().__init__(f"image_account_selection:{self.kind}; {detail}")
 
 
+class OAuthRefreshError(RuntimeError):
+    """Structured OAuth token refresh failure."""
+
+    def __init__(self, status_code: int, error_code: str = "", description: str = "") -> None:
+        self.status_code = int(status_code or 0)
+        self.error_code = str(error_code or "").strip()
+        self.description = str(description or "").strip()[:300]
+        details = [f"oauth_refresh_http_{self.status_code}"]
+        if self.error_code:
+            details.append(self.error_code)
+        if self.description and self.description.casefold() != self.error_code.casefold():
+            details.append(self.description)
+        super().__init__(": ".join(details))
+
+
+class TerminalRefreshTokenError(OAuthRefreshError):
+    """The refresh credential is revoked, expired, or otherwise unusable."""
+
+    def __init__(self, status_code: int, error_code: str = "", description: str = "") -> None:
+        super().__init__(status_code, error_code, description)
+        self.failure = image_failure("auth_invalid", raw_detail=str(self))
+
+
+class RefreshCredentialsChangedError(RuntimeError):
+    """Refresh credentials changed while an OAuth request was in flight."""
+
+    def __init__(self) -> None:
+        message = "OAuth refresh credentials changed during refresh."
+        self.failure = image_failure("upstream_unavailable", raw_detail=message)
+        super().__init__(message)
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -60,6 +92,12 @@ class AccountService:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/145.0.0.0 Safari/537.36"
     )
+    _TERMINAL_REFRESH_ERROR_CODES = frozenset({
+        "invalid_grant",
+        "invalid_refresh_token",
+        "refresh_token_invalidated",
+    })
+    _TERMINAL_REFRESH_MESSAGE_FRAGMENTS = ("session has ended",)
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
     _refresh_progress_lock = Lock()
@@ -454,6 +492,40 @@ class AccountService:
         except Exception:
             return ""
 
+    @staticmethod
+    def _oauth_refresh_error_fields(data: object) -> tuple[str, str]:
+        if not isinstance(data, dict):
+            return "", ""
+        error = data.get("error")
+        nested = error if isinstance(error, dict) else {}
+        code = str(
+            nested.get("code")
+            or data.get("code")
+            or (error if isinstance(error, str) else "")
+            or ""
+        ).strip()
+        description = str(
+            data.get("error_description")
+            or nested.get("message")
+            or data.get("message")
+            or nested.get("description")
+            or ""
+        ).strip()
+        return code, description
+
+    @classmethod
+    def _is_terminal_refresh_error(cls, status_code: int, error_code: str, description: str) -> bool:
+        if status_code in {408, 429} or status_code >= 500:
+            return False
+        normalized_code = str(error_code or "").strip().casefold()
+        if normalized_code:
+            return normalized_code in cls._TERMINAL_REFRESH_ERROR_CODES
+        normalized_description = str(description or "").strip().casefold()
+        return status_code in {400, 401} and any(
+            fragment in normalized_description
+            for fragment in cls._TERMINAL_REFRESH_MESSAGE_FRAGMENTS
+        )
+
     def _resolve_access_token_locked(self, access_token: str) -> str:
         token = str(access_token or "").strip()
         seen: set[str] = set()
@@ -474,25 +546,39 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
-    def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
+    def _record_token_refresh_error(
+        self,
+        access_token: str,
+        event: str,
+        error: str,
+        *,
+        expected_refresh_token: str | None = None,
+    ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
-                return
+                return False
+            if expected_refresh_token is not None and (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                return False
             next_item = dict(current)
             next_item["last_token_refresh_error"] = str(error or "refresh token failed")
             next_item["last_token_refresh_error_at"] = now
             account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[resolved] = account
-                self._save_accounts()
+            if account is None:
+                return False
+            self._accounts[resolved] = account
+            self._save_accounts()
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
-            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            {"source": event, "token": anonymize_token(resolved), "error": str(error or "")},
         )
+        return True
 
     def _recent_token_refresh_error(self, account: dict) -> bool:
         last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
@@ -516,7 +602,7 @@ class AccountService:
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
         if not str(account.get("refresh_token") or "").strip():
             return None
-        if account.get("status") == "禁用":
+        if account.get("status") not in {"正常", "限流"}:
             return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
@@ -546,13 +632,21 @@ class AccountService:
                 },
                 timeout=60,
             )
-            data = response.json() if response.text else {}
-            if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
-                detail = ""
-                if isinstance(data, dict):
-                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
-                detail = detail or self._safe_response_text(response)
-                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
+            raw_text = self._safe_response_text(response)
+            try:
+                data = response.json() if raw_text else {}
+            except Exception:
+                data = {}
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
+                error_code, description = self._oauth_refresh_error_fields(data)
+                description = description or raw_text
+                error_type = (
+                    TerminalRefreshTokenError
+                    if self._is_terminal_refresh_error(status_code, error_code, description)
+                    else OAuthRefreshError
+                )
+                raise error_type(status_code, error_code, description)
             return {
                 "access_token": str(data.get("access_token") or "").strip(),
                 "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
@@ -561,16 +655,30 @@ class AccountService:
         finally:
             session.close()
 
-    def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
+    def _apply_refreshed_tokens(
+        self,
+        old_access_token: str,
+        token_data: dict,
+        event: str,
+        *,
+        expected_refresh_token: str,
+    ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
-                return old_token
+                raise RefreshCredentialsChangedError()
+            if (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                raise RefreshCredentialsChangedError()
             new_token = str(token_data.get("access_token") or old_token).strip()
             if not new_token:
                 return old_token
+            if new_token != old_token and new_token in self._accounts:
+                raise RefreshCredentialsChangedError()
 
             next_item = dict(current)
             next_item["access_token"] = new_token
@@ -608,35 +716,87 @@ class AccountService:
         )
         return new_token
 
-    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+    def refresh_access_token(
+        self,
+        access_token: str,
+        *,
+        force: bool = False,
+        event: str = "refresh_access_token",
+        remove_invalid: bool | None = None,
+    ) -> str:
         if not access_token:
             return ""
         with self._token_refresh_lock:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
-                return access_token
+                raise RefreshCredentialsChangedError()
             active_token = str(account.get("access_token") or resolved_token or access_token)
             if not self._token_needs_refresh(active_token, force=force):
                 return active_token
-            refresh_token = str(account.get("refresh_token") or "").strip()
-            if not refresh_token:
-                return active_token
             if not force and self._recent_token_refresh_error(account):
                 return active_token
-            try:
-                token_data = self._request_access_token_refresh(refresh_token, account)
-            except Exception as exc:
-                error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
-                return active_token
-            return self._apply_refreshed_tokens(active_token, token_data, event)
+            for attempt in range(2):
+                refresh_token = str(account.get("refresh_token") or "").strip()
+                if not refresh_token:
+                    return active_token
+                credentials_changed: RefreshCredentialsChangedError | None = None
+                latest_account: dict | None = None
+                try:
+                    token_data = self._request_access_token_refresh(refresh_token, account)
+                except TerminalRefreshTokenError as exc:
+                    error_str = str(exc)
+                    self.handle_invalid_token(
+                        active_token,
+                        event,
+                        error=error_str,
+                        remove=remove_invalid,
+                        expected_access_token=active_token,
+                        expected_refresh_token=refresh_token,
+                        token_refresh_error=error_str,
+                    )
+                    _, latest_account = self._get_account_for_token(active_token)
+                    latest_refresh_token = str((latest_account or {}).get("refresh_token") or "").strip()
+                    if not latest_account or latest_refresh_token == refresh_token:
+                        raise
+                    credentials_changed = RefreshCredentialsChangedError()
+                except Exception as exc:
+                    error_str = str(exc or "")
+                    recorded = self._record_token_refresh_error(
+                        active_token,
+                        event,
+                        error_str,
+                        expected_refresh_token=refresh_token,
+                    )
+                    if recorded:
+                        return active_token
+                    credentials_changed = RefreshCredentialsChangedError()
+                    _, latest_account = self._get_account_for_token(active_token)
+                else:
+                    try:
+                        return self._apply_refreshed_tokens(
+                            active_token,
+                            token_data,
+                            event,
+                            expected_refresh_token=refresh_token,
+                        )
+                    except RefreshCredentialsChangedError as exc:
+                        credentials_changed = exc
+                        _, latest_account = self._get_account_for_token(active_token)
+
+                latest_refresh_token = str((latest_account or {}).get("refresh_token") or "").strip()
+                if attempt == 0 and latest_account and latest_refresh_token and latest_refresh_token != refresh_token:
+                    account = latest_account
+                    active_token = str(account.get("access_token") or active_token)
+                    continue
+                raise credentials_changed or RefreshCredentialsChangedError()
+            raise RefreshCredentialsChangedError()
 
     def list_expiring_access_tokens(self) -> list[str]:
         with self._lock:
             return [
                 token
                 for account in self._accounts.values()
-                if account.get("status") != "禁用"
+                if account.get("status") in {"正常", "限流"}
                 and str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
@@ -663,7 +823,14 @@ class AccountService:
         errors = []
         for access_token in access_tokens:
             before = self.resolve_access_token(access_token)
-            after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
+            try:
+                after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
+            except (TerminalRefreshTokenError, RefreshCredentialsChangedError) as exc:
+                errors.append({
+                    "token": anonymize_token(before),
+                    "error": str(exc),
+                })
+                continue
             account = self.get_account(after)
             if account and str(account.get("last_token_refresh_error") or "").strip():
                 errors.append({
@@ -890,20 +1057,25 @@ class AccountService:
         )
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
-        excluded = set(excluded_tokens or set())
-        with self._lock:
-            candidates = [
-                token
-                for account in self._accounts.values()
-                if self._is_account_selectable(account, allow_limited=True)
-                   and (token := account.get("access_token") or "")
-                   and token not in excluded
-            ]
-            if not candidates:
-                return ""
-            access_token = candidates[self._index % len(candidates)]
-            self._index += 1
-        return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+        attempted = set(excluded_tokens or set())
+        while True:
+            with self._lock:
+                candidates = [
+                    token
+                    for account in self._accounts.values()
+                    if self._is_account_selectable(account, allow_limited=True)
+                       and (token := account.get("access_token") or "")
+                       and token not in attempted
+                ]
+                if not candidates:
+                    return ""
+                access_token = candidates[self._index % len(candidates)]
+                self._index += 1
+            attempted.add(access_token)
+            try:
+                return self.refresh_access_token(access_token, event="get_text_access_token")
+            except (TerminalRefreshTokenError, RefreshCredentialsChangedError):
+                continue
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
@@ -935,6 +1107,7 @@ class AccountService:
             error=error,
             quiet=quiet,
             remove=remove,
+            expected_access_token=access_token,
         )
 
     def handle_invalid_token(
@@ -944,25 +1117,25 @@ class AccountService:
         error: str | None = None,
         quiet: bool = False,
         remove: bool | None = None,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        token_refresh_error: str | None = None,
     ) -> bool:
         """统一处理鉴权异常账号。
 
         口径固定为：先记录异常，再按“自动移除异常账号”配置删除或保留异常状态。
         """
-        self._record_invalid_token_seen(access_token, event, str(error or "invalid access token"))
-        account = self.get_account(access_token)
-        if not account or account.get("status") != "异常":
-            return False
         should_remove = config.auto_remove_invalid_accounts if remove is None else remove
-        if not should_remove:
-            return False
-        removed = bool(self.delete_accounts([access_token], return_items=False)["removed"])
-        if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
-                            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")})
-        elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
-        return removed
+        return self._apply_invalid_token_state(
+            access_token,
+            event,
+            str(error or "invalid access token"),
+            remove=bool(should_remove),
+            expected_access_token=expected_access_token,
+            expected_refresh_token=expected_refresh_token,
+            token_refresh_error=token_refresh_error,
+            quiet=quiet,
+        )
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -1448,18 +1621,35 @@ class AccountService:
                 self._accounts[access_token] = account
                 self._save_accounts()
 
-    def _record_invalid_token_seen(
+    def _apply_invalid_token_state(
         self,
         access_token: str,
         event: str,
         error: str,
+        *,
+        remove: bool,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        token_refresh_error: str | None = None,
+        quiet: bool = False,
     ) -> bool:
+        _ = quiet
         now = datetime.now(timezone.utc)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
-                return True
+                return False
+            if expected_access_token is not None and (
+                access_token != str(expected_access_token or "").strip()
+            ):
+                return False
+            if expected_refresh_token is not None and (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                return False
+
             next_item = dict(current)
             next_item["status"] = "禁用" if current.get("status") == "禁用" else "异常"
             next_item["quota"] = 0
@@ -1474,12 +1664,28 @@ class AccountService:
             next_item["last_remote_check_error_at"] = now.isoformat()
             next_item["last_remote_check_event"] = event
             next_item["last_remote_check_result"] = "invalid"
+            if token_refresh_error:
+                next_item["last_token_refresh_error"] = str(token_refresh_error)
+                next_item["last_token_refresh_error_at"] = now.isoformat()
             account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[access_token] = account
-                self._save_accounts()
+            if account is None:
+                return False
 
-            final_status = str((account or next_item).get("status") or "异常")
+            final_status = str(account.get("status") or "异常")
+            removed = bool(remove and final_status == "异常")
+            if removed:
+                self._accounts.pop(access_token, None)
+                self._image_inflight.pop(access_token, None)
+                self._token_aliases = {
+                    old: new
+                    for old, new in self._token_aliases.items()
+                    if old != access_token and new != access_token
+                }
+                self._index = self._index % len(self._accounts) if self._accounts else 0
+            else:
+                self._accounts[access_token] = account
+            self._save_accounts()
+
             log_service.add(
                 LOG_TYPE_ACCOUNT,
                 "账号鉴权确认失效" if final_status == "异常" else "已禁用账号鉴权确认失效",
@@ -1490,7 +1696,14 @@ class AccountService:
                     "error": str(error or ""),
                 },
             )
-        return True
+            if removed:
+                log_service.add(LOG_TYPE_ACCOUNT, "删除 1 个账号", {"removed": 1})
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "自动移除异常账号",
+                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                )
+        return removed
 
     @staticmethod
     def _mark_remote_check_pending(account: dict, event: str, now: str) -> None:
@@ -1683,53 +1896,80 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = self.refresh_access_token(
+            access_token,
+            event=f"{event}:preflight",
+            remove_invalid=remove_invalid,
+        )
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             with OpenAIBackendAPI(active_token) as backend:
                 result = backend.get_user_info()
         except InvalidAccessTokenError as exc:
-            before_refresh = self.get_account(active_token) or {}
-            before_refresh_at = str(before_refresh.get("last_token_refresh_at") or "")
-            before_error_at = str(before_refresh.get("last_token_refresh_error_at") or "")
-            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
-            after_refresh = self.get_account(refreshed_token or active_token) or {}
-            after_refresh_at = str(after_refresh.get("last_token_refresh_at") or "")
-            after_error_at = str(after_refresh.get("last_token_refresh_error_at") or "")
-            refresh_failed = bool(after_error_at and after_error_at != before_error_at)
-            refresh_succeeded = bool(after_refresh_at and after_refresh_at != before_refresh_at)
-            if refresh_failed:
-                refresh_error = str(after_refresh.get("last_token_refresh_error") or "refresh token failed")
-                self._record_remote_check_error(
-                    active_token,
-                    event,
-                    f"access token rejected; recovery check failed: {refresh_error}",
-                )
-                raise
-            if refreshed_token and (refreshed_token != active_token or refresh_succeeded):
+            auth_error: InvalidAccessTokenError | None = exc
+            current_token = self.resolve_access_token(active_token)
+            if current_token and current_token != active_token and self.get_account(current_token):
+                active_token = current_token
                 try:
-                    with OpenAIBackendAPI(refreshed_token) as backend:
+                    with OpenAIBackendAPI(active_token) as backend:
                         result = backend.get_user_info()
-                except InvalidAccessTokenError as retry_exc:
-                    self.handle_invalid_token(
-                        refreshed_token,
-                        event,
-                        error=str(retry_exc),
-                        remove=remove_invalid,
-                    )
+                except InvalidAccessTokenError as current_exc:
+                    auth_error = current_exc
+                except Exception as current_exc:
+                    self._record_remote_check_error(active_token, event, str(current_exc))
                     raise
-                except Exception as retry_exc:
-                    self._record_remote_check_error(refreshed_token, event, str(retry_exc))
-                    raise
-                active_token = refreshed_token
-            else:
-                self.handle_invalid_token(
+                else:
+                    auth_error = None
+
+            if auth_error is not None:
+                before_refresh = self.get_account(active_token) or {}
+                before_refresh_at = str(before_refresh.get("last_token_refresh_at") or "")
+                before_error_at = str(before_refresh.get("last_token_refresh_error_at") or "")
+                refreshed_token = self.refresh_access_token(
                     active_token,
-                    event,
-                    error=str(exc),
-                    remove=remove_invalid,
+                    force=True,
+                    event=f"{event}:invalid_access_token",
+                    remove_invalid=remove_invalid,
                 )
-                raise
+                after_refresh = self.get_account(refreshed_token or active_token) or {}
+                after_refresh_at = str(after_refresh.get("last_token_refresh_at") or "")
+                after_error_at = str(after_refresh.get("last_token_refresh_error_at") or "")
+                refresh_failed = bool(after_error_at and after_error_at != before_error_at)
+                refresh_succeeded = bool(after_refresh_at and after_refresh_at != before_refresh_at)
+                if refresh_failed:
+                    refresh_error = str(after_refresh.get("last_token_refresh_error") or "refresh token failed")
+                    self._record_remote_check_error(
+                        active_token,
+                        event,
+                        f"access token rejected; recovery check failed: {refresh_error}",
+                    )
+                    raise auth_error
+                if refreshed_token and (refreshed_token != active_token or refresh_succeeded):
+                    try:
+                        with OpenAIBackendAPI(refreshed_token) as backend:
+                            result = backend.get_user_info()
+                    except InvalidAccessTokenError as retry_exc:
+                        self.handle_invalid_token(
+                            refreshed_token,
+                            event,
+                            error=str(retry_exc),
+                            remove=remove_invalid,
+                            expected_access_token=refreshed_token,
+                        )
+                        raise
+                    except Exception as retry_exc:
+                        self._record_remote_check_error(refreshed_token, event, str(retry_exc))
+                        raise
+                    active_token = refreshed_token
+                else:
+                    self.handle_invalid_token(
+                        active_token,
+                        event,
+                        error=str(auth_error),
+                        remove=remove_invalid,
+                        expected_access_token=active_token,
+                    )
+                    raise auth_error
         except Exception as exc:
             self._record_remote_check_error(active_token, event, str(exc))
             raise

@@ -523,7 +523,7 @@ export function accountSourceText(item: Account): string {
   const rawPlan = cleanString(item.type)
   const planKey = rawPlan.toLowerCase().replaceAll('-', '').replaceAll('_', '').replaceAll(' ', '')
   const plan = ACCOUNT_PLAN_LABELS[planKey] || rawPlan || '未知'
-  return `${source} · ${plan}`
+  return `${source} / ${plan}`
 }
 
 export function accountProxyText(item: Account): string {
