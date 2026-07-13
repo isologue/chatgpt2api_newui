@@ -177,6 +177,7 @@ RATE_LIMIT_FAILURE_CODES = frozenset({
     "limited",
     "quota_exhausted",
     "rate_limit",
+    "rate_limit_exceeded",
     "rate_limited",
     "upstream_rate_limited",
     "限流",
@@ -323,7 +324,7 @@ def _structured_codes(value: Any) -> set[str]:
             if identity in visited:
                 continue
             visited.add(identity)
-            for key in ("code", "error_code", "type"):
+            for key in ("code", "error_code", "failure_code", "type", "error"):
                 candidate = current.get(key)
                 if isinstance(candidate, str) and candidate.strip():
                     codes.add(candidate.strip().lower())
@@ -342,17 +343,65 @@ AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "tok
 POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
 
 
+def _failure_priority(code: str) -> int:
+    normalized = FAILURE_CODE_ALIASES.get(str(code or "").strip().lower(), str(code or "").strip().lower())
+    if normalized == "content_policy_violation":
+        return 3
+    if normalized == "upstream_text_reply":
+        return 0
+    if normalized in {"image_tool_error", "upstream_error"}:
+        return 1
+    return 2
+
+
+def _classify_structured_failure_codes(
+    codes: Any,
+    *,
+    retry_after: int | None = None,
+    raw_detail: Any = None,
+) -> ImageFailure | None:
+    normalized_codes = {
+        str(code or "").strip().lower()
+        for code in (codes if isinstance(codes, (set, frozenset, list, tuple)) else (codes,))
+        if str(code or "").strip()
+    }
+    if normalized_codes.intersection(POLICY_CODES):
+        return image_failure("content_policy_violation", retry_after=retry_after, raw_detail=raw_detail)
+    if normalized_codes.intersection(AUTH_CODES):
+        return image_failure("auth_invalid", retry_after=retry_after, raw_detail=raw_detail)
+    if normalized_codes.intersection(QUOTA_CODES):
+        return image_failure("image_quota_exhausted", retry_after=retry_after, raw_detail=raw_detail)
+
+    known_codes = {
+        FAILURE_CODE_ALIASES.get(code, code)
+        for code in normalized_codes
+        if FAILURE_CODE_ALIASES.get(code, code) in FAILURE_POLICIES
+    }
+    if any(is_rate_limit_failure_code(code) for code in normalized_codes):
+        known_codes.add("upstream_rate_limited")
+    if known_codes:
+        selected_code = max(known_codes, key=lambda code: (_failure_priority(code), code))
+        return image_failure(selected_code, retry_after=retry_after, raw_detail=raw_detail)
+    return None
+
+
 def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
     codes = _structured_codes(exc.body)
     context = str(exc.context or "").strip().lower()
     context_path = context.split("?", 1)[0].rstrip("/")
     retry_after = exc.retry_after
-    if codes.intersection(POLICY_CODES):
-        return image_failure("content_policy_violation", raw_detail=exc.body)
-    if codes.intersection(AUTH_CODES) or exc.status_code == 401:
+    structured_failure = _classify_structured_failure_codes(
+        codes,
+        retry_after=retry_after,
+        raw_detail=exc.body,
+    )
+    if structured_failure is not None and structured_failure.code in {
+        "content_policy_violation",
+        "auth_invalid",
+    }:
+        return structured_failure
+    if exc.status_code == 401:
         return image_failure("auth_invalid", retry_after=retry_after, raw_detail=exc.body)
-    if exc.status_code == 403:
-        return image_failure("upstream_unavailable", retry_after=retry_after, raw_detail=exc.body)
     if exc.status_code == 429:
         is_file_upload = (
             context_path in {"/backend-api/files", "image_upload"}
@@ -363,8 +412,11 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
         )
         if is_file_upload:
             return image_failure("file_upload_throttled", retry_after=retry_after, raw_detail=exc.body)
-        if codes.intersection(QUOTA_CODES):
-            return image_failure("image_quota_exhausted", retry_after=retry_after, raw_detail=exc.body)
+    if structured_failure is not None:
+        return structured_failure
+    if exc.status_code == 403:
+        return image_failure("upstream_unavailable", retry_after=retry_after, raw_detail=exc.body)
+    if exc.status_code == 429:
         return image_failure("upstream_rate_limited", retry_after=retry_after, raw_detail=exc.body)
     if exc.status_code in {408, 504}:
         return image_failure("upstream_connection_timeout", retry_after=retry_after, raw_detail=exc.body)
@@ -467,28 +519,9 @@ def _message_has_image_output(message: Mapping[str, Any]) -> bool:
     return has_pointer(message.get("content"))
 
 
-def _message_is_image_generation_state(message: Mapping[str, Any]) -> bool:
-    metadata = _mapping(message.get("metadata"))
-
-    def field(name: str) -> str:
-        value = message.get(name)
-        if value in (None, ""):
-            value = metadata.get(name)
-        return str(value or "").strip().lower()
-
-    return (
-        field("turn_use_case") == "image gen"
-        or field("async_task_type") == "image_gen"
-        or field("message_type") in {"image_gen", "image_generation"}
-    )
-
-
 def classify_upstream_message(value: Any) -> ImageFailure | None:
     outer = _mapping(value)
     moderation = _mapping(outer.get("moderation_response"))
-    if outer.get("type") == "moderation" and moderation.get("blocked") is True:
-        return image_failure("content_policy_violation", raw_detail=value)
-
     message = _message(value)
     author = _mapping(message.get("author"))
     metadata = _mapping(message.get("metadata"))
@@ -496,26 +529,30 @@ def classify_upstream_message(value: Any) -> ImageFailure | None:
     role = str(author.get("role") or "").strip().lower()
     content_type = str(content.get("content_type") or "").strip().lower()
     status = str(message.get("status") or metadata.get("status") or "").strip().lower()
-    codes = _structured_codes({"metadata": metadata})
+    codes = _structured_codes(message)
     raw_detail = _message_text(message)
 
-    if codes.intersection(POLICY_CODES) or metadata.get("blocked") is True:
-        return image_failure("content_policy_violation", raw_detail=raw_detail or value)
-    if codes.intersection(AUTH_CODES):
-        return image_failure("auth_invalid", raw_detail=raw_detail or value)
-    if codes.intersection(QUOTA_CODES):
-        return image_failure("image_quota_exhausted", raw_detail=raw_detail or value)
-    if _message_has_image_output(message):
-        return None
-    if metadata.get("is_error") is True or (role == "tool" and content_type == "system_error"):
-        return image_failure("image_tool_error", raw_detail=raw_detail or value)
-    if _message_is_image_generation_state(message):
-        return None
-    if role == "assistant" and content_type == "text" and (
-        is_terminal_message_status(status) or message.get("end_turn") is True
-    ):
-        return image_failure("upstream_text_reply", raw_detail=raw_detail or value)
-    return None
+    return classify_message_facts(
+        role=role,
+        content_type=content_type,
+        status=status,
+        end_turn=message.get("end_turn") is True,
+        is_error=(
+            message.get("is_error") is True
+            or metadata.get("is_error") is True
+            or bool(message.get("error"))
+            or bool(metadata.get("error"))
+        ),
+        blocked=(
+            message.get("blocked") is True
+            or metadata.get("blocked") is True
+            or (outer.get("type") == "moderation" and moderation.get("blocked") is True)
+        ),
+        has_image_output=_message_has_image_output(message),
+        has_text=bool(raw_detail),
+        codes=codes,
+        raw_detail=raw_detail or value,
+    )
 
 
 def merge_message_failure(
@@ -524,13 +561,10 @@ def merge_message_failure(
 ) -> ImageFailure | None:
     if candidate is None:
         return current
-    if (
-        candidate.code == "upstream_text_reply"
-        and current is not None
-        and current.code != "upstream_text_reply"
-    ):
-        return current
-    return candidate
+    if current is None:
+        return candidate
+
+    return candidate if _failure_priority(candidate.code) >= _failure_priority(current.code) else current
 
 
 def classify_task_failure(task: Any) -> ImageFailure | None:
@@ -593,6 +627,37 @@ def classify_conversation_failure(data: Any) -> ImageFailure | None:
 def extract_message_facts(value: Any) -> dict[str, Any]:
     facts: dict[str, Any] = {}
 
+    def add_codes(value: Any) -> None:
+        candidates = _structured_codes(value)
+        if isinstance(value, str) and value.strip():
+            candidates.add(value.strip().lower())
+        if candidates:
+            facts["codes"] = set(facts.get("codes") or ()).union(candidates)
+
+    def record_content(content: Mapping[str, Any]) -> None:
+        if content.get("content_type") not in (None, ""):
+            facts["content_type"] = str(content.get("content_type") or "").strip().lower()
+        parts = content.get("parts")
+        if isinstance(parts, list) and any(
+            isinstance(part, str) and bool(part.strip())
+            for part in parts
+        ):
+            facts["has_text"] = True
+        if isinstance(content.get("text"), str) and str(content.get("text") or "").strip():
+            facts["has_text"] = True
+
+    def record_metadata(metadata: Mapping[str, Any]) -> None:
+        if metadata.get("is_error") is True or bool(metadata.get("error")):
+            facts["is_error"] = True
+        if metadata.get("blocked") is True:
+            facts["blocked"] = True
+        if metadata.get("status") not in (None, ""):
+            facts["status"] = str(metadata.get("status") or "").strip().lower()
+        for name in ("turn_use_case", "async_task_type", "message_type"):
+            if metadata.get(name) not in (None, ""):
+                facts[name] = str(metadata.get(name) or "").strip().lower()
+        add_codes(metadata)
+
     def visit(item: Any) -> None:
         if isinstance(item, Mapping):
             message = item.get("message")
@@ -601,16 +666,27 @@ def extract_message_facts(value: Any) -> dict[str, Any]:
             author = _mapping(item.get("author"))
             content = _mapping(item.get("content"))
             metadata = _mapping(item.get("metadata"))
+            if author or content:
+                message_id = item.get("id") or item.get("message_id")
+                if isinstance(message_id, str) and message_id.strip():
+                    facts["message_id"] = message_id.strip()
             if author.get("role") not in (None, ""):
                 facts["role"] = str(author.get("role") or "").strip().lower()
-            if content.get("content_type") not in (None, ""):
-                facts["content_type"] = str(content.get("content_type") or "").strip().lower()
+            record_content(content)
+            record_metadata(metadata)
             if item.get("status") not in (None, ""):
                 facts["status"] = str(item.get("status") or "").strip().lower()
             if item.get("end_turn") is True:
                 facts["end_turn"] = True
-            if metadata.get("is_error") is True:
+            if item.get("is_error") is True or bool(item.get("error")):
                 facts["is_error"] = True
+            if item.get("blocked") is True:
+                facts["blocked"] = True
+            add_codes({
+                key: item.get(key)
+                for key in ("code", "error_code", "failure_code")
+                if item.get(key) not in (None, "")
+            })
             for name in ("turn_use_case", "async_task_type", "message_type"):
                 candidate = item.get(name)
                 if candidate in (None, ""):
@@ -619,16 +695,38 @@ def extract_message_facts(value: Any) -> dict[str, Any]:
                     facts[name] = str(candidate).strip().lower()
             path = str(item.get("p") or "").strip().lower()
             patch_value = item.get("v")
-            if path.endswith("/message/author/role") and isinstance(patch_value, str):
+            if path.endswith("/message/metadata") and isinstance(patch_value, Mapping):
+                record_metadata(patch_value)
+            elif path.endswith("/message/content") and isinstance(patch_value, Mapping):
+                record_content(patch_value)
+            elif path.endswith("/message/author/role") and isinstance(patch_value, str):
                 facts["role"] = patch_value.strip().lower()
+            elif path.endswith(("/message/id", "/message/message_id")) and isinstance(patch_value, str):
+                facts["message_id"] = patch_value.strip()
             elif path.endswith("/message/content/content_type") and isinstance(patch_value, str):
                 facts["content_type"] = patch_value.strip().lower()
-            elif path.endswith("/message/status") and isinstance(patch_value, str):
+            elif path.endswith("/message/content/text") and isinstance(patch_value, str) and patch_value.strip():
+                facts["has_text"] = True
+            elif path.endswith("/message/content/parts") and isinstance(patch_value, list):
+                if any(isinstance(part, str) and part.strip() for part in patch_value):
+                    facts["has_text"] = True
+            elif "/message/content/parts/" in path and isinstance(patch_value, str) and patch_value.strip():
+                facts["has_text"] = True
+            elif path.endswith(("/message/status", "/message/metadata/status")) and isinstance(patch_value, str):
                 facts["status"] = patch_value.strip().lower()
             elif path.endswith("/message/end_turn") and patch_value is True:
                 facts["end_turn"] = True
-            elif path.endswith("/message/metadata/is_error") and patch_value is True:
+            elif path.endswith(("/message/is_error", "/message/metadata/is_error")) and patch_value is True:
                 facts["is_error"] = True
+            elif path.endswith(("/message/error", "/message/metadata/error")) and bool(patch_value):
+                facts["is_error"] = True
+                add_codes(patch_value)
+            elif path.endswith(("/message/blocked", "/message/metadata/blocked")) and patch_value is True:
+                facts["blocked"] = True
+            elif "/message/" in path and path.rsplit("/", 1)[-1] in {
+                "code", "error_code", "failure_code", "type",
+            }:
+                add_codes(patch_value)
             else:
                 for name in ("turn_use_case", "async_task_type", "message_type"):
                     if path.endswith(f"/message/metadata/{name}") and isinstance(patch_value, str):
@@ -654,27 +752,40 @@ def classify_message_facts(
     is_error: bool = False,
     blocked: bool = False,
     has_image_output: bool = False,
+    has_text: bool = False,
     turn_use_case: str = "",
     async_task_type: str = "",
     message_type: str = "",
+    codes: Any = (),
+    raw_detail: Any = None,
 ) -> ImageFailure | None:
-    if blocked:
-        return image_failure("content_policy_violation")
     if has_image_output:
         return None
+
+    if blocked:
+        return image_failure("content_policy_violation", raw_detail=raw_detail)
     normalized_role = str(role or "").strip().lower()
     normalized_content_type = str(content_type or "").strip().lower()
     normalized_status = str(status or "").strip().lower()
-    if is_error or (normalized_role == "tool" and normalized_content_type == "system_error"):
-        return image_failure("image_tool_error")
-    if (
-        str(turn_use_case or "").strip().lower() == "image gen"
-        or str(async_task_type or "").strip().lower() == "image_gen"
-        or str(message_type or "").strip().lower() in {"image_gen", "image_generation"}
+    structured_codes = (
+        tuple(codes)
+        if isinstance(codes, (set, frozenset, list, tuple))
+        else (codes,)
+    )
+    structured_failure = _classify_structured_failure_codes(
+        (*structured_codes, normalized_status),
+        raw_detail=raw_detail,
+    )
+    if structured_failure is not None:
+        return structured_failure
+
+    if is_error or normalized_status in FAILED_STATUSES or (
+        normalized_role == "tool" and normalized_content_type == "system_error"
     ):
-        return None
+        code = "upstream_rate_limited" if is_rate_limit_failure_code(normalized_status) else "image_tool_error"
+        return image_failure(code, raw_detail=raw_detail)
     if normalized_role == "assistant" and normalized_content_type == "text" and (
         end_turn or is_terminal_message_status(normalized_status)
-    ):
-        return image_failure("upstream_text_reply")
+    ) and has_text:
+        return image_failure("upstream_text_reply", raw_detail=raw_detail)
     return None

@@ -517,6 +517,8 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    async_task_type: str = ""
+    message_type: str = ""
     message_facts: dict[str, Any] = field(default_factory=dict)
     failure: ImageFailure | None = None
 
@@ -765,7 +767,12 @@ def _is_user_message_event(event: dict[str, Any]) -> bool:
     return False
 
 
-def update_conversation_state(state: ConversationState, payload: str, event: dict[str, Any] | None = None) -> None:
+def update_conversation_state(
+        state: ConversationState,
+        payload: str,
+        event: dict[str, Any] | None = None,
+        message_text: str = "",
+) -> None:
     conversation_id, file_ids, sediment_ids = extract_conversation_ids(payload)
     if conversation_id and not state.conversation_id:
         state.conversation_id = conversation_id
@@ -806,16 +813,34 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
             state.turn_use_case = str(metadata.get("turn_use_case") or state.turn_use_case)
 
     facts = event_facts
+    if facts.get("blocked") is True:
+        state.blocked = True
     if facts.get("turn_use_case"):
         state.turn_use_case = str(facts["turn_use_case"])
+    if facts.get("async_task_type"):
+        state.async_task_type = str(facts["async_task_type"])
+    if facts.get("message_type"):
+        state.message_type = str(facts["message_type"])
     role = str(facts.get("role") or "").strip().lower()
     current_role = str(state.message_facts.get("role") or "").strip().lower()
+    message_id = str(facts.get("message_id") or "").strip()
+    current_message_id = str(state.message_facts.get("message_id") or "").strip()
+    should_update_facts = False
     if role in {"assistant", "tool"}:
-        if current_role and current_role != role:
+        if (
+            (current_role and current_role != role)
+            or (message_id and current_message_id and message_id != current_message_id)
+        ):
             state.message_facts = {}
-        state.message_facts.update(facts)
+        should_update_facts = True
     elif not role and current_role in {"assistant", "tool"}:
+        should_update_facts = True
+    if should_update_facts:
+        accumulated_codes = set(state.message_facts.get("codes") or ())
         state.message_facts.update(facts)
+        incoming_codes = set(facts.get("codes") or ())
+        if accumulated_codes or incoming_codes:
+            state.message_facts["codes"] = accumulated_codes.union(incoming_codes)
 
     has_image_output = bool(state.file_ids or state.sediment_ids)
     if has_image_output:
@@ -831,11 +856,14 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         is_error=bool(state.message_facts.get("is_error")),
         blocked=state.blocked,
         has_image_output=False,
+        has_text=bool(state.message_facts.get("has_text")),
         turn_use_case=str(state.message_facts.get("turn_use_case") or state.turn_use_case),
         async_task_type=str(state.message_facts.get("async_task_type") or ""),
         message_type=str(state.message_facts.get("message_type") or ""),
+        codes=state.message_facts.get("codes") or (),
+        raw_detail=message_text or state.raw_text,
     )
-    candidate_failure = structured_failure or facts_failure
+    candidate_failure = merge_message_failure(structured_failure, facts_failure)
     if candidate_failure is not None:
         # The final assistant text can echo a preceding tool error. Keep the
         # structured failure so account attribution and retry stay consistent.
@@ -852,6 +880,8 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
+        "async_task_type": state.async_task_type,
+        "message_type": state.message_type,
         "_image_failure": state.failure,
         **extra,
     }
@@ -878,13 +908,13 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         if not isinstance(event, dict):
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
-        update_conversation_state(state, payload, event)
+        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        update_conversation_state(state, payload, event, next_raw_text)
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
             state.raw_text = ""
             state.text = ""
             continue
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
         state.raw_text = next_raw_text
         if next_text != state.text:
@@ -1009,7 +1039,7 @@ def _get_detailed_failure_from_tasks(
     timeout_secs: float = 10.0,
     wait_secs: float = 2.0,
 ) -> tuple[ImageFailure | None, str]:
-    """Return the first structured task failure plus raw diagnostic text."""
+    """Return the most specific structured task failure and its diagnostic text."""
     import time as _time
     try:
         if wait_secs > 0:
@@ -1018,22 +1048,32 @@ def _get_detailed_failure_from_tasks(
         if not tasks:
             return None, ""
 
+        selected_failure: ImageFailure | None = None
+        selected_error = ""
         for task in tasks:
-            failure = classify_task_failure(task)
-            if failure is None:
+            candidate = classify_task_failure(task)
+            if candidate is None:
                 continue
             is_error, error_msg, metadata = backend.check_task_error(task)
-            raw_error = error_msg or _failure_raw_text(failure)
+            raw_error = error_msg or _failure_raw_text(candidate)
             logger.info({
                 "event": "image_task_structured_error",
                 "conversation_id": conversation_id,
-                "failure_code": failure.code,
+                "failure_code": candidate.code,
                 "error_msg": diagnostic_excerpt(raw_error, 1000),
                 "metadata": metadata,
                 "legacy_is_error": is_error,
             })
-            return failure.with_raw_detail(raw_error or failure.raw_detail), raw_error
-        return None, ""
+            merged = merge_message_failure(selected_failure, candidate)
+            if merged is not selected_failure:
+                selected_failure = merged
+                selected_error = raw_error
+        if selected_failure is None:
+            return None, ""
+        return (
+            selected_failure.with_raw_detail(selected_error or selected_failure.raw_detail),
+            selected_error,
+        )
     except Exception as exc:
         logger.warning({
             "event": "image_task_error_query_failed",
@@ -1181,6 +1221,8 @@ def _recover_after_image_stream_timeout(
             "blocked": bool(last.get("blocked")),
             "tool_invoked": last.get("tool_invoked"),
             "turn_use_case": str(last.get("turn_use_case") or ""),
+            "async_task_type": str(last.get("async_task_type") or ""),
+            "message_type": str(last.get("message_type") or ""),
             "text_preview": diagnostic_excerpt(message, 1000),
         },
     }
@@ -1210,21 +1252,16 @@ def _recover_after_image_stream_timeout(
         except Exception as exc:
             conversation_probe_error = diagnostic_excerpt(repr(exc), 1000)
 
-    failure_candidates = [task_failure, conversation_failure, stream_failure]
-    terminal_failure = next(
-        (
-            failure
-            for failure in failure_candidates
-            if failure is not None and failure.code == "content_policy_violation"
-        ),
-        next((failure for failure in failure_candidates if failure is not None), None),
-    )
-    failure_detail = (
-        task_error
-        or _failure_raw_text(conversation_failure)
-        or _failure_raw_text(stream_failure)
-        or message
-    )
+    terminal_failure: ImageFailure | None = None
+    for failure in (stream_failure, task_failure, conversation_failure):
+        terminal_failure = merge_message_failure(terminal_failure, failure)
+    if terminal_failure is task_failure:
+        failure_detail = task_error or _failure_raw_text(task_failure)
+    elif terminal_failure is conversation_failure:
+        failure_detail = _failure_raw_text(conversation_failure)
+    else:
+        failure_detail = _failure_raw_text(stream_failure)
+    failure_detail = failure_detail or message
 
     followup.update({
         "failure_code": terminal_failure.code if terminal_failure else "",
@@ -1459,16 +1496,21 @@ def stream_image_outputs(
     message = str(last.get("text") or "").strip()
     stream_failure = last.get("_image_failure")
     stream_failure = stream_failure if isinstance(stream_failure, ImageFailure) else None
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
-    # Image-generation SSE can finish with a human-readable queue/status
-    # placeholder while the actual file IDs are still committed via the
-    # conversation document.  When the turn structurally says an image should be
-    # polled, do not treat stream text as terminal; let the poll path decide
-    # from conversation/tool structure.
+    turn_use_case = str(last.get("turn_use_case") or "").strip().lower()
+    async_task_type = str(last.get("async_task_type") or "").strip().lower()
+    message_type = str(last.get("message_type") or "").strip().lower()
+    should_poll_for_image = bool(
+        (
+            request.images
+            or turn_use_case == "image gen"
+            or async_task_type == "image_gen"
+            or message_type in {"image_gen", "image_generation"}
+        )
+        and stream_failure is None
+    )
     is_text_reply = bool(
         stream_failure is not None
         and stream_failure.code == "upstream_text_reply"
-        and not should_poll_for_image
     )
     conversation_stream_ms = int((time.perf_counter() - conversation_stream_started) * 1000)
     http_timing = _backend_http_timing_data(backend)
@@ -1488,7 +1530,9 @@ def stream_image_outputs(
         "file_ids": file_ids,
         "sediment_ids": sediment_ids,
         "tool_invoked": last.get("tool_invoked"),
-        "turn_use_case": last.get("turn_use_case"),
+        "turn_use_case": turn_use_case,
+        "async_task_type": async_task_type,
+        "message_type": message_type,
         "is_text_reply": is_text_reply,
         "should_poll_for_image": should_poll_for_image,
         "conversation_stream_ms": conversation_stream_ms,
@@ -1529,9 +1573,27 @@ def stream_image_outputs(
         )
         return
 
-    if stream_failure is not None and not file_ids and not sediment_ids and (
-        stream_failure.code != "upstream_text_reply" or not should_poll_for_image
-    ):
+    if is_text_reply and conversation_id and not file_ids and not sediment_ids:
+        task_failure, task_error = _get_detailed_failure_from_tasks(
+            backend,
+            conversation_id,
+            timeout_secs=5.0,
+            wait_secs=0.0,
+        )
+        merged_failure = merge_message_failure(stream_failure, task_failure)
+        if merged_failure is not stream_failure:
+            stream_failure = merged_failure.with_raw_detail(
+                task_error or merged_failure.raw_detail or message
+            )
+            message = task_error or message
+            logger.info({
+                "event": "image_text_reply_structured_failure",
+                "conversation_id": conversation_id,
+                "failure_code": stream_failure.code,
+                "error": diagnostic_excerpt(message, 1000),
+            })
+
+    if stream_failure is not None and not file_ids and not sediment_ids:
         yield ImageOutput(
             kind="message",
             model=request.model,
@@ -1542,33 +1604,6 @@ def stream_image_outputs(
             failure=stream_failure,
         )
         return
-
-    detailed_failure: ImageFailure | None = None
-    detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
-        detailed_failure, detailed_error = _get_detailed_failure_from_tasks(
-            backend,
-            conversation_id,
-            timeout_secs=5.0,
-            wait_secs=1.0,
-        )
-        if detailed_failure is not None:
-            logger.info({
-                "event": "image_task_error_before_poll",
-                "conversation_id": conversation_id,
-                "failure_code": detailed_failure.code,
-                "error": diagnostic_excerpt(detailed_error, 1000),
-            })
-            yield ImageOutput(
-                kind="message",
-                model=request.model,
-                index=index,
-                total=total,
-                text=detailed_error,
-                conversation_id=conversation_id,
-                failure=detailed_failure,
-            )
-            return
 
     if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(
@@ -1613,18 +1648,6 @@ def stream_image_outputs(
             text=message,
             conversation_id=conversation_id,
             failure=stream_failure or image_failure("no_image_generated", raw_detail=message),
-        )
-        return
-
-    if detailed_failure is not None:
-        yield ImageOutput(
-            kind="message",
-            model=request.model,
-            index=index,
-            total=total,
-            text=detailed_error,
-            conversation_id=conversation_id,
-            failure=detailed_failure,
         )
         return
 

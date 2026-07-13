@@ -24,6 +24,7 @@ from services.account_service import account_service
 from services.config import config
 from services.image_failure import (
     ImageDownloadError,
+    ImageFailure,
     ImageFailureError,
     ImagePollTimeoutError,
     InvalidAccessTokenError,
@@ -31,6 +32,7 @@ from services.image_failure import (
     classify_image_exception,
     classify_task_failure,
     is_terminal_message_status,
+    merge_message_failure,
 )
 from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
@@ -2621,6 +2623,7 @@ class OpenAIBackendAPI:
         while _remaining() > 0:
             attempt += 1
             last_task_error = ""
+            task_failure: ImageFailure | None = None
             task_count = 0
             task_check_ok = False
             task_query_started = time.perf_counter()
@@ -2629,28 +2632,28 @@ class OpenAIBackendAPI:
                 task_count = len(tasks)
                 task_check_ok = True
                 for task in tasks:
-                    failure = classify_task_failure(task)
-                    if failure is None:
+                    candidate_failure = classify_task_failure(task)
+                    if candidate_failure is None:
                         continue
                     is_error, error_msg, metadata = self.check_task_error(task)
-                    last_task_error = error_msg or (
-                        failure.raw_detail if isinstance(failure.raw_detail, str) else ""
+                    candidate_error = error_msg or (
+                        candidate_failure.raw_detail
+                        if isinstance(candidate_failure.raw_detail, str)
+                        else ""
                     )
+                    selected_failure = merge_message_failure(task_failure, candidate_failure)
+                    if selected_failure is not task_failure:
+                        task_failure = selected_failure
+                        last_task_error = candidate_error
                     logger.info({
                         "event": "image_poll_task_failure",
                         "conversation_id": conversation_id,
                         "attempt": attempt,
-                        "failure_code": failure.code,
-                        "error_msg": diagnostic_excerpt(last_task_error, 1000),
+                        "failure_code": candidate_failure.code,
+                        "error_msg": diagnostic_excerpt(candidate_error, 1000),
                         "metadata": metadata,
                         "legacy_is_error": is_error,
                     })
-                    raise ImageFailureError(
-                        last_task_error,
-                        failure=failure.with_raw_detail(last_task_error or failure.raw_detail),
-                    )
-            except ImageFailureError:
-                raise
             except Exception as exc:
                 # tasks 查询失败不影响正常轮询流程
                 logger.debug({
@@ -2702,17 +2705,27 @@ class OpenAIBackendAPI:
                         sediment_ids.append(sediment_id)
 
             if not file_ids and not sediment_ids:
-                failure = classify_conversation_failure(conversation)
+                conversation_failure = classify_conversation_failure(conversation)
+                failure = merge_message_failure(task_failure, conversation_failure)
                 if failure is not None:
-                    raw_detail = failure.raw_detail if isinstance(failure.raw_detail, str) else last_assistant_text
-                    logger.info({
-                        "event": "image_poll_conversation_failure",
-                        "conversation_id": conversation_id,
-                        "attempt": attempt,
-                        "failure_code": failure.code,
-                        "task_count": task_count if task_check_ok else None,
-                        "message_preview": diagnostic_excerpt(raw_detail, 1000),
-                    })
+                    if failure is task_failure:
+                        raw_detail = last_task_error or (
+                            failure.raw_detail if isinstance(failure.raw_detail, str) else ""
+                        )
+                    else:
+                        raw_detail = (
+                            failure.raw_detail
+                            if isinstance(failure.raw_detail, str)
+                            else last_assistant_text
+                        )
+                        logger.info({
+                            "event": "image_poll_conversation_failure",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "failure_code": failure.code,
+                            "task_count": task_count if task_check_ok else None,
+                            "message_preview": diagnostic_excerpt(raw_detail, 1000),
+                        })
                     exc = ImageFailureError(
                         raw_detail,
                         failure=failure.with_raw_detail(raw_detail or failure.raw_detail),
