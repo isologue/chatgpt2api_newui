@@ -978,6 +978,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if token:
                     continue
             if token and auth_invalid:
+                error_message = str(exc)
+                account_service.remove_invalid_token(token, "text_stream", error=error_message)
                 account_service.schedule_auth_verification(token, "text_stream")
             elif token:
                 account_service.handle_request_failure(token, "text_stream", exc)

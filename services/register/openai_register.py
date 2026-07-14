@@ -937,6 +937,24 @@ class PlatformRegistrar:
             detail = _response_json(resp) if resp is not None else {}
             raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
 
+    def _authorize_continue_signup(self, email: str, index: int) -> None:
+        step(index, "提交邮箱信息进行注册授权（authorize/continue）")
+        url = f"{auth_base}/api/accounts/authorize/continue"
+        headers = self._json_headers(f"{auth_base}/create-account")
+        headers["openai-sentinel-token"] = build_sentinel_token(
+            self.session, self.device_id, "authorize_continue", self.fingerprint
+        )
+        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+        resp, error = request_with_local_retry(
+            self.session, "post", url,
+            json={"username": {"kind": "email", "value": email}},
+            headers=headers, allow_redirects=False, verify=False,
+        )
+        if resp is None or resp.status_code != 200:
+            detail = _response_json(resp) if resp is not None else {}
+            raise RuntimeError(error or f"signup_continue_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
+        step(index, "邮箱提交授权完成（authorize/continue）")
+
     @staticmethod
     def _is_passwordless_invalid_state(resp) -> bool:
         if resp is None or getattr(resp, "status_code", None) != 409:
@@ -1002,7 +1020,7 @@ class PlatformRegistrar:
         step(index, "Microsoft passwordless token 换取完成")
         return tokens
 
-    def _start_passwordless_signup(self, index: int) -> None:
+    def _start_passwordless_signup(self, email: str, index: int) -> None:
         step(index, "开始切换 passwordless signup 并发送验证码")
         url = f"{auth_base}/api/accounts/passwordless/send-otp"
 
@@ -1011,20 +1029,30 @@ class PlatformRegistrar:
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             return request_with_local_retry(self.session, "post", url, headers=headers, verify=False)
 
-        resp, error = send()
-        if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+        for attempt in range(2):
+            if attempt:
+                self._reset_auth_cookies()
+                self._platform_authorize(email, index)
+                self._authorize_continue_signup(email, index)
             resp, error = send()
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
-        if resp is None or resp.status_code not in (200, 201, 204):
-            data = _response_json(resp) if resp is not None else {}
-            detail = f", detail={json.dumps(data, ensure_ascii=False)[:300]}" if data else ""
-            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        self.passwordless_signup = True
-        step(index, "passwordless signup 验证码发送完成")
+                bundle = self._refresh_cloudflare_clearance(auth_base, index)
+                if bundle is None:
+                    raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+                resp, error = send()
+                if _is_cloudflare_challenge(resp):
+                    raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+            if attempt == 0 and resp is not None and resp.status_code == 409:
+                continue
+            if resp is None or resp.status_code not in (200, 201, 204):
+                data = _response_json(resp) if resp is not None else {}
+                detail = ", detail=" + json.dumps(data, ensure_ascii=False)[:300] if data else ""
+                raise RuntimeError(error or "passwordless_send_otp_http_" + str(getattr(resp, "status_code", "unknown")) + detail)
+            self.passwordless_signup = True
+            step(index, "passwordless signup 验证码发送完成")
+            return
+        raise RuntimeError("passwordless signup 失败：两次尝试均返回 409")
+
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -1214,7 +1242,7 @@ class PlatformRegistrar:
             else:
                 if not self.passwordless_signup:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-                    self._start_passwordless_signup(index)
+                    self._start_passwordless_signup(email, index)
                 step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
                 step(index, "开始等待注册验证码")
                 code = wait_for_code(mailbox, register_proxy=self.proxy)
