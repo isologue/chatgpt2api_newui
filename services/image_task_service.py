@@ -16,6 +16,7 @@ from services.image_failure import (
     ImagePollTimeoutError,
     classify_image_exception,
     image_failure,
+    public_image_error_message,
 )
 from services.json_file import read_json_file, write_json_file
 from services.log_service import LOG_TYPE_CALL, collect_image_attempts, log_service
@@ -30,8 +31,10 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+TASK_ERROR_MESSAGE_VERSION = 1
 TASK_DETAIL_KEYS = (
     "error_code",
+    "error_message_version",
     "failure_scope",
     "failure_capability",
     "failure_retryable",
@@ -91,9 +94,10 @@ def _normalize_task_failure(
     failure = classify_image_exception(exc)
     details.update(failure.diagnostic_fields())
     details["error_code"] = failure.code
+    details["error_message_version"] = TASK_ERROR_MESSAGE_VERSION
     if failure.code == "image_poll_timeout" and _clean(getattr(exc, "conversation_id", "")):
         details["can_resume_poll"] = True
-    return failure.public_message, raw_error, details
+    return public_image_error_message(failure, exc), raw_error, details
 
 
 def _now_iso() -> str:
@@ -171,8 +175,12 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
+        stored_error = _clean(task.get("error"))
         failure = image_failure(_clean(task.get("error_code")))
-        item["error"] = failure.public_message
+        if _clean(task.get("error_message_version")) == str(TASK_ERROR_MESSAGE_VERSION):
+            item["error"] = stored_error
+        else:
+            item["error"] = public_image_error_message(failure)
         item["error_code"] = failure.code
     for key in PUBLIC_TASK_DETAIL_KEYS:
         value = task.get(key)
@@ -392,10 +400,14 @@ class ImageTaskService:
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
-                message = _clean(result.get("message")) or "image task returned no image data"
+                upstream_message = _clean(result.get("message"))
+                message = upstream_message or "image task returned no image data"
                 error = ImageGenerationError(
                     message,
-                    failure=image_failure("no_image_generated", raw_detail=message),
+                    failure=image_failure(
+                        "no_image_generated",
+                        raw_detail=upstream_message or None,
+                    ),
                 )
                 if account_email:
                     setattr(error, "account_email", account_email)
@@ -568,12 +580,19 @@ class ImageTaskService:
                 task["usage"] = usage
             _copy_task_details(item, task)
             if status == TASK_STATUS_ERROR:
+                stored_error = _clean(item.get("error"))
+                stored_version = _clean(item.get("error_message_version"))
                 failure = image_failure(_clean(task.get("error_code")))
-                task["error"] = failure.public_message
+                if stored_version == str(TASK_ERROR_MESSAGE_VERSION):
+                    task["error"] = stored_error
+                else:
+                    task["error"] = public_image_error_message(failure)
                 task["error_code"] = failure.code
+                task["error_message_version"] = TASK_ERROR_MESSAGE_VERSION
                 if (
-                    _clean(item.get("error")) != failure.public_message
+                    stored_error != task["error"]
                     or _clean(item.get("error_code")) != failure.code
+                    or stored_version != str(TASK_ERROR_MESSAGE_VERSION)
                 ):
                     self._loaded_private_task_details = True
             else:

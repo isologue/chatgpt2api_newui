@@ -341,9 +341,7 @@ export function imageTaskProgressLabel(task?: ImageTask | null) {
 }
 
 export function taskPrimaryMessage(task?: ImageTask | null) {
-  if (!task) return ''
-  return task.error
-    || 'Image generation failed. Please try again later.'
+  return cleanString(task?.error)
 }
 
 export function imageAssetUrl(asset: ImageTaskAsset) {

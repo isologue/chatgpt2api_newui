@@ -28,6 +28,7 @@ from services.image_failure import (
     extract_message_facts,
     image_failure,
     merge_message_failure,
+    public_image_error_message,
 )
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import OpenAIBackendAPI
@@ -1567,7 +1568,7 @@ def stream_image_outputs(
             model=request.model,
             index=index,
             total=total,
-            text=detailed_error or message or policy_failure.public_message,
+            text=detailed_error or message or public_image_error_message(policy_failure),
             conversation_id=conversation_id,
             failure=policy_failure,
         )
@@ -1652,25 +1653,27 @@ def stream_image_outputs(
         return
 
     if conversation_id:
+        failure = image_failure("no_image_generated")
         yield ImageOutput(
             kind="message",
             model=request.model,
             index=index,
             total=total,
-            text="Image generation completed upstream but the result could not be retrieved. Please try again in a moment.",
+            text=public_image_error_message(failure),
             conversation_id=conversation_id,
-            failure=image_failure("no_image_generated"),
+            failure=failure,
         )
         return
 
+    failure = image_failure("no_image_generated")
     yield ImageOutput(
         kind="message",
         model=request.model,
         index=index,
         total=total,
-        text="Image generation started upstream but the response was incomplete. Please try again.",
+        text=public_image_error_message(failure),
         conversation_id=conversation_id,
-        failure=image_failure("no_image_generated"),
+        failure=failure,
     )
 
 def _codex_response_images(value: Any) -> list[str]:
@@ -1796,7 +1799,7 @@ def _generate_single_image(
         retry_token = ""
         fallback_retry_pending = False
         retry_error = attach_attempts(error or ImageGenerationError(
-            failure.public_message,
+            public_image_error_message(failure),
             failure=failure,
             account_email=account_email,
         ))
@@ -2226,7 +2229,7 @@ def _generate_single_image(
                 "index": index,
             })
             raise ImageGenerationError(
-                str(exc) or "Image generation was rejected by upstream policy.",
+                str(exc),
                 failure=failure,
                 account_email=account_email,
                 conversation_id=getattr(exc, "conversation_id", ""),
@@ -2238,7 +2241,7 @@ def _generate_single_image(
             failure = classify_image_exception(exc)
             attempt_conversation_id = str(getattr(exc, "conversation_id", "") or attempt_conversation_id)
             finalize_image_slot(False, failure=failure)
-            text_reply = str(exc) or "The upstream service returned text instead of an image."
+            text_reply = str(exc).strip()
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2588,7 +2591,7 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             raw_detail=failed_output.text,
         )
         raise ImageGenerationError(
-            failed_output.text or failure.public_message,
+            failed_output.text or public_image_error_message(failure),
             failure=failure,
             account_email=failed_output.account_email or account_email,
             conversation_id=failed_output.conversation_id or conversation_id,

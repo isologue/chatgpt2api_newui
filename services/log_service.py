@@ -938,21 +938,25 @@ def _exception_log_fields(exc: Exception, *, image: bool = False) -> dict[str, o
         fields.setdefault("raw_error", diagnostic_excerpt(str(exc), 4000))
     return fields
 
+def _image_error_payload(exc: Exception) -> dict[str, object]:
+    from services.image_failure import classify_image_exception, public_image_error_message
+
+    failure = classify_image_exception(exc)
+    return {
+        "error": {
+            "message": public_image_error_message(failure, exc),
+            "type": failure.error_type,
+            "param": getattr(exc, "param", None),
+            "code": failure.code,
+        }
+    }
+
+
 def _image_error_response(exc: Exception) -> JSONResponse:
     from services.image_failure import classify_image_exception
 
     failure = classify_image_exception(exc)
-    return openai_error_response(
-        {
-            "error": {
-                "message": failure.public_message,
-                "type": failure.error_type,
-                "param": getattr(exc, "param", None),
-                "code": failure.code,
-            }
-        },
-        failure.status_code,
-    )
+    return openai_error_response(_image_error_payload(exc), failure.status_code)
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
@@ -1047,9 +1051,14 @@ class LoggedCall:
             return _strip_internal_response_fields(result)
 
         if self.endpoint.startswith("/v1/images"):
-            sender = image_sse_stream
+            sender = lambda items: image_sse_stream(items, error_builder=_image_error_payload)
         else:
-            sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
+            if sse == "anthropic":
+                sender = anthropic_sse_stream
+            elif image_request:
+                sender = lambda items: sse_json_stream(items, error_builder=_image_error_payload)
+            else:
+                sender = sse_json_stream
         first_item_submitted = time.perf_counter()
 
         def _next_item_with_timing():

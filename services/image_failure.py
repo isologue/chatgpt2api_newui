@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -16,7 +17,6 @@ class FailurePolicy:
     retryable: bool
     status_code: int
     error_type: str
-    public_message: str
     account_failure: bool = False
     refresh_account: bool = False
 
@@ -30,7 +30,6 @@ class ImageFailure:
     retry_after: int | None
     status_code: int
     error_type: str
-    public_message: str
     account_failure: bool = False
     refresh_account: bool = False
     raw_detail: Any = field(default=None, compare=False, repr=False)
@@ -52,107 +51,85 @@ class ImageFailure:
 FAILURE_POLICIES: dict[str, FailurePolicy] = {
     "upstream_error": FailurePolicy(
         "transient", None, False, 502, "server_error",
-        "The upstream image request failed. Please try again.",
         account_failure=True,
     ),
     "internal_error": FailurePolicy(
         "internal", None, False, 500, "server_error",
-        "An internal image processing error occurred. Please try again.",
     ),
     "upstream_unavailable": FailurePolicy(
         "transient", None, True, 502, "server_error",
-        "The upstream image service is temporarily unavailable. Please try again.",
         account_failure=True,
     ),
     "upstream_connection_failed": FailurePolicy(
         "transient", None, True, 502, "server_error",
-        "Could not connect to the upstream image service. Please try again.",
         account_failure=True,
     ),
     "upstream_connection_timeout": FailurePolicy(
         "transient", None, True, 504, "server_error",
-        "The upstream image service timed out. Please try again.",
         account_failure=True,
     ),
     "upstream_rate_limited": FailurePolicy(
         "transient", "image_generation", True, 429, "rate_limit_error",
-        "The upstream image service is busy. Please try again shortly.",
         account_failure=True,
         refresh_account=True,
     ),
     "image_poll_timeout": FailurePolicy(
         "transient", "image_generation", True, 502, "server_error",
-        "The image did not finish before the timeout. Please try again.",
         account_failure=True,
     ),
     "image_stream_timeout": FailurePolicy(
         "transient", "image_generation", True, 502, "server_error",
-        "The upstream image stream timed out. Please try again.",
         account_failure=True,
     ),
     "image_stream_interrupted": FailurePolicy(
         "transient", "image_generation", True, 502, "server_error",
-        "The upstream image stream was interrupted. Please try again.",
         account_failure=True,
     ),
     "image_tool_error": FailurePolicy(
         "account", "image_generation", True, 502, "server_error",
-        "The selected image account is temporarily unavailable. Please try again.",
         account_failure=True,
         refresh_account=True,
     ),
     "image_quota_exhausted": FailurePolicy(
         "account", "image_generation", True, 429, "insufficient_quota",
-        "The selected image account has no image quota available.",
         account_failure=True,
         refresh_account=True,
     ),
     "file_upload_throttled": FailurePolicy(
         "account", "file_upload", True, 429, "rate_limit_error",
-        "Reference image upload is temporarily unavailable. Please try again.",
         account_failure=True,
     ),
     "auth_invalid": FailurePolicy(
         "account", "auth", True, 401, "authentication_error",
-        "The selected image account is unavailable. Please try again.",
         account_failure=True,
         refresh_account=True,
     ),
     "content_policy_violation": FailurePolicy(
         "request", None, False, 400, "invalid_request_error",
-        "The image request was rejected by the upstream safety system.",
     ),
     "invalid_image_input": FailurePolicy(
         "request", None, False, 400, "invalid_request_error",
-        "The image request is invalid. Check the input and try again.",
     ),
     "upstream_text_reply": FailurePolicy(
         "request", None, False, 502, "server_error",
-        "The upstream service returned text instead of an image.",
     ),
     "no_image_generated": FailurePolicy(
         "request", None, False, 502, "server_error",
-        "The upstream service did not generate an image for this request.",
     ),
     "unsupported_model": FailurePolicy(
         "request", None, False, 400, "invalid_request_error",
-        "This model does not support image generation.",
     ),
     "image_download_failed": FailurePolicy(
         "delivery", None, False, 502, "server_error",
-        "The image was generated, but delivering the result failed. Please try again.",
     ),
     "task_interrupted": FailurePolicy(
         "request", None, False, 503, "server_error",
-        "The image task was interrupted by a service restart. Please submit it again.",
     ),
     "no_available_account": FailurePolicy(
         "transient", None, False, 503, "server_error",
-        "No image account is currently available. Please try again later.",
     ),
     "insufficient_quota": FailurePolicy(
         "account", "image_generation", False, 429, "insufficient_quota",
-        "No image generation quota is currently available.",
     ),
 }
 
@@ -222,11 +199,106 @@ def image_failure(
         retry_after=retry_after,
         status_code=policy.status_code,
         error_type=policy.error_type,
-        public_message=policy.public_message,
         account_failure=policy.account_failure,
         refresh_account=policy.refresh_account,
         raw_detail=raw_detail,
     )
+
+
+IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
+IMAGE_TOOL_ERROR_PUBLIC_MESSAGE = "The image generation tool encountered an error. Please try again."
+IMAGE_QUOTA_PUBLIC_MESSAGE = "No image generation quota is currently available."
+
+_PUBLIC_RAW_DETAIL_CODES = frozenset({
+    "content_policy_violation",
+    "image_quota_exhausted",
+    "invalid_image_input",
+    "no_image_generated",
+    "upstream_rate_limited",
+    "upstream_text_reply",
+    "unsupported_model",
+})
+
+_DIRECT_PUBLIC_TEXT_CODES = frozenset({
+    "content_policy_violation",
+    "invalid_image_input",
+    "upstream_text_reply",
+    "unsupported_model",
+})
+
+_TOOL_ERROR_PUBLIC_CODES = frozenset({
+    "image_stream_interrupted",
+    "image_stream_timeout",
+})
+
+def _is_structured_text_payload(text: str) -> bool:
+    candidate = text.strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        candidate = candidate[3:-3].strip()
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].lstrip()
+    try:
+        json.loads(candidate)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _is_structured_failure_code(text: str) -> bool:
+    normalized = text.strip().lower()
+    return normalized in (
+        FAILURE_POLICIES.keys()
+        | FAILURE_CODE_ALIASES.keys()
+        | RATE_LIMIT_FAILURE_CODES
+        | FAILED_STATUSES
+    )
+
+
+def _safe_public_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if _is_structured_text_payload(text) or _is_structured_failure_code(text):
+        return ""
+    return text
+
+
+def _public_upstream_text(
+    failure: ImageFailure,
+    error: BaseException | None = None,
+) -> str:
+    candidates: list[Any] = []
+    if error is not None:
+        candidates.extend((
+            getattr(error, "raw_upstream_message", None),
+            getattr(error, "last_assistant_text", None),
+        ))
+    if failure.code in _PUBLIC_RAW_DETAIL_CODES:
+        candidates.append(failure.raw_detail)
+    for candidate in candidates:
+        if text := _safe_public_text(candidate):
+            return text
+    return ""
+
+
+def public_image_error_message(
+    failure: ImageFailure,
+    error: BaseException | None = None,
+) -> str:
+    if failure.code == "image_poll_timeout":
+        return IMAGE_TIMEOUT_PUBLIC_MESSAGE
+    if failure.code in _TOOL_ERROR_PUBLIC_CODES:
+        return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
+
+    upstream_text = _public_upstream_text(failure, error)
+    if upstream_text:
+        return upstream_text
+
+    if failure.code in {"image_quota_exhausted", "insufficient_quota"}:
+        return IMAGE_QUOTA_PUBLIC_MESSAGE
+    return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
 
 
 class ImageFailureError(RuntimeError):
@@ -245,7 +317,7 @@ class ImageFailureError(RuntimeError):
             retry_after=retry_after,
             raw_detail=raw_message,
         )
-        super().__init__(raw_message or self.failure.public_message)
+        super().__init__(raw_message or public_image_error_message(self.failure))
 
 
 class InvalidAccessTokenError(ImageFailureError):
@@ -286,6 +358,12 @@ class ImageGenerationError(ImageFailureError):
     ) -> None:
         raw_message = str(message or "").strip()
         resolved = failure or image_failure(code, raw_detail=raw_error or raw_message)
+        if (
+            resolved.raw_detail is None
+            and raw_message
+            and resolved.code in _DIRECT_PUBLIC_TEXT_CODES
+        ):
+            resolved = resolved.with_raw_detail(raw_message)
         super().__init__(raw_message, failure=resolved)
         self.status_code = int(status_code if status_code is not None else resolved.status_code)
         self.error_type = str(error_type or resolved.error_type)
@@ -301,7 +379,7 @@ class ImageGenerationError(ImageFailureError):
     def to_openai_error(self) -> dict[str, Any]:
         return {
             "error": {
-                "message": self.failure.public_message,
+                "message": public_image_error_message(self.failure, self),
                 "type": self.error_type,
                 "param": self.param,
                 "code": self.code,
