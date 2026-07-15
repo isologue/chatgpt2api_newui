@@ -2131,16 +2131,76 @@ class AccountService:
             items.append(item)
         return items
 
+    @classmethod
+    def _account_status_category_for_stats(cls, account: dict) -> str:
+        status = cls._normalize_account_status(account.get("status"), account)
+        status_key = str(account.get("status") or "").strip().lower()
+        reason_code = str(account.get("status_reason_code") or "").strip().lower()
+        error_kind = str(account.get("last_error_kind") or "").strip().lower()
+
+        if status == cls.STATUS_DISABLED:
+            return "disabled"
+        if status == cls.STATUS_SUSPICIOUS or status_key in {"suspicious", "suspected"} or reason_code == "account_suspected":
+            return "suspicious"
+        if status == cls.STATUS_LIMITED or status_key in {"limited", "rate_limited", "cooling", "backoff"}:
+            return "limited"
+        if status == cls.STATUS_ABNORMAL or status_key in {"abnormal", "invalid", "error", "incomplete"}:
+            return "abnormal"
+
+        limited_reason_codes = {
+            "pro_cooldown",
+            "video_cooldown",
+            "lane_backoff",
+            "lane_degraded",
+            "image_generation_unavailable",
+            "image_degraded_to_fast",
+            "image_quota_exhausted",
+            "text_pending",
+        }
+        limited_error_kinds = {
+            "quota_exhausted",
+            "media_pending",
+            "media_generation_unavailable",
+            "media_degraded",
+            "lane_degraded",
+            "text_pending",
+        }
+        if reason_code in limited_reason_codes or error_kind in limited_error_kinds:
+            return "limited"
+
+        abnormal_reason_codes = {
+            "snlm0e_refresh_failed",
+            "account_invalid",
+            "parse_failure",
+            "upstream_error",
+        }
+        abnormal_error_kinds = {"auth_invalid", "parse_failure", "upstream_error"}
+        if (
+            reason_code in abnormal_reason_codes
+            or error_kind in abnormal_error_kinds
+            or cls._quota_value(account.get("invalid_count"), 0) > 0
+            or str(account.get("last_refresh_error") or "").strip()
+            or str(account.get("last_token_refresh_error") or "").strip()
+        ):
+            return "abnormal"
+
+        lane_backoff_summary = account.get("lane_backoff_summary")
+        if isinstance(lane_backoff_summary, dict) and cls._bool_value(lane_backoff_summary.get("active"), False):
+            return "limited"
+
+        return "normal"
+
     def get_stats(self) -> dict:
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
-        suspicious = sum(1 for a in items if a.get("status") == self.STATUS_SUSPICIOUS)
-        abnormal = sum(1 for a in items if a.get("status") == "异常")
-        disabled = sum(1 for a in items if a.get("status") == "禁用")
-        normal_items = [a for a in items if a.get("status") == "正常"]
+        status_categories = [self._account_status_category_for_stats(a) for a in items]
+        active = sum(1 for category in status_categories if category == "normal")
+        limited = sum(1 for category in status_categories if category == "limited")
+        suspicious = sum(1 for category in status_categories if category == "suspicious")
+        abnormal = sum(1 for category in status_categories if category == "abnormal")
+        disabled = sum(1 for category in status_categories if category == "disabled")
+        normal_items = [a for a, category in zip(items, status_categories) if category == "normal"]
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in normal_items)
         unlimited = sum(1 for a in normal_items if self._is_unlimited_image_quota_account(a))
         unknown_quota = sum(
