@@ -85,8 +85,11 @@
         />
 
         <LogsImageAttemptTimeline
-          v-if="log.accountSwitchCount"
+          v-if="log.imageAttempts.length && hasImageAttemptBreakdown(log)"
           :attempts="log.imageAttempts"
+          :requested-count="log.imageRequestedCount"
+          :succeeded-count="log.imageSucceededCount"
+          :failed-count="log.imageFailedCount"
         />
 
         <DetailTextBlock
@@ -95,19 +98,19 @@
           @copy="emit('copy', $event)"
         />
         <DetailTextBlock
-          title="错误"
+          title="对外错误"
           :content="log.error"
           tone="danger"
           @copy="emit('copy', $event)"
         />
         <DetailTextBlock
-          title="原始上游错误"
+          title="上游错误"
           :content="log.rawUpstreamError"
           tone="danger"
           @copy="emit('copy', $event)"
         />
         <DetailTextBlock
-          title="上游文本回复"
+          title="上游文本"
           :content="log.rawUpstreamMessage || log.upstreamPreview"
           tone="warning"
           @copy="emit('copy', $event)"
@@ -145,6 +148,7 @@ import ModalShell from '@/components/ai/ModalShell.vue'
 import StateBadge from '@/components/ai/StateBadge.vue'
 import { isSystemLogSuccess, type SystemLogRow } from '@/api/logs'
 import {
+  hasImageAttemptBreakdown,
   type DetailField,
   type DetailTimelineGroup,
   type DetailTimelineLegendItem,

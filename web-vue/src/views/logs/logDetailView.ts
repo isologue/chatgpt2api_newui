@@ -445,7 +445,7 @@ function upstreamEnvelopeValue(metricValue: (key: string) => number): number {
 }
 
 export function buildTimelineSegments(item: SystemLogRow | null): DetailTimelineSegment[] {
-  if (!item || item.accountSwitchCount > 0) return []
+  if (!item || hasImageAttemptBreakdown(item)) return []
   return buildTimelineSegmentsFromMetric((key) => metricValueFromLog(item, key))
 }
 
@@ -503,7 +503,7 @@ function buildTimelineGroupsFromMetric(
 }
 
 export function buildTimelineGroups(item: SystemLogRow | null): DetailTimelineGroup[] {
-  if (!item || item.accountSwitchCount > 0) return []
+  if (!item || hasImageAttemptBreakdown(item)) return []
   return buildTimelineGroupsFromMetric(
     (key) => metricValueFromLog(item, key),
     (key) => eventTimeForMetric(item, key),
@@ -545,7 +545,7 @@ export function shouldAutoExpandTimeline(item: SystemLogRow | null, bottleneckSt
 
 export function buildPrimaryDetailFields(item: SystemLogRow | null): DetailField[] {
   if (!item) return []
-  const accountDetailsLiveInAttemptTimeline = item.accountSwitchCount > 0
+  const accountDetailsLiveInAttemptTimeline = hasImageAttemptBreakdown(item)
   return compactDetailFields([
     { label: '请求 ID', value: rawDetailValue(item, 'call_id') || item.id, copyable: true },
     { label: '接口', value: item.endpoint, copyable: true },
@@ -556,6 +556,11 @@ export function buildPrimaryDetailFields(item: SystemLogRow | null): DetailField
     accountDetailsLiveInAttemptTimeline ? null : { label: '会话 ID', value: item.conversationId, copyable: true },
     { label: '时间', value: timeRangeDetailValue(item), wide: true },
   ])
+}
+
+export function hasImageAttemptBreakdown(item: SystemLogRow): boolean {
+  return item.imageAttempts.length > 0
+    && (item.imageAttempts.length > 1 || item.imageRequestedCount > 1)
 }
 
 export function buildDiagnosticDetailFields(item: SystemLogRow | null): DetailField[] {

@@ -13,8 +13,8 @@
         </span>
       </div>
       <div class="attempt-timeline__summary">
-        <MetaChip v-if="attemptGroups.length > 1" size="xs" tone="muted">
-          {{ attemptGroups.length }} 张图片
+        <MetaChip v-if="resultRequestedCount" size="xs" tone="muted">
+          {{ resultRequestedCount }} 张 · 成功 {{ resultSucceededCount }} · 失败 {{ resultFailedCount }}
         </MetaChip>
         <MetaChip size="xs" tone="muted">{{ attemptRows.length }} 次尝试</MetaChip>
         <MetaChip v-if="switchCount" size="xs" tone="warning">
@@ -39,6 +39,9 @@
         <div v-if="attemptGroups.length > 1" class="attempt-timeline__group-header">
           <strong>图片 {{ group.slot }}</strong>
           <div>
+            <span :class="group.succeeded ? 'attempt-timeline__group-success' : 'attempt-timeline__group-failed'">
+              {{ group.succeeded ? '成功' : '失败' }}
+            </span>
             <span>{{ group.attempts.length }} 次尝试</span>
             <span v-if="group.attempts.length > 1">切换 {{ group.attempts.length - 1 }} 次</span>
           </div>
@@ -89,7 +92,37 @@
                   {{ attemptFailureLabel(attempt) }}
                 </span>
                 <code :title="attempt.failureCode">{{ attempt.failureCode }}</code>
+                <code v-if="attempt.statusCode">HTTP {{ attempt.statusCode }}</code>
               </span>
+              <details
+                v-if="attempt.publicError || attempt.upstreamError || attempt.upstreamText"
+                class="attempt-timeline__error-details"
+              >
+                <summary>
+                  <span>错误详情</span>
+                  <Icon icon="lucide:chevron-down" />
+                </summary>
+                <div class="attempt-timeline__error-content">
+                  <div v-if="attempt.publicError" class="attempt-timeline__raw-error">
+                    <span>对外错误</span>
+                    <code>{{ attempt.publicError }}</code>
+                  </div>
+                  <div
+                    v-if="attempt.upstreamError"
+                    class="attempt-timeline__raw-error"
+                  >
+                    <span>上游错误</span>
+                    <code>{{ attempt.upstreamError }}</code>
+                  </div>
+                  <div
+                    v-if="attempt.upstreamText"
+                    class="attempt-timeline__raw-error"
+                  >
+                    <span>上游文本</span>
+                    <code>{{ attempt.upstreamText }}</code>
+                  </div>
+                </div>
+              </details>
             </div>
 
             <div class="attempt-timeline__breakdown">
@@ -134,6 +167,9 @@ import LogsTimelineSummary from '@/views/logs/LogsTimelineSummary.vue'
 
 const props = defineProps<{
   attempts: ImageAttempt[]
+  requestedCount?: number
+  succeededCount?: number
+  failedCount?: number
 }>()
 
 const attemptsVisible = ref(true)
@@ -158,8 +194,24 @@ const attemptGroups = computed(() => {
     attempts.push(attempt)
     groups.set(attempt.slot, attempts)
   })
-  return Array.from(groups, ([slot, attempts]) => ({ slot, attempts }))
+  return Array.from(groups, ([slot, attempts]) => ({
+    slot,
+    attempts,
+    succeeded: attempts.some((attempt) => attempt.status === 'success'),
+  }))
 })
+const resultRequestedCount = computed(() => Math.max(
+  props.requestedCount || 0,
+  attemptGroups.value.length,
+))
+const resultSucceededCount = computed(() => Math.max(
+  props.succeededCount || 0,
+  attemptGroups.value.filter((group) => group.succeeded).length,
+))
+const resultFailedCount = computed(() => Math.max(
+  props.failedCount || 0,
+  resultRequestedCount.value - resultSucceededCount.value,
+))
 const switchCount = computed(() => attemptGroups.value.reduce(
   (total, group) => total + Math.max(0, group.attempts.length - 1),
   0,
@@ -304,6 +356,14 @@ function toggleAttemptDetails(key: string): void {
   color: hsl(var(--muted-foreground));
 }
 
+.attempt-timeline__group-success {
+  color: rgb(22 163 74);
+}
+
+.attempt-timeline__group-failed {
+  color: rgb(225 29 72);
+}
+
 .attempt-timeline__item {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
@@ -420,6 +480,7 @@ function toggleAttemptDetails(key: string): void {
 }
 
 .attempt-timeline__facts {
+  display: grid;
   margin-top: 8px;
   font-size: 11px;
   color: hsl(var(--muted-foreground));
@@ -431,6 +492,54 @@ function toggleAttemptDetails(key: string): void {
   align-items: center;
   gap: 5px;
   line-height: 1.45;
+}
+
+.attempt-timeline__error-details {
+  margin-left: 17px;
+}
+
+.attempt-timeline__error-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  cursor: pointer;
+  color: hsl(var(--muted-foreground));
+  font-weight: 600;
+  list-style: none;
+}
+
+.attempt-timeline__error-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.attempt-timeline__error-details summary svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 160ms ease;
+}
+
+.attempt-timeline__error-details[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.attempt-timeline__error-content {
+  display: grid;
+  gap: 7px;
+  margin-top: 6px;
+  border-left: 2px solid hsl(var(--border));
+  padding-left: 9px;
+}
+
+.attempt-timeline__raw-error > span {
+  display: block;
+  margin-bottom: 3px;
+  color: hsl(var(--muted-foreground));
+}
+
+.attempt-timeline__raw-error code {
+  display: block;
+  white-space: pre-wrap;
 }
 
 .attempt-timeline__fact > svg {

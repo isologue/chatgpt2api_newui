@@ -56,14 +56,6 @@ def exception_diagnostic_fields(
         if isinstance(value, str):
             value = diagnostic_excerpt(value, string_limit)
         fields[key] = value
-    if "raw_upstream_message" not in fields and hasattr(exc, "last_assistant_text"):
-        value = getattr(exc, "last_assistant_text")
-        if value not in (None, ""):
-            fields["raw_upstream_message"] = (
-                diagnostic_excerpt(value, string_limit)
-                if isinstance(value, str)
-                else value
-            )
     followup = fields.get("stream_timeout_followup")
     if isinstance(followup, dict) and "diagnosis" not in fields:
         fields["diagnosis"] = followup

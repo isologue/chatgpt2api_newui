@@ -58,6 +58,14 @@
           {{ summary || '-' }}
         </p>
         <MetaChip
+          v-if="item.imageResultStatus === 'partial_success'"
+          size="xs"
+          tone="warning"
+          chip-class="shrink-0"
+        >
+          成功 {{ item.imageSucceededCount }}/{{ item.imageRequestedCount }}
+        </MetaChip>
+        <MetaChip
           v-if="item.accountSwitchCount"
           size="xs"
           tone="warning"

@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
@@ -213,7 +213,21 @@ def ensure_ok(response: requests.Response, context: str) -> None:
     raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
 
 
-def sse_json_stream(items) -> Iterator[str]:
+def _stream_error_payload(
+    exc: Exception,
+    error_builder: Callable[[Exception], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if hasattr(exc, "to_openai_error"):
+        return exc.to_openai_error()
+    if error_builder is not None:
+        return error_builder(exc)
+    return {"error": {"message": str(exc), "type": exc.__class__.__name__}}
+
+
+def sse_json_stream(
+    items,
+    error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+) -> Iterator[str]:
     yield ": stream-open\n\n"
     try:
         for item in items:
@@ -224,14 +238,15 @@ def sse_json_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
+        error = _stream_error_payload(exc, error_builder)
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
 
-def image_sse_stream(items) -> Iterator[str]:
+def image_sse_stream(
+    items,
+    error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+) -> Iterator[str]:
     try:
         for item in items:
             event = str(item.get("type") or "message") if isinstance(item, dict) else "message"
@@ -243,9 +258,7 @@ def image_sse_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
+        error = _stream_error_payload(exc, error_builder)
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 

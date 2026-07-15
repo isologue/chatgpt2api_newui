@@ -43,6 +43,26 @@ RAW_DIAGNOSTIC_FIELDS = (
 )
 
 
+CANONICAL_FAILURE_FIELDS = (
+    "failure_code",
+    "failure_scope",
+    "failure_capability",
+    "failure_retryable",
+    "failure_account_failure",
+    "failure_retry_after",
+    "status_code",
+    "error_type",
+)
+
+
+CALL_FAILURE_FIELDS = (
+    *CANONICAL_FAILURE_FIELDS,
+    "public_error",
+    "account_failure",
+    *RAW_DIAGNOSTIC_FIELDS,
+)
+
+
 def _trim_raw(value: object, limit: int = 4000) -> str:
     return _trim(value, limit)
 
@@ -67,6 +87,7 @@ STAGE_LABELS = {
     "image_starting_generation": "等待上游首包",
     "image_generating": "上游生成中",
     "image_stream_failed": "上游断流",
+    "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "切换备用出口",
     "image_stream_resolve_start": "等待图片结果",
@@ -100,6 +121,7 @@ ACTIVE_STAGE_GROUPS = {
     "image_starting_generation": "上游准备",
     "image_generating": "上游生成中",
     "image_stream_failed": "上游断流",
+    "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "等待出口",
     "image_stream_resolve_start": "等待图片结果",
@@ -240,6 +262,29 @@ class RealtimeMonitorService:
             self._merge_stage_data(record, data)
             self._events.append(self._event(call_id, event, record, data))
 
+    def capture_image_attempts(self, call_id: str, attempts: object) -> None:
+        call_id = str(call_id or "").strip()
+        if not call_id or not isinstance(attempts, (list, tuple)):
+            return
+        with self._lock:
+            record = self._active.get(call_id)
+            if record is None:
+                return
+            captured = record.setdefault("_image_attempts", {})
+            if not isinstance(captured, dict):
+                captured = {}
+                record["_image_attempts"] = captured
+            for value in attempts:
+                if not isinstance(value, dict):
+                    continue
+                slot = _int_ms(value.get("slot"))
+                attempt = _int_ms(value.get("attempt"))
+                status = str(value.get("status") or "").strip().lower()
+                if slot <= 0 or attempt <= 0 or not status:
+                    continue
+                key = (slot, attempt)
+                captured[key] = {**dict(captured.get(key) or {}), **dict(value)}
+
     def finish(self, detail: dict[str, Any]) -> None:
         call_id = str(detail.get("call_id") or "").strip()
         if not call_id:
@@ -285,6 +330,10 @@ class RealtimeMonitorService:
             for key in RAW_DIAGNOSTIC_FIELDS:
                 if detail.get(key):
                     record[key] = _trim_raw(detail.get(key))
+            self._merge_failure_fields(record, detail)
+            if status == "success":
+                for key in CALL_FAILURE_FIELDS:
+                    record.pop(key, None)
             urls = detail.get("urls")
             if isinstance(urls, list):
                 record["url_count"] = len(urls)
@@ -292,7 +341,9 @@ class RealtimeMonitorService:
             if isinstance(perf, dict):
                 self._merge_metric_dict(record.setdefault("perf", {}), perf)
             all_events = [dict(item) for item in self._events if item.get("call_id") == call_id]
+            self._merge_captured_image_attempts(detail, record.pop("_image_attempts", None))
             self._attach_image_attempt_monitors(detail, all_events)
+            self._attach_image_result_summary(detail, record)
             events = all_events[-60:]
             diagnostic = self._detail_diagnostic(record, events)
             if diagnostic:
@@ -402,6 +453,7 @@ class RealtimeMonitorService:
         for key in RAW_DIAGNOSTIC_FIELDS:
             if key in data and data.get(key):
                 record[key] = _trim_raw(data.get(key))
+        self._merge_failure_fields(record, data)
         if "has_proxy" in data:
             record["has_proxy"] = bool(data.get("has_proxy"))
 
@@ -437,9 +489,36 @@ class RealtimeMonitorService:
             for key in RAW_DIAGNOSTIC_FIELDS:
                 if key in data and data.get(key):
                     image[key] = _trim_raw(data.get(key))
+            self._merge_failure_fields(image, data)
             if "has_proxy" in data:
                 image["has_proxy"] = bool(data.get("has_proxy"))
             self._merge_metric_dict(image.setdefault("metrics", {}), metric_data)
+
+    @staticmethod
+    def _merge_failure_fields(target: dict[str, Any], values: dict[str, Any]) -> None:
+        for key in (
+            "failure_code",
+            "failure_scope",
+            "failure_capability",
+            "error_type",
+        ):
+            if key in values:
+                value = values.get(key)
+                target[key] = None if value is None else str(value)
+        for key in ("status_code", "failure_retry_after"):
+            if key in values:
+                value = values.get(key)
+                target[key] = None if value is None else _int_ms(value)
+        if values.get("public_error"):
+            target["public_error"] = _trim_raw(values.get("public_error"))
+        for key in (
+            "failure_retryable",
+            "failure_account_failure",
+            "account_failure",
+            "switched_account",
+        ):
+            if key in values:
+                target[key] = bool(values.get(key))
 
     def _merge_metric_dict(self, target: dict[str, int], values: dict[str, Any]) -> None:
         for key, value in values.items():
@@ -476,7 +555,8 @@ class RealtimeMonitorService:
             compact_event = {
                 key: value
                 for key, value in event.items()
-                if key in {"time", "event", "label", "status"}
+                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS}
+                or key in {"public_error", "account_failure", "switched_account"}
                 or (str(key).endswith("_ms") and _int_ms(value) > 0)
             }
             if compact_event:
@@ -506,6 +586,79 @@ class RealtimeMonitorService:
                     item["monitor"] = monitor
             enriched.append(item)
         detail["image_attempts"] = enriched
+
+    @staticmethod
+    def _merge_captured_image_attempts(detail: dict[str, Any], captured: object) -> None:
+        merged: dict[tuple[int, int], dict[str, Any]] = {}
+
+        def merge(values: object) -> None:
+            if isinstance(values, dict):
+                items = values.values()
+            elif isinstance(values, (list, tuple)):
+                items = values
+            else:
+                return
+            for value in items:
+                if not isinstance(value, dict):
+                    continue
+                slot = _int_ms(value.get("slot"))
+                attempt = _int_ms(value.get("attempt"))
+                status = str(value.get("status") or "").strip().lower()
+                if slot <= 0 or attempt <= 0 or not status:
+                    continue
+                key = (slot, attempt)
+                merged[key] = {**merged.get(key, {}), **dict(value)}
+
+        merge(captured)
+        merge(detail.get("image_attempts"))
+        if merged:
+            detail["image_attempts"] = [merged[key] for key in sorted(merged)]
+
+    @staticmethod
+    def _attach_image_result_summary(detail: dict[str, Any], record: dict[str, Any]) -> None:
+        attempts = detail.get("image_attempts")
+        attempt_items = (
+            [item for item in attempts if isinstance(item, dict)]
+            if isinstance(attempts, list)
+            else []
+        )
+        request_meta = detail.get("request_meta") if isinstance(detail.get("request_meta"), dict) else {}
+        requested = _int_ms(request_meta.get("n"))
+        images = record.get("images") if isinstance(record.get("images"), dict) else {}
+        requested = max(
+            requested,
+            max((_int_ms(item.get("total")) for item in images.values() if isinstance(item, dict)), default=0),
+            max((_int_ms(item.get("slot")) for item in attempt_items), default=0),
+        )
+        succeeded_slots = {
+            _int_ms(item.get("slot"))
+            for item in attempt_items
+            if str(item.get("status") or "").strip().lower() == "success" and _int_ms(item.get("slot")) > 0
+        }
+        result_count = max(
+            _int_ms(detail.get("result_data_count")),
+            _int_ms(detail.get("result_url_count")),
+            len(detail.get("urls") or []) if isinstance(detail.get("urls"), list) else 0,
+        )
+        succeeded = len(succeeded_slots) if attempt_items else result_count
+        requested = max(requested, succeeded)
+        if requested <= 0:
+            return
+        failed = max(0, requested - succeeded)
+        if succeeded > 0 and failed > 0:
+            result_status = "partial_success"
+        elif succeeded > 0:
+            result_status = "success"
+        else:
+            result_status = "failed"
+        summary = {
+            "image_requested_count": requested,
+            "image_succeeded_count": succeeded,
+            "image_failed_count": failed,
+            "image_result_status": result_status,
+        }
+        detail.update(summary)
+        record.update(summary)
 
     def _summary(self, active: list[dict[str, Any]], completed: list[dict[str, Any]]) -> dict[str, Any]:
         success = sum(1 for item in completed if str(item.get("status") or "").lower() == "success")
@@ -680,6 +833,10 @@ class RealtimeMonitorService:
                     "proxy_node_name",
                     "image_egress_limit",
                     "local_reason",
+                    *CANONICAL_FAILURE_FIELDS,
+                    "public_error",
+                    "account_failure",
+                    "switched_account",
                     *RAW_DIAGNOSTIC_FIELDS,
                 ):
                     if field in value and value[field] not in ("", None):
@@ -702,6 +859,8 @@ class RealtimeMonitorService:
                     key: value
                     for key, value in event.items()
                     if key in {"time", "event", "label", "index", "total", "attempt", "status"}
+                    or key in CANONICAL_FAILURE_FIELDS
+                    or key in {"public_error", "account_failure", "switched_account"}
                     or key in RAW_DIAGNOSTIC_FIELDS
                     or (str(key).endswith("_ms") and _int_ms(value) > 0)
                 }
@@ -718,6 +877,7 @@ class RealtimeMonitorService:
 
     def _copy_record(self, record: dict[str, Any]) -> dict[str, Any]:
         copied = dict(record)
+        copied.pop("_image_attempts", None)
         copied["metrics"] = dict(record.get("metrics") or {})
         copied["perf"] = dict(record.get("perf") or {})
         images = record.get("images")
@@ -789,6 +949,10 @@ class RealtimeMonitorService:
                 "egress_mode",
                 "has_proxy",
                 "local_reason",
+                *CANONICAL_FAILURE_FIELDS,
+                "public_error",
+                "account_failure",
+                "switched_account",
                 *RAW_DIAGNOSTIC_FIELDS,
             ):
                 if key in data:

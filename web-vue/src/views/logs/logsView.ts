@@ -242,6 +242,7 @@ export function summaryText(item: SystemLogRow): string {
 }
 
 export function statusLabel(item: SystemLogRow): string {
+  if (item.imageResultStatus === 'partial_success') return '部分成功'
   if (isSuccess(item)) return '成功'
   if (isFailed(item)) return '失败'
   if (isLimited(item)) return '受限'
@@ -249,6 +250,7 @@ export function statusLabel(item: SystemLogRow): string {
 }
 
 export function statusTone(item: SystemLogRow): LogStatusTone {
+  if (item.imageResultStatus === 'partial_success') return 'warning'
   if (isSuccess(item)) return 'success'
   if (isFailed(item)) return 'danger'
   if (isLimited(item)) return 'warning'

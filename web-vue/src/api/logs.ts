@@ -125,6 +125,13 @@ export type ImageAttempt = {
   accountEmail: string
   status: string
   failureCode: string
+  statusCode: number
+  errorType: string
+  publicError: string
+  upstreamError: string
+  upstreamText: string
+  accountFailure: boolean
+  switchedAccount: boolean | null
   conversationId: string
   durationMs: number
   monitor: ImageAttemptMonitor
@@ -183,6 +190,10 @@ export type SystemLogRow = {
   urls: string[]
   imageUrls: string[]
   imageAttempts: ImageAttempt[]
+  imageRequestedCount: number
+  imageSucceededCount: number
+  imageFailedCount: number
+  imageResultStatus: string
   accountSwitchCount: number
   diagnosisChips: LogDiagnosisChip[]
   preview: string
@@ -265,10 +276,11 @@ function formatDetailValue(value: unknown): string {
 function normalizeLevel(item: SystemLog): LogEntry['level'] {
   const detail = item.detail || {}
   const status = cleanString(detail.status).toLowerCase()
+  const imageResultStatus = cleanString(detail.image_result_status).toLowerCase()
   const error = cleanString(detail.error)
   const errorCode = structuredFailureCode(detail)
   if (status === 'failed' || error || errorCode) return 'ERROR'
-  if (status === 'warning' || status === 'limited') return 'WARNING'
+  if (status === 'warning' || status === 'limited' || imageResultStatus === 'partial_success') return 'WARNING'
   return 'INFO'
 }
 
@@ -439,23 +451,54 @@ function buildSystemLogDiagnosisChips(row: {
 export function normalizeSystemLogRow(item: SystemLog, index: number, options: NormalizeSystemLogRowOptions = {}): SystemLogRow {
   const detail = item.detail || {}
   const monitor = detail.monitor && typeof detail.monitor === 'object' ? detail.monitor as Record<string, any> : {}
-  const error = detailValue(detail, 'error')
+  const error = detailValue(detail, 'public_error') || detailValue(detail, 'error')
   const requestText = detailValue(detail, 'request_text')
   const requestTextFull = detailValue(detail, 'request_text_full') || requestText
   const requestTextTruncated = detailRawValue(detail, 'request_text_truncated') === true
   const rawUpstreamMessage = detailValue(detail, 'raw_upstream_message')
-  const upstreamPreview = detailValue(detail, 'upstream_message_preview')
-  const duplicateDiagnosticValues = [error, rawUpstreamMessage, upstreamPreview].filter(Boolean)
-  const rawUpstreamError = [
-    detailValue(detail, 'upstream_error'),
-    detailValue(detail, 'raw_error'),
-  ].find((value) => value && !duplicateDiagnosticValues.includes(value)) || ''
+  const upstreamPreview = rawUpstreamMessage ? '' : detailValue(detail, 'upstream_message_preview')
+  const rawUpstreamError = detailValue(detail, 'upstream_error')
   const reason = detailValue(detail, 'reason')
   const summary = cleanString(item.summary)
   const preview = summarizeLogText(requestText || rawUpstreamMessage || upstreamPreview || error || rawUpstreamError || reason || summary)
   const urls = collectUrls(detail)
   const imageUrls = normalizePreviewUrls(urls, options.apiBaseUrl)
   const imageAttempts = normalizeImageAttempts(detailRawValue(detail, 'image_attempts'))
+  const requestMeta = detail.request_meta && typeof detail.request_meta === 'object'
+    ? detail.request_meta as Record<string, unknown>
+    : {}
+  const attemptedSlots = imageAttempts.map((attempt) => attempt.slot)
+  const succeededSlots = new Set(
+    imageAttempts
+      .filter((attempt) => attempt.status === 'success')
+      .map((attempt) => attempt.slot),
+  )
+  const imageRequestedBaseCount = Math.max(
+    normalizeNonNegativeNumber(detailRawValue(detail, 'image_requested_count')),
+    normalizeNonNegativeNumber(requestMeta.n),
+    ...attemptedSlots,
+    0,
+  )
+  const imageSucceededCount = Math.max(
+    normalizeNonNegativeNumber(detailRawValue(detail, 'image_succeeded_count')),
+    succeededSlots.size,
+    imageAttempts.length ? 0 : imageUrls.length,
+  )
+  const imageRequestedCount = Math.max(imageRequestedBaseCount, imageSucceededCount)
+  const imageFailedCount = Math.max(
+    normalizeNonNegativeNumber(detailRawValue(detail, 'image_failed_count')),
+    imageRequestedCount - imageSucceededCount,
+    0,
+  )
+  const imageResultStatus = detailValue(detail, 'image_result_status').toLowerCase() || (
+    imageSucceededCount > 0 && imageFailedCount > 0
+      ? 'partial_success'
+      : imageSucceededCount > 0
+        ? 'success'
+        : imageRequestedCount > 0
+          ? 'failed'
+          : ''
+  )
   const accountSwitchCount = imageAccountSwitchCount(imageAttempts)
   const status = detailValue(detail, 'status')
   const durationMs = detailValue(detail, 'duration_ms')
@@ -521,6 +564,10 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
     urls,
     imageUrls,
     imageAttempts,
+    imageRequestedCount,
+    imageSucceededCount,
+    imageFailedCount,
+    imageResultStatus,
     accountSwitchCount,
     diagnosisChips: buildSystemLogDiagnosisChips({
       status,
@@ -809,6 +856,13 @@ function normalizeImageAttempts(value: unknown): ImageAttempt[] {
       accountEmail: cleanString(item.account_email),
       status: cleanString(item.status).toLowerCase(),
       failureCode: cleanString(item.failure_code).toLowerCase(),
+      statusCode: normalizeNonNegativeNumber(item.status_code),
+      errorType: cleanString(item.error_type),
+      publicError: cleanString(item.public_error),
+      upstreamError: cleanString(item.upstream_error),
+      upstreamText: cleanString(item.raw_upstream_message) || cleanString(item.upstream_message_preview),
+      accountFailure: item.account_failure === true,
+      switchedAccount: typeof item.switched_account === 'boolean' ? item.switched_account : null,
       conversationId: cleanString(item.conversation_id),
       durationMs: normalizeNonNegativeNumber(item.duration_ms),
       monitor: normalizeImageAttemptMonitor(item.monitor),
@@ -818,6 +872,9 @@ function normalizeImageAttempts(value: unknown): ImageAttempt[] {
 }
 
 export function imageAccountSwitchCount(attempts: ImageAttempt[]): number {
+  if (attempts.some((attempt) => attempt.switchedAccount !== null)) {
+    return attempts.filter((attempt) => attempt.switchedAccount === true).length
+  }
   const attemptsPerSlot = new Map<number, number>()
   attempts.forEach((attempt) => {
     attemptsPerSlot.set(attempt.slot, (attemptsPerSlot.get(attempt.slot) || 0) + 1)
