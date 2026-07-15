@@ -1672,13 +1672,25 @@ class AccountService:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
+            should_remove = config.auto_remove_invalid_accounts
+            if should_remove:
+                self._accounts.pop(access_token, None)
+                self._save_accounts()
             self._image_slot_condition.notify_all()
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "存疑账号刷新失败转异常",
             {"source": event, "token": anonymize_token(access_token), "error": reason},
         )
+        if should_remove:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "自动移除异常账号",
+                {"source": event, "token": anonymize_token(access_token), "error": reason},
+            )
+            return None
         return self.get_account(access_token)
+
 
     @staticmethod
     def _mark_remote_check_pending(account: dict, event: str, now: str) -> None:

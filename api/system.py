@@ -586,6 +586,8 @@ def create_router(app_version: str) -> APIRouter:
                 and config.refresh_account_interval_minute != previous_refresh_interval
             ):
                 notify_account_watcher_config_changed()
+            if config.auto_remove_invalid_accounts or config.auto_remove_rate_limited_accounts:
+                account_service.cleanup_auto_remove_accounts()
             return {"config": updated_config}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
