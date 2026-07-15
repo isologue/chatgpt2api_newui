@@ -517,6 +517,17 @@ def extract_continue_url(data: dict[str, Any] | None) -> str:
     return ""
 
 
+def _passwordless_otp_ready(data: dict[str, Any] | None) -> bool:
+    """Return whether authorize/continue already advanced to email OTP verification."""
+    if not isinstance(data, dict):
+        return False
+    page = data.get("page")
+    page_type = str(page.get("type") or "").strip().lower() if isinstance(page, dict) else ""
+    continue_path = _url_path(extract_continue_url(data)).lower()
+    markers = ("email-verification", "email_verification", "email-otp", "email_otp")
+    return any(marker in page_type or marker in continue_path for marker in markers)
+
+
 def _absolute_auth_url(url: str) -> str:
     value = str(url or "").strip()
     if value.startswith("/"):
@@ -881,17 +892,23 @@ class PlatformRegistrar:
     def _reset_auth_cookies(self) -> None:
         jar = getattr(self.session.cookies, "jar", self.session.cookies)
         for cookie in list(jar):
-            domain = str(getattr(cookie, "domain", "") or "")
-            if "auth.openai.com" not in domain:
+            domain = str(getattr(cookie, "domain", "") or "").lower()
+            name = str(getattr(cookie, "name", "") or "")
+            if not any(host in domain for host in ("openai.com", "chatgpt.com")):
+                continue
+            if name.lower() in {"cf_clearance", "__cf_bm", "_cfuvid"}:
                 continue
             try:
                 self.session.cookies.delete(
-                    str(getattr(cookie, "name", "") or ""),
+                    name,
                     domain=domain,
                     path=str(getattr(cookie, "path", "/") or "/"),
                 )
             except Exception:
                 continue
+        self.platform_auth_code = ""
+        self.last_otp_continue_url = ""
+        self.passwordless_signup = False
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
 
@@ -937,7 +954,7 @@ class PlatformRegistrar:
             detail = _response_json(resp) if resp is not None else {}
             raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
 
-    def _authorize_continue_signup(self, email: str, index: int) -> None:
+    def _authorize_continue_signup(self, email: str, index: int) -> bool:
         step(index, "提交邮箱信息进行注册授权（authorize/continue）")
         url = f"{auth_base}/api/accounts/authorize/continue"
         headers = self._json_headers(f"{auth_base}/create-account")
@@ -953,7 +970,14 @@ class PlatformRegistrar:
         if resp is None or resp.status_code != 200:
             detail = _response_json(resp) if resp is not None else {}
             raise RuntimeError(error or f"signup_continue_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
-        step(index, "邮箱提交授权完成（authorize/continue）")
+        data = _response_json(resp)
+        otp_ready = _passwordless_otp_ready(data)
+        page = data.get("page") if isinstance(data, dict) else None
+        page_type = str(page.get("type") or "").strip() if isinstance(page, dict) else ""
+        continue_url = extract_continue_url(data)
+        next_step = page_type or _safe_url_for_log(continue_url)
+        step(index, f"邮箱提交授权完成（authorize/continue） next={next_step or '?'}")
+        return otp_ready
 
     @staticmethod
     def _is_passwordless_invalid_state(resp) -> bool:
@@ -1029,11 +1053,19 @@ class PlatformRegistrar:
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             return request_with_local_retry(self.session, "post", url, headers=headers, verify=False)
 
-        for attempt in range(2):
+        last_detail = ""
+        for attempt in range(3):
             if attempt:
+                step(index, f"注册会话失效，重建 signup 授权（第 {attempt + 1}/3 次）", "yellow")
                 self._reset_auth_cookies()
-                self._platform_authorize(email, index)
-                self._authorize_continue_signup(email, index)
+                self._platform_authorize(email, index, screen_hint="signup")
+                if self.passwordless_signup:
+                    step(index, "signup 授权已直接发送验证码，跳过重复 send-otp", "yellow")
+                    return
+                if self._authorize_continue_signup(email, index):
+                    self.passwordless_signup = True
+                    step(index, "authorize/continue 已进入验证码页，跳过重复 send-otp", "yellow")
+                    return
             resp, error = send()
             if _is_cloudflare_challenge(resp):
                 bundle = self._refresh_cloudflare_clearance(auth_base, index)
@@ -1042,8 +1074,12 @@ class PlatformRegistrar:
                 resp, error = send()
                 if _is_cloudflare_challenge(resp):
                     raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
-            if attempt == 0 and resp is not None and resp.status_code == 409:
-                continue
+            if self._is_passwordless_invalid_state(resp):
+                data = _response_json(resp)
+                last_detail = json.dumps(data, ensure_ascii=False)[:500]
+                if attempt < 2:
+                    continue
+                raise RuntimeError(f"passwordless signup 会话重建后仍失效: {last_detail}")
             if resp is None or resp.status_code not in (200, 201, 204):
                 data = _response_json(resp) if resp is not None else {}
                 detail = ", detail=" + json.dumps(data, ensure_ascii=False)[:300] if data else ""
@@ -1051,7 +1087,7 @@ class PlatformRegistrar:
             self.passwordless_signup = True
             step(index, "passwordless signup 验证码发送完成")
             return
-        raise RuntimeError("passwordless signup 失败：两次尝试均返回 409")
+        raise RuntimeError(f"passwordless signup 会话重建后仍失效: {last_detail or 'invalid_state'}")
 
 
     def _register_user(self, email: str, password: str, index: int) -> None:
