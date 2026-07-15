@@ -4,6 +4,7 @@
 
 <script setup lang="ts">
 import { computed, shallowRef, watch } from 'vue'
+import { writeClipboardText } from '@/lib/clipboard'
 import {
   needsStudioCodeFormatter,
   renderStudioMarkdown,
@@ -87,33 +88,4 @@ async function handleMarkdownClick(event: MouseEvent) {
   }
 }
 
-async function writeClipboardText(text: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
-  }
-  const scrollX = window.scrollX
-  const scrollY = window.scrollY
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.setAttribute('readonly', 'readonly')
-  textarea.style.position = 'fixed'
-  textarea.style.top = '0'
-  textarea.style.left = '0'
-  textarea.style.width = '1px'
-  textarea.style.height = '1px'
-  textarea.style.opacity = '0'
-  textarea.style.pointerEvents = 'none'
-  document.body.appendChild(textarea)
-  let ok = false
-  try {
-    textarea.focus({ preventScroll: true })
-    textarea.select()
-    ok = document.execCommand('copy')
-  } finally {
-    document.body.removeChild(textarea)
-    window.scrollTo(scrollX, scrollY)
-  }
-  if (!ok) throw new Error('copy failed')
-}
 </script>

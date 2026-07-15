@@ -71,6 +71,15 @@ def _mask_email(value: object) -> str:
     return str(value or "").strip()
 
 
+def _mask_slot_email(value: object) -> str:
+    email = str(value or "").strip()
+    if "@" not in email:
+        return email[:3] + "***" if email else ""
+    local, domain = email.split("@", 1)
+    visible = local[:2] if len(local) > 1 else local[:1]
+    return f"{visible}***@{domain}"
+
+
 STAGE_LABELS = {
     "handler_submitted": "等待入口",
     "handler_started": "入口执行",
@@ -466,6 +475,8 @@ class RealtimeMonitorService:
             image["updated_at"] = str(record.get("updated_at") or "")
             if data.get("total"):
                 image["total"] = _int_ms(data.get("total"))
+            if data.get("account_email"):
+                image["account_email"] = _mask_slot_email(data.get("account_email"))
             if data.get("status"):
                 image["status"] = str(data.get("status") or "")
             if data.get("returned_result") is not None:
@@ -906,6 +917,8 @@ class RealtimeMonitorService:
             "model": str(record.get("model") or data.get("model") if data else record.get("model") or ""),
         }
         if data:
+            if data.get("account_email"):
+                payload["account_email"] = _mask_slot_email(data.get("account_email"))
             for key in (
                 "index",
                 "total",

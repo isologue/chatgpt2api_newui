@@ -203,7 +203,7 @@ function buildMessageView(message: StudioMessage): StudioMessageView {
     return cached.view
   }
   const assets = buildImageAssetViews(taskAssets)
-  const isPendingImageMessage = isImageMessage && (!task || (task.status !== 'success' && task.status !== 'error' && assets.length === 0))
+  const isPendingImageMessage = isImageMessage && (!task || (task.status !== 'success' && task.status !== 'error'))
   const revision = (cached?.revision || 0) + 1
   const view: StudioMessageView = {
     ...message,
@@ -212,9 +212,12 @@ function buildMessageView(message: StudioMessage): StudioMessageView {
     assets,
     isImageMessage,
     isPendingImageMessage,
-    isSingleImageResult: isImageMessage && !isPendingImageMessage && assets.length === 1,
+    isSingleImageResult: isImageMessage && task?.status === 'success' && assets.length === 1,
     imageSlotCount,
-    pendingSlots: Array.from({ length: imageSlotCount }, (_, index) => index),
+    pendingSlots: Array.from(
+      { length: Math.max(0, imageSlotCount - assets.length) },
+      (_, index) => assets.length + index,
+    ),
     imagePendingStageText: imageTaskProgressLabel(task),
     primaryMessage: taskPrimaryMessage(task),
     imagePreviewStyle: isImageMessage ? buildImagePreviewStyle(message, task, imageSlotCount, assets) : undefined,

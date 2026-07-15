@@ -195,7 +195,7 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     input.pageRuntime.clearTimer(IMAGE_POLL_TIMER_KEY)
     if (!input.pageRuntime.canRun.value) return
     if (!pendingImageTaskIds.value.length) return
-    input.pageRuntime.setTimer(IMAGE_POLL_TIMER_KEY, 4000, () => {
+    input.pageRuntime.setTimer(IMAGE_POLL_TIMER_KEY, 1200, () => {
       void refresh(true)
     })
   }

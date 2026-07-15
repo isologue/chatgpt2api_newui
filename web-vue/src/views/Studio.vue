@@ -163,6 +163,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { preloadPromptLibrary } from '@/composables/usePromptLibraryRuntime'
 import StudioPromptPicker from '@/components/studio/StudioPromptPicker.vue'
+import { writeClipboardText } from '@/lib/clipboard'
 import { downloadUrlAsFile } from '@/lib/downloads'
 import {
   buildStudioConversationLookup,
@@ -606,7 +607,7 @@ function openPreview(src: string, name: string, localPath = '') {
 async function copyText(value: string) {
   if (!value) return
   try {
-    await navigator.clipboard.writeText(value)
+    await writeClipboardText(value)
     toast.success('已复制')
   } catch {
     toast.error('复制失败')

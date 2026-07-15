@@ -127,99 +127,95 @@
             </template>
 
             <template v-else>
-              <template v-if="!message.task || message.task.status === 'queued' || message.task.status === 'running'">
-                <div class="studio-result-block studio-result-block-pending">
-                  <div class="studio-result-grid" :class="{ 'is-single': message.imageSlotCount <= 1 }">
-                    <div
-                      v-for="slot in message.pendingSlots"
-                      :key="`${message.id}-pending-${slot}`"
-                      class="studio-result-item"
+              <div v-if="message.task?.status === 'error'" class="studio-image-status is-error">
+                <Icon icon="lucide:circle-alert" class="h-4 w-4" />
+                <span>{{ message.primaryMessage || '上游没有返回可用图片。' }}</span>
+              </div>
+
+              <div
+                v-else
+                class="studio-result-block"
+                :class="{ 'studio-result-block-pending': message.pendingSlots.length > 0 }"
+              >
+                <div class="studio-result-grid" :class="{ 'is-single': message.imageSlotCount <= 1 }">
+                  <div
+                    v-for="(asset, assetIndex) in message.assets"
+                    :key="`${message.id}-${assetIndex}`"
+                    class="studio-result-item"
+                  >
+                    <button
+                      type="button"
+                      class="studio-result-media"
+                      :class="{ 'has-image': Boolean(asset.url) }"
+                      @click="$emit('preview', asset.url, `结果 ${assetIndex + 1}`, asset.path)"
                     >
-                      <div class="studio-result-media studio-result-placeholder">
-                        <Icon icon="lucide:loader-circle" class="h-5 w-5 animate-spin" />
-                        <span>正在处理图片</span>
-                        <small>{{ message.imagePendingStageText }}</small>
-                      </div>
-                      <div v-if="message.imageSlotCount > 1" class="studio-result-caption">
-                        <span>图片 {{ slot + 1 }}</span>
+                      <img
+                        v-if="asset.url"
+                        :src="asset.url"
+                        :alt="`结果 ${assetIndex + 1}`"
+                        :width="asset.width || undefined"
+                        :height="asset.height || undefined"
+                        loading="lazy"
+                      />
+                      <span v-else>无图片 URL</span>
+                    </button>
+                    <div v-if="asset.url" class="studio-result-caption">
+                      <span v-if="message.imageSlotCount > 1" class="studio-result-caption-label">结果 {{ assetIndex + 1 }}</span>
+                      <div class="studio-result-actions">
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          root-class="studio-result-action"
+                          title="引用到输入框"
+                          aria-label="引用到输入框"
+                          @click="$emit('reference-image', asset, `结果 ${assetIndex + 1}`, message)"
+                        >
+                          <Icon icon="lucide:image-plus" class="h-3.5 w-3.5" />
+                          <span>引用</span>
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          root-class="studio-result-action"
+                          title="局部修改"
+                          aria-label="局部修改"
+                          @click="$emit('inpaint-image', asset, `结果 ${assetIndex + 1}`, message)"
+                        >
+                          <Icon icon="lucide:scan-line" class="h-3.5 w-3.5" />
+                          <span>局部</span>
+                        </Button>
+                        <Button
+                          v-if="message.inpaintSource"
+                          size="xs"
+                          variant="outline"
+                          root-class="studio-result-action"
+                          title="对比原图"
+                          aria-label="对比原图"
+                          @click="$emit('compare-image', message.inpaintSource, asset, `结果 ${assetIndex + 1}`)"
+                        >
+                          <Icon icon="lucide:columns-2" class="h-3.5 w-3.5" />
+                          <span>对比</span>
+                        </Button>
                       </div>
                     </div>
                   </div>
-                </div>
-              </template>
 
-              <template v-else>
-                <div v-if="message.task?.status === 'error'" class="studio-image-status is-error">
-                  <Icon icon="lucide:circle-alert" class="h-4 w-4" />
-                  <span>{{ message.primaryMessage || '上游没有返回可用图片。' }}</span>
-                </div>
-
-                <div v-else class="studio-result-block">
-                  <div class="studio-result-grid" :class="{ 'is-single': message.assets.length <= 1 }">
-                    <div
-                      v-for="(asset, assetIndex) in message.assets"
-                      :key="`${message.id}-${assetIndex}`"
-                      class="studio-result-item"
-                    >
-                      <button
-                        type="button"
-                        class="studio-result-media"
-                        :class="{ 'has-image': Boolean(asset.url) }"
-                        @click="$emit('preview', asset.url, `结果 ${assetIndex + 1}`, asset.path)"
-                      >
-                        <img
-                          v-if="asset.url"
-                          :src="asset.url"
-                          :alt="`结果 ${assetIndex + 1}`"
-                          :width="asset.width || undefined"
-                          :height="asset.height || undefined"
-                          loading="lazy"
-                        />
-                        <span v-else>无图片 URL</span>
-                      </button>
-                      <div v-if="asset.url" class="studio-result-caption">
-                        <span v-if="message.assets.length > 1" class="studio-result-caption-label">结果 {{ assetIndex + 1 }}</span>
-                        <div class="studio-result-actions">
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            root-class="studio-result-action"
-                            title="引用到输入框"
-                            aria-label="引用到输入框"
-                            @click="$emit('reference-image', asset, `结果 ${assetIndex + 1}`, message)"
-                          >
-                            <Icon icon="lucide:image-plus" class="h-3.5 w-3.5" />
-                            <span>引用</span>
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            root-class="studio-result-action"
-                            title="局部修改"
-                            aria-label="局部修改"
-                            @click="$emit('inpaint-image', asset, `结果 ${assetIndex + 1}`, message)"
-                          >
-                            <Icon icon="lucide:scan-line" class="h-3.5 w-3.5" />
-                            <span>局部</span>
-                          </Button>
-                          <Button
-                            v-if="message.inpaintSource"
-                            size="xs"
-                            variant="outline"
-                            root-class="studio-result-action"
-                            title="对比原图"
-                            aria-label="对比原图"
-                            @click="$emit('compare-image', message.inpaintSource, asset, `结果 ${assetIndex + 1}`)"
-                          >
-                            <Icon icon="lucide:columns-2" class="h-3.5 w-3.5" />
-                            <span>对比</span>
-                          </Button>
-                        </div>
-                      </div>
+                  <div
+                    v-for="slot in message.pendingSlots"
+                    :key="`${message.id}-pending-${slot}`"
+                    class="studio-result-item"
+                  >
+                    <div class="studio-result-media studio-result-placeholder">
+                      <Icon icon="lucide:loader-circle" class="h-5 w-5 animate-spin" />
+                      <span>正在处理图片</span>
+                      <small>{{ message.imagePendingStageText }}</small>
+                    </div>
+                    <div v-if="message.imageSlotCount > 1" class="studio-result-caption">
+                      <span>图片 {{ slot + 1 }}</span>
                     </div>
                   </div>
                 </div>
-              </template>
+              </div>
             </template>
           </div>
 

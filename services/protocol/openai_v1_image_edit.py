@@ -94,7 +94,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                 output_tokens=count_image_output_items_tokens(data, size, quality),
             ),
         )
-    result = collect_image_outputs(outputs)
+    partial_result_callback = body.get("_partial_result_callback")
+    result = collect_image_outputs(
+        outputs,
+        result_callback=partial_result_callback if callable(partial_result_callback) else None,
+    )
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
