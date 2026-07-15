@@ -1149,14 +1149,14 @@ class AccountService:
             token
             for item in self._accounts.values()
             if remove_invalid
-               and item.get("status") == "异常"
+               and self._account_status_category_for_stats(item) == "abnormal"
                and (token := item.get("access_token") or "")
         ]
         rate_limited_tokens = [
             token
             for item in self._accounts.values()
             if remove_rate_limited
-               and item.get("status") == "限流"
+               and self._account_status_category_for_stats(item) == "limited"
                and (token := item.get("access_token") or "")
         ]
         return invalid_tokens, rate_limited_tokens
@@ -1882,6 +1882,38 @@ class AccountService:
                 )
         return result
 
+    @classmethod
+    def _apply_remote_image_quota_fallback(cls, current: dict, result: dict[str, Any]) -> dict[str, Any]:
+        """Avoid turning a locally exhausted free image account back to normal when remote quota is unknown."""
+        if not isinstance(result, dict) or not cls._bool_value(result.get("image_quota_unknown"), False):
+            return result
+        if cls._quota_value(result.get("quota"), 0) > 0:
+            return result
+
+        account_type = cls._normalize_account_type(result.get("type") or current.get("type"))
+        if account_type and account_type != "free":
+            return result
+
+        current_status = cls._normalize_account_status(current.get("status"), current)
+        local_quota_exhausted = (
+            current_status == cls.STATUS_LIMITED
+            or bool(current.get("last_quota_estimated_empty_at"))
+            or (
+                not cls._bool_value(current.get("image_quota_unknown"), True)
+                and cls._quota_value(current.get("quota"), 0) <= 0
+            )
+        )
+        if not local_quota_exhausted:
+            return result
+
+        return {
+            **result,
+            "status": cls.STATUS_LIMITED,
+            "quota": 0,
+            "image_quota_unknown": False,
+            "status_reason_code": result.get("status_reason_code") or "image_quota_exhausted",
+        }
+
     def fetch_remote_info(
         self,
         access_token: str,
@@ -1954,6 +1986,7 @@ class AccountService:
                 self._record_remote_check_error(active_token, event, str(exc))
             raise
         current = self.get_account(active_token) or {}
+        result = self._apply_remote_image_quota_fallback(current, result)
         if current.get("status") == "禁用":
             result = {**result, "status": "禁用"}
         self._record_refresh_success(active_token, event)
