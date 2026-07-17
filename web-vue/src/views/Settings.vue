@@ -81,6 +81,7 @@
 
           <SettingsBasicPolicyPanel
             :settings="localSettings"
+            :image-auth-refresh-concurrency-field="imageAuthRefreshConcurrencyField"
             :image-max-account-attempts-field="imageMaxAccountAttemptsField"
             :image-settle-seconds-field="imageSettleSecondsField"
             @set-log-level="setLogLevel"
@@ -442,36 +443,44 @@ const refreshAccountIntervalField = useNumberSettingField(
   { integer: true, min: 1, fallback: 5 },
 )
 const imagePollTimeoutField = useNumberSettingField(
-  () => localSettings.value?.image_poll_timeout_secs ?? 120,
+  () => localSettings.value?.image_poll_timeout_secs ?? 60,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_poll_timeout_secs = value
   },
-  { integer: true, min: 1, fallback: 120 },
+  { integer: true, min: 1, fallback: 60 },
 )
 const imageStreamTimeoutField = useNumberSettingField(
-  () => localSettings.value?.image_stream_timeout_secs ?? 300,
+  () => localSettings.value?.image_stream_timeout_secs ?? 80,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_stream_timeout_secs = value
   },
-  { integer: true, min: 1, fallback: 300 },
+  { integer: true, min: 1, fallback: 80 },
 )
 const imageAccountConcurrencyField = useNumberSettingField(
-  () => localSettings.value?.image_account_concurrency ?? 3,
+  () => localSettings.value?.image_account_concurrency ?? 1,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_account_concurrency = value
   },
-  { integer: true, min: 1, fallback: 3 },
+  { integer: true, min: 1, max: 3, fallback: 1 },
 )
 const imageMaxAccountAttemptsField = useNumberSettingField(
-  () => localSettings.value?.image_max_account_attempts ?? 2,
+  () => localSettings.value?.image_max_account_attempts ?? 4,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_max_account_attempts = value
   },
-  { integer: true, min: 1, max: 10, fallback: 2 },
+  { integer: true, min: 2, fallback: 4 },
+)
+const imageAuthRefreshConcurrencyField = useNumberSettingField(
+  () => localSettings.value?.image_auth_refresh_concurrency ?? 10,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_auth_refresh_concurrency = value
+  },
+  { integer: true, min: 1, fallback: 10 },
 )
 const imageSettleSecondsField = useNumberSettingField(
   () => localSettings.value?.image_settle_secs ?? 5,

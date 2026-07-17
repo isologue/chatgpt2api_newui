@@ -248,10 +248,10 @@ environment:
 
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `image_stream_timeout_secs` | `300` | 图片上游 SSE / HTTP 流最长等待时间。 |
-| `image_poll_timeout_secs` | `300` | 图片结果解析和轮询最长等待时间。 |
+| `image_stream_timeout_secs` | `80` | 图片上游 SSE / HTTP 流最长等待时间。 |
+| `image_poll_timeout_secs` | `60` | 图片结果解析和轮询最长等待时间。 |
 | `image_parallel_generation` | `true` | 多图请求是否并行生成。 |
-| `image_account_concurrency` | `3` | 单账号图片并发上限。 |
+| `image_account_concurrency` | `1` | 单账号图片并发上限，可设置为 1–3。 |
 | `image_remove_conversation_after_result` | `false` | 图片成功保存后尝试隐藏上游 ChatGPT 官网会话。 |
 | `auto_remove_invalid_accounts` | `true` | 鉴权失效账号是否自动移除。 |
 | `auto_remove_rate_limited_accounts` | `false` | 远程确认图片额度耗尽后是否自动移除账号。 |

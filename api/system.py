@@ -57,6 +57,8 @@ SETTINGS_UPDATE_KEYS = {
     "image_poll_initial_wait_secs",
     "image_account_concurrency",
     "image_account_retry_enabled",
+    "image_preflight_token_refresh_enabled",
+    "image_auth_refresh_concurrency",
     "image_max_account_attempts",
     "image_parallel_generation",
     "image_remove_conversation_after_result",

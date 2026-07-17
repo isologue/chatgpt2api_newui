@@ -16,22 +16,40 @@
         </div>
         <div class="settings-check-item">
           <div class="settings-check-control">
-            <Checkbox v-model="settings.image_account_retry_enabled">失败后自动尝试其他账号</Checkbox>
-            <HelpTip text="仅账号、鉴权、限流或上游异常会切换账号；提示词、输入和图片下载错误不会切换。" />
+            <Checkbox v-model="settings.image_account_retry_enabled">生图失败后尝试其他账号</Checkbox>
+            <HelpTip text="除文本结果（HTTP 400）外，当前账号未能交付图片时立即尝试其他账号；当前请求不会等待后台账号核验。" />
+          </div>
+        </div>
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.image_preflight_token_refresh_enabled">生图前强制刷新 Access Token</Checkbox>
+            <HelpTip text="默认关闭。开启后，带 refresh_token 的账号会在生图前额外刷新 Access Token；仅有 Access Token 的账号会跳过。并发请求会复用正在进行的刷新，已有生图任务时会跳过主动轮换。" />
           </div>
         </div>
       </div>
       <FormField label="最大尝试账号数">
         <template #label-extra>
-          <HelpTip text="包含第一次使用的账号。默认 2，表示当前账号失败后最多再换 1 个账号。" />
+          <HelpTip text="包含第一次使用的账号。默认 4，最小 2，不限制可填写的最大值。" />
         </template>
         <Input
           :model-value="imageMaxAccountAttemptsField.input.value"
           type="number"
           block
-          placeholder="2"
+          placeholder="4"
           :disabled="!settings.image_account_retry_enabled"
           @update:model-value="imageMaxAccountAttemptsField.update"
+        />
+      </FormField>
+      <FormField label="图片鉴权并发数">
+        <template #label-extra>
+          <HelpTip text="限制生图前刷新和失败后后台核验的并发请求。默认 10，最小 1，不限制可填写的最大值；不影响文本、搜索和定时账号刷新。" />
+        </template>
+        <Input
+          :model-value="imageAuthRefreshConcurrencyField.input.value"
+          type="number"
+          block
+          placeholder="10"
+          @update:model-value="imageAuthRefreshConcurrencyField.update"
         />
       </FormField>
     </FormSection>
@@ -93,6 +111,7 @@ import type { NumberSettingField } from '@/views/settings/useNumberSettingField'
 
 defineProps<{
   settings: Settings
+  imageAuthRefreshConcurrencyField: NumberSettingField
   imageMaxAccountAttemptsField: NumberSettingField
   imageSettleSecondsField: NumberSettingField
 }>()
