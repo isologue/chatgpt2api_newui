@@ -3288,14 +3288,28 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
         for url in urls:
+            parsed_url = urlparse(url)
+            same_origin = (
+                not parsed_url.netloc
+                or parsed_url.netloc.lower() == urlparse(self.base_url).netloc.lower()
+            )
+            download_headers = (
+                self._headers(parsed_url.path or "/")
+                if same_origin
+                else self._signed_asset_headers()
+            )
             for attempt in range(2):
                 try:
                     response = self.session.get(
                         url,
-                        headers=self._signed_asset_headers(),
+                        headers=download_headers,
                         timeout=120,
                     )
-                    ensure_ok(response, "image_download", credential_scope="signed_asset")
+                    ensure_ok(
+                        response,
+                        "image_download",
+                        credential_scope="account" if same_origin else "signed_asset",
+                    )
                     content = bytes(response.content or b"")
                     if not content:
                         if attempt == 0:
