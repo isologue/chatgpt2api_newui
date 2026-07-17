@@ -432,17 +432,17 @@ class ConfigStore:
     def image_poll_timeout_secs(self) -> int:
         self.reload_if_changed()
         try:
-            return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
+            return max(1, int(self.data.get("image_poll_timeout_secs", 60)))
         except (TypeError, ValueError):
-            return 120
+            return 60
 
     @property
     def image_stream_timeout_secs(self) -> int:
         self.reload_if_changed()
         try:
-            return max(1, int(self.data.get("image_stream_timeout_secs", 300)))
+            return max(1, int(self.data.get("image_stream_timeout_secs", 80)))
         except (TypeError, ValueError):
-            return 300
+            return 80
 
     @property
     def image_poll_interval_secs(self) -> float:
@@ -464,9 +464,9 @@ class ConfigStore:
     @property
     def image_account_concurrency(self) -> int:
         try:
-            return max(1, int(self.data.get("image_account_concurrency", 3)))
+            return min(3, max(1, int(self.data.get("image_account_concurrency", 1))))
         except (TypeError, ValueError):
-            return 3
+            return 1
 
     @property
     def image_account_retry_enabled(self) -> bool:
@@ -474,12 +474,26 @@ class ConfigStore:
         return _normalize_bool(self.data.get("image_account_retry_enabled"), True)
 
     @property
+    def image_preflight_token_refresh_enabled(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_preflight_token_refresh_enabled"), False)
+
+    @property
+    def image_auth_refresh_concurrency(self) -> int:
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_auth_refresh_concurrency"),
+            10,
+            1,
+        )
+
+    @property
     def image_max_account_attempts(self) -> int:
         self.reload_if_changed()
         try:
-            return min(10, max(1, int(self.data.get("image_max_account_attempts", 2))))
+            return max(2, int(self.data.get("image_max_account_attempts", 4)))
         except (TypeError, ValueError):
-            return 2
+            return 4
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -608,6 +622,8 @@ class ConfigStore:
             data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
             data["image_account_concurrency"] = self.image_account_concurrency
             data["image_account_retry_enabled"] = self.image_account_retry_enabled
+            data["image_preflight_token_refresh_enabled"] = self.image_preflight_token_refresh_enabled
+            data["image_auth_refresh_concurrency"] = self.image_auth_refresh_concurrency
             data["image_max_account_attempts"] = self.image_max_account_attempts
             data["image_parallel_generation"] = self.image_parallel_generation
             data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result

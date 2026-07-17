@@ -91,6 +91,9 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                pending_auth = account_service.list_pending_auth_verification_tokens()
+                if pending_auth:
+                    account_service.resume_pending_auth_verifications()
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
@@ -103,7 +106,8 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         "[account-watcher] checking "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(expiring_tokens)} expiring access tokens "
-                        f"(skipping {len(normal_tokens)} normal accounts)"
+                        f"(skipping {len(normal_tokens)} normal accounts, "
+                        f"recovering {len(pending_auth)} pending auth accounts)"
                     )
                     account_service.refresh_accounts(tokens)
                 if keepalive_tokens:

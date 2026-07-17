@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
 from typing import Any
+from uuid import uuid4
 
 from services.config import config
 from services.image_failure import ImageFailure, classify_image_exception, image_failure
@@ -17,6 +19,9 @@ from services.log_service import (
 )
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+
+_RemoteCheckMarker = tuple[str, str, str, bool | None, str, str]
+
 
 
 class ImageAccountSelectionError(RuntimeError):
@@ -106,14 +111,21 @@ class AccountService:
         self.storage = storage_backend
         self._lock = Lock()
         self._token_refresh_lock = Lock()
+        self._oauth_refresh_flights_lock = Lock()
+        self._oauth_refresh_flights: dict[tuple[str, str], Future[str]] = {}
+        self._image_auth_condition = Condition(Lock())
+        self._image_auth_active = 0
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_failure_refresh_lock = Lock()
         self._image_failure_refresh_active: set[str] = set()
+        self._image_failure_refresh_active_scopes: dict[str, str] = {}
+        self._image_failure_refresh_rerun: set[str] = set()
         self._image_failure_refresh_pending: deque[str] = deque()
         self._image_failure_refresh_pending_set: set[str] = set()
+        self._image_failure_refresh_pending_scopes: dict[str, str] = {}
         self._image_failure_refresh_started_at: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -190,13 +202,20 @@ class AccountService:
             if normalized is None:
                 changed = True
                 continue
-            if normalized.get("last_remote_check_result") == "pending":
+            if (
+                normalized.get("last_remote_check_result") == "pending"
+                and normalized.get("pending_auth_scope") != "image"
+            ):
                 normalized["last_remote_check_result"] = "error"
                 normalized["last_remote_check_error"] = (
                     normalized.get("last_remote_check_error")
                     or "Account verification was interrupted by a service restart."
                 )
                 normalized["last_remote_check_error_at"] = datetime.now(timezone.utc).isoformat()
+                normalized["pending_auth_remove_invalid"] = None
+                normalized["pending_auth_scope"] = None
+                normalized.pop("pending_auth_verification_id", None)
+                changed = True
             if normalized != item:
                 changed = True
             loaded[normalized["access_token"]] = normalized
@@ -208,13 +227,23 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
-    def _is_account_selectable(account: dict, *, allow_limited: bool) -> bool:
+    def _is_account_selectable(
+        account: dict,
+        *,
+        allow_limited: bool,
+        allow_image_pending: bool = False,
+    ) -> bool:
         if not isinstance(account, dict):
             return False
         allowed_statuses = {"正常", "限流"} if allow_limited else {"正常"}
         if account.get("status") not in allowed_statuses:
             return False
-        return account.get("last_remote_check_result") != "pending"
+        if account.get("last_remote_check_result") != "pending":
+            return True
+        return bool(
+            allow_image_pending
+            and account.get("pending_auth_scope") == "image"
+        )
 
     @classmethod
     def _is_image_account_available(cls, account: dict) -> bool:
@@ -441,6 +470,22 @@ class AccountService:
             if remote_check_result in {"pending", "ok", "error", "invalid"}
             else None
         )
+        pending_remove = normalized.get("pending_auth_remove_invalid")
+        normalized["pending_auth_remove_invalid"] = (
+            self._bool_value(pending_remove)
+            if normalized["last_remote_check_result"] == "pending" and pending_remove is not None
+            else None
+        )
+        pending_scope = str(normalized.get("pending_auth_scope") or "").strip().lower()
+        normalized["pending_auth_scope"] = (
+            "image" if pending_scope == "image" else "account"
+        ) if normalized["last_remote_check_result"] == "pending" else None
+        verification_id = str(normalized.get("pending_auth_verification_id") or "").strip()
+        if normalized["last_remote_check_result"] == "pending" and verification_id:
+            normalized["pending_auth_verification_id"] = verification_id
+        else:
+            normalized.pop("pending_auth_verification_id", None)
+
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
@@ -518,10 +563,10 @@ class AccountService:
         if status_code in {408, 429} or status_code >= 500:
             return False
         normalized_code = str(error_code or "").strip().casefold()
-        if normalized_code:
-            return normalized_code in cls._TERMINAL_REFRESH_ERROR_CODES
         normalized_description = str(description or "").strip().casefold()
-        return status_code in {400, 401} and any(
+        if normalized_code in cls._TERMINAL_REFRESH_ERROR_CODES:
+            return True
+        return 400 <= status_code < 500 and any(
             fragment in normalized_description
             for fragment in cls._TERMINAL_REFRESH_MESSAGE_FRAGMENTS
         )
@@ -546,12 +591,21 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
+    def _credential_snapshot(self, access_token: str) -> tuple[str, str, dict | None]:
+        resolved, account = self._get_account_for_token(access_token)
+        if not account:
+            return resolved, "", None
+        active_token = str(account.get("access_token") or resolved or access_token).strip()
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        return active_token, refresh_token, account
+
     def _record_token_refresh_error(
         self,
         access_token: str,
         event: str,
         error: str,
         *,
+        expected_access_token: str | None = None,
         expected_refresh_token: str | None = None,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
@@ -559,6 +613,10 @@ class AccountService:
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
+                return False
+            if expected_access_token is not None and (
+                resolved != str(expected_access_token or "").strip()
+            ):
                 return False
             if expected_refresh_token is not None and (
                 str(current.get("refresh_token") or "").strip()
@@ -604,6 +662,8 @@ class AccountService:
             return None
         if account.get("status") not in {"正常", "限流"}:
             return None
+        if account.get("last_remote_check_result") == "pending":
+            return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
         anchor = self._refresh_token_keepalive_anchor(account)
@@ -612,26 +672,55 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
-    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+    @contextmanager
+    def _image_auth_slot(self):
+        with self._image_auth_condition:
+            while self._image_auth_active >= config.image_auth_refresh_concurrency:
+                self._image_auth_condition.wait(timeout=0.5)
+            self._image_auth_active += 1
+        try:
+            yield
+        finally:
+            with self._image_auth_condition:
+                self._image_auth_active = max(0, self._image_auth_active - 1)
+                self._image_auth_condition.notify_all()
+
+    @contextmanager
+    def _oauth_refresh_slot(self, *, image_scope: bool):
+        if image_scope:
+            with self._image_auth_slot():
+                yield
+            return
+        with self._token_refresh_lock:
+            yield
+
+    def _request_access_token_refresh(
+        self,
+        refresh_token: str,
+        account: dict | None = None,
+        *,
+        image_scope: bool = False,
+    ) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
         session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
-            response = session.post(
-                self._OAUTH_TOKEN_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": self._OAUTH_USER_AGENT,
-                },
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
-                },
-                timeout=60,
-            )
+            with self._oauth_refresh_slot(image_scope=image_scope):
+                response = session.post(
+                    self._OAUTH_TOKEN_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": self._OAUTH_USER_AGENT,
+                    },
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": self._OAUTH_CLIENT_ID,
+                    },
+                    timeout=60,
+                )
             raw_text = self._safe_response_text(response)
             try:
                 data = response.json() if raw_text else {}
@@ -661,13 +750,17 @@ class AccountService:
         token_data: dict,
         event: str,
         *,
+        expected_access_token: str | None = None,
         expected_refresh_token: str,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
+        expected_access_token = expected_access_token or old_access_token
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
+                raise RefreshCredentialsChangedError()
+            if old_token != str(expected_access_token or "").strip():
                 raise RefreshCredentialsChangedError()
             if (
                 str(current.get("refresh_token") or "").strip()
@@ -705,6 +798,36 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                with self._image_failure_refresh_lock:
+                    old_pending_scope = self._image_failure_refresh_pending_scopes.pop(
+                        old_token,
+                        None,
+                    )
+                    pending = (
+                        new_token if token == old_token else token
+                        for token in self._image_failure_refresh_pending
+                    )
+                    self._image_failure_refresh_pending = deque(dict.fromkeys(pending))
+                    self._image_failure_refresh_pending_set = set(
+                        self._image_failure_refresh_pending
+                    )
+                    if old_pending_scope is not None:
+                        current_scope = self._image_failure_refresh_pending_scopes.get(new_token)
+                        self._image_failure_refresh_pending_scopes[new_token] = (
+                            "account"
+                            if "account" in {old_pending_scope, current_scope}
+                            else "image"
+                        )
+                    old_started_at = self._image_failure_refresh_started_at.pop(
+                        old_token, None
+                    )
+                    if old_started_at is not None:
+                        self._image_failure_refresh_started_at[new_token] = max(
+                            old_started_at,
+                            self._image_failure_refresh_started_at.get(new_token, 0.0),
+                        )
+                    # Active workers retain their original key until their finally
+                    # block runs. Scheduling resolves aliases to deduplicate them.
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -716,6 +839,51 @@ class AccountService:
         )
         return new_token
 
+    def _refresh_access_token_owner(
+        self,
+        active_token: str,
+        refresh_token: str,
+        account: dict,
+        *,
+        event: str,
+        image_scope: bool,
+    ) -> str:
+        try:
+            if image_scope:
+                token_data = self._request_access_token_refresh(
+                    refresh_token,
+                    account,
+                    image_scope=True,
+                )
+            else:
+                token_data = self._request_access_token_refresh(refresh_token, account)
+        except TerminalRefreshTokenError as exc:
+            exc.expected_access_token = active_token
+            exc.expected_refresh_token = refresh_token
+            current_token, current_refresh_token, current = self._credential_snapshot(active_token)
+            if not current or (current_token, current_refresh_token) != (active_token, refresh_token):
+                raise RefreshCredentialsChangedError() from exc
+            raise
+        except Exception as exc:
+            recorded = self._record_token_refresh_error(
+                active_token,
+                event,
+                str(exc or ""),
+                expected_access_token=active_token,
+                expected_refresh_token=refresh_token,
+            )
+            if recorded:
+                raise
+            raise RefreshCredentialsChangedError() from exc
+
+        return self._apply_refreshed_tokens(
+            active_token,
+            token_data,
+            event,
+            expected_access_token=active_token,
+            expected_refresh_token=refresh_token,
+        )
+
     def refresh_access_token(
         self,
         access_token: str,
@@ -723,73 +891,117 @@ class AccountService:
         force: bool = False,
         event: str = "refresh_access_token",
         remove_invalid: bool | None = None,
+        raise_on_error: bool = False,
+        image_scope: bool = False,
+        expected_credentials: tuple[str, str] | None = None,
+        skip_if_image_busy: bool = False,
     ) -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        for credential_attempt in range(2):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 raise RefreshCredentialsChangedError()
             active_token = str(account.get("access_token") or resolved_token or access_token)
-            if not self._token_needs_refresh(active_token, force=force):
+            needs_refresh = self._token_needs_refresh(active_token, force=force)
+            refresh_backoff = not force and self._recent_token_refresh_error(account)
+            refresh_token = str(account.get("refresh_token") or "").strip()
+            if expected_credentials is not None and (
+                active_token, refresh_token
+            ) != expected_credentials:
+                raise RefreshCredentialsChangedError()
+            if not refresh_token:
                 return active_token
-            if not force and self._recent_token_refresh_error(account):
-                return active_token
-            for attempt in range(2):
-                refresh_token = str(account.get("refresh_token") or "").strip()
-                if not refresh_token:
-                    return active_token
-                credentials_changed: RefreshCredentialsChangedError | None = None
-                latest_account: dict | None = None
-                try:
-                    token_data = self._request_access_token_refresh(refresh_token, account)
-                except TerminalRefreshTokenError as exc:
-                    error_str = str(exc)
-                    self.handle_invalid_token(
-                        active_token,
-                        event,
-                        error=error_str,
-                        remove=remove_invalid,
-                        expected_access_token=active_token,
-                        expected_refresh_token=refresh_token,
-                        token_refresh_error=error_str,
-                    )
-                    _, latest_account = self._get_account_for_token(active_token)
-                    latest_refresh_token = str((latest_account or {}).get("refresh_token") or "").strip()
-                    if not latest_account or latest_refresh_token == refresh_token:
-                        raise
-                    credentials_changed = RefreshCredentialsChangedError()
-                except Exception as exc:
-                    error_str = str(exc or "")
-                    recorded = self._record_token_refresh_error(
-                        active_token,
-                        event,
-                        error_str,
-                        expected_refresh_token=refresh_token,
-                    )
-                    if recorded:
-                        return active_token
-                    credentials_changed = RefreshCredentialsChangedError()
-                    _, latest_account = self._get_account_for_token(active_token)
-                else:
-                    try:
-                        return self._apply_refreshed_tokens(
-                            active_token,
-                            token_data,
-                            event,
-                            expected_refresh_token=refresh_token,
-                        )
-                    except RefreshCredentialsChangedError as exc:
-                        credentials_changed = exc
-                        _, latest_account = self._get_account_for_token(active_token)
 
-                latest_refresh_token = str((latest_account or {}).get("refresh_token") or "").strip()
-                if attempt == 0 and latest_account and latest_refresh_token and latest_refresh_token != refresh_token:
-                    account = latest_account
-                    active_token = str(account.get("access_token") or active_token)
+            key = (active_token, refresh_token)
+            if skip_if_image_busy:
+                with self._image_slot_condition:
+                    current_token = self._resolve_access_token_locked(active_token)
+                    current = self._accounts.get(current_token)
+                    current_refresh_token = str(
+                        (current or {}).get("refresh_token") or ""
+                    ).strip()
+                    if not current or (current_token, current_refresh_token) != key:
+                        if expected_credentials is not None or credential_attempt > 0:
+                            raise RefreshCredentialsChangedError()
+                        continue
+                    image_busy = int(self._image_inflight.get(current_token, 0)) > 1
+                    with self._oauth_refresh_flights_lock:
+                        future = self._oauth_refresh_flights.get(key)
+                        owner = future is None
+                        if future is None:
+                            if image_busy or not needs_refresh or refresh_backoff:
+                                return active_token
+                            future = Future()
+                            self._oauth_refresh_flights[key] = future
+            else:
+                with self._oauth_refresh_flights_lock:
+                    future = self._oauth_refresh_flights.get(key)
+                    owner = future is None
+                    if future is None:
+                        if not needs_refresh or refresh_backoff:
+                            return active_token
+                        future = Future()
+                        self._oauth_refresh_flights[key] = future
+            if owner:
+                try:
+                    result = self._refresh_access_token_owner(
+                        active_token,
+                        refresh_token,
+                        account,
+                        event=event,
+                        image_scope=image_scope,
+                    )
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+            try:
+                return future.result()
+            except TerminalRefreshTokenError as exc:
+                expected_access_token = str(
+                    getattr(exc, "expected_access_token", active_token) or active_token
+                )
+                expected_refresh_token = str(
+                    getattr(exc, "expected_refresh_token", refresh_token) or refresh_token
+                )
+                current_token, current_refresh_token, current = self._credential_snapshot(active_token)
+                if current and (current_token, current_refresh_token) != (
+                    expected_access_token,
+                    expected_refresh_token,
+                ):
+                    if expected_credentials is not None:
+                        raise RefreshCredentialsChangedError() from exc
+                    if credential_attempt == 0:
+                        continue
+                error_str = str(exc)
+                self.handle_invalid_token(
+                    active_token,
+                    event,
+                    error=error_str,
+                    remove=remove_invalid,
+                    expected_access_token=expected_access_token,
+                    expected_refresh_token=expected_refresh_token,
+                    token_refresh_error=error_str,
+                )
+                raise
+            except RefreshCredentialsChangedError:
+                if credential_attempt == 0 and expected_credentials is None:
                     continue
-                raise credentials_changed or RefreshCredentialsChangedError()
-            raise RefreshCredentialsChangedError()
+                raise
+            except Exception:
+                if raise_on_error:
+                    raise
+                current_token, current = self._get_account_for_token(active_token)
+                if current:
+                    return str(current.get("access_token") or current_token or active_token)
+                raise RefreshCredentialsChangedError()
+            finally:
+                if owner:
+                    with self._oauth_refresh_flights_lock:
+                        if self._oauth_refresh_flights.get(key) is future:
+                            self._oauth_refresh_flights.pop(key, None)
+        raise RefreshCredentialsChangedError()
 
     def list_expiring_access_tokens(self) -> list[str]:
         with self._lock:
@@ -797,6 +1009,7 @@ class AccountService:
                 token
                 for account in self._accounts.values()
                 if account.get("status") in {"正常", "限流"}
+                and account.get("last_remote_check_result") != "pending"
                 and str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
@@ -1022,7 +1235,20 @@ class AccountService:
                 raise
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                if config.image_preflight_token_refresh_enabled:
+                    access_token = self.refresh_access_token(
+                        access_token,
+                        force=True,
+                        event="get_available_access_token:forced_preflight",
+                        image_scope=True,
+                        skip_if_image_busy=True,
+                    )
+                    attempted_tokens.add(access_token)
+                account = self.fetch_remote_info(
+                    access_token,
+                    "get_available_access_token",
+                    image_scope=True,
+                )
             except Exception:
                 # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
                 # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
@@ -1063,7 +1289,11 @@ class AccountService:
                 candidates = [
                     token
                     for account in self._accounts.values()
-                    if self._is_account_selectable(account, allow_limited=True)
+                    if self._is_account_selectable(
+                        account,
+                        allow_limited=True,
+                        allow_image_pending=True,
+                    )
                        and (token := account.get("access_token") or "")
                        and token not in attempted
                 ]
@@ -1119,6 +1349,7 @@ class AccountService:
         remove: bool | None = None,
         expected_access_token: str | None = None,
         expected_refresh_token: str | None = None,
+        expected_remote_check_marker: _RemoteCheckMarker | None = None,
         token_refresh_error: str | None = None,
     ) -> bool:
         """统一处理鉴权异常账号。
@@ -1133,6 +1364,7 @@ class AccountService:
             remove=bool(should_remove),
             expected_access_token=expected_access_token,
             expected_refresh_token=expected_refresh_token,
+            expected_remote_check_marker=expected_remote_check_marker,
             token_refresh_error=token_refresh_error,
             quiet=quiet,
         )
@@ -1166,8 +1398,27 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "限流"
+                   and item.get("last_remote_check_result") != "pending"
                    and (token := item.get("access_token") or "")
             ]
+
+    def list_pending_auth_verification_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("last_remote_check_result") == "pending"
+                and item.get("pending_auth_scope") == "image"
+                and (token := str(item.get("access_token") or "").strip())
+            ]
+
+    def resume_pending_auth_verifications(self) -> int:
+        tokens = self.list_pending_auth_verification_tokens()
+        scheduled = 0
+        for token in tokens:
+            if self._schedule_account_refresh_after_image_failure(token):
+                scheduled += 1
+        return scheduled
 
     def _auto_remove_tokens_locked(
         self,
@@ -1265,6 +1516,7 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "正常"
+                   and item.get("last_remote_check_result") != "pending"
                    and (token := item.get("access_token") or "")
             ]
 
@@ -1537,7 +1789,31 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()] if return_items else []
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    @staticmethod
+    def _remote_check_marker(
+        account: dict | None,
+    ) -> _RemoteCheckMarker:
+        item = account or {}
+        return (
+            str(item.get("last_remote_check_result") or ""),
+            str(item.get("last_remote_check_attempt_at") or ""),
+            str(item.get("last_remote_check_event") or ""),
+            item.get("pending_auth_remove_invalid"),
+            str(item.get("pending_auth_scope") or ""),
+            str(item.get("pending_auth_verification_id") or ""),
+        )
+
+    def update_account(
+        self,
+        access_token: str,
+        updates: dict,
+        quiet: bool = False,
+        *,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        expected_remote_check_marker: _RemoteCheckMarker | None = None,
+        preserve_disabled: bool = False,
+    ) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1545,7 +1821,23 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            if expected_access_token is not None and (
+                access_token != str(expected_access_token or "").strip()
+            ):
+                return dict(current)
+            if expected_refresh_token is not None and (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                return dict(current)
+            if (
+                expected_remote_check_marker is not None
+                and self._remote_check_marker(current) != expected_remote_check_marker
+            ):
+                return dict(current)
             merged = {**current, **updates, "access_token": access_token}
+            if preserve_disabled and current.get("status") == "禁用":
+                merged["status"] = "禁用"
             if (
                 current.get("status") == "限流"
                 and "status" in updates
@@ -1575,51 +1867,85 @@ class AccountService:
     def _record_refresh_success(
         self,
         access_token: str,
+        updates: dict,
         event: str = "fetch_remote_info",
-    ) -> None:
+        *,
+        expected_access_token: str,
+        expected_refresh_token: str,
+        expected_remote_check_marker: _RemoteCheckMarker,
+    ) -> dict | None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
-            if current is None:
-                return
-            next_item = dict(current)
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
-            next_item["last_refresh_error"] = None
-            next_item["last_refresh_error_at"] = None
-            next_item["last_remote_checked_at"] = now
-            next_item["last_remote_check_attempt_at"] = now
-            next_item["last_remote_check_error"] = None
-            next_item["last_remote_check_error_at"] = None
-            next_item["last_remote_check_event"] = event
-            next_item["last_remote_check_result"] = "ok"
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[access_token] = account
+        return self.update_account(
+            access_token,
+            {
+                **updates,
+                "invalid_count": 0,
+                "last_invalid_at": None,
+                "last_refresh_error": None,
+                "last_refresh_error_at": None,
+                "last_remote_checked_at": now,
+                "last_remote_check_attempt_at": now,
+                "last_remote_check_error": None,
+                "last_remote_check_error_at": None,
+                "last_remote_check_event": event,
+                "last_remote_check_result": "ok",
+                "pending_auth_remove_invalid": None,
+                "pending_auth_scope": None,
+            },
+            quiet=True,
+            expected_access_token=expected_access_token,
+            expected_refresh_token=expected_refresh_token,
+            expected_remote_check_marker=expected_remote_check_marker,
+            preserve_disabled=True,
+        )
 
     def _record_remote_check_error(
         self,
         access_token: str,
         event: str,
         error: str,
-    ) -> None:
+        *,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        expected_remote_check_marker: _RemoteCheckMarker | None = None,
+    ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
-                return
+                return False
+            if expected_access_token is not None and (
+                access_token != str(expected_access_token or "").strip()
+            ):
+                return False
+            if expected_refresh_token is not None and (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                return False
+            if (
+                expected_remote_check_marker is not None
+                and self._remote_check_marker(current) != expected_remote_check_marker
+            ):
+                return False
             next_item = dict(current)
             next_item["last_remote_check_attempt_at"] = now
             next_item["last_remote_check_error"] = str(error or "remote check failed")
             next_item["last_remote_check_error_at"] = now
             next_item["last_remote_check_event"] = event
-            next_item["last_remote_check_result"] = "error"
+            current_result = str(current.get("last_remote_check_result") or "")
+            next_item["last_remote_check_result"] = (
+                "invalid" if current_result == "invalid" else "error"
+            )
+            next_item["pending_auth_remove_invalid"] = None
+            next_item["pending_auth_scope"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
                 self._save_accounts()
+                return True
+        return False
 
     def _apply_invalid_token_state(
         self,
@@ -1630,6 +1956,7 @@ class AccountService:
         remove: bool,
         expected_access_token: str | None = None,
         expected_refresh_token: str | None = None,
+        expected_remote_check_marker: _RemoteCheckMarker | None = None,
         token_refresh_error: str | None = None,
         quiet: bool = False,
     ) -> bool:
@@ -1649,27 +1976,46 @@ class AccountService:
                 != str(expected_refresh_token or "").strip()
             ):
                 return False
-
-            next_item = dict(current)
-            next_item["status"] = "禁用" if current.get("status") == "禁用" else "异常"
-            next_item["quota"] = 0
-            next_item["image_quota_unknown"] = True
-            next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
-            next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
-            next_item["last_refresh_error_at"] = now.isoformat()
-            next_item["last_remote_checked_at"] = now.isoformat()
-            next_item["last_remote_check_attempt_at"] = now.isoformat()
-            next_item["last_remote_check_error"] = str(error or "invalid access token")
-            next_item["last_remote_check_error_at"] = now.isoformat()
-            next_item["last_remote_check_event"] = event
-            next_item["last_remote_check_result"] = "invalid"
-            if token_refresh_error:
-                next_item["last_token_refresh_error"] = str(token_refresh_error)
-                next_item["last_token_refresh_error_at"] = now.isoformat()
-            account = self._normalize_account(next_item)
-            if account is None:
+            if (
+                expected_remote_check_marker is not None
+                and self._remote_check_marker(current) != expected_remote_check_marker
+            ):
                 return False
+
+            terminal_already_recorded = bool(
+                token_refresh_error
+                and current.get("status") in {"异常", "禁用"}
+                and current.get("last_remote_check_result") == "invalid"
+                and str(current.get("last_token_refresh_error") or "")
+                == str(token_refresh_error)
+            )
+            if terminal_already_recorded:
+                account = dict(current)
+                if not (remove and account.get("status") == "异常"):
+                    return False
+            else:
+                next_item = dict(current)
+                next_item["status"] = "禁用" if current.get("status") == "禁用" else "异常"
+                next_item["quota"] = 0
+                next_item["image_quota_unknown"] = True
+                next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+                next_item["last_invalid_at"] = now.isoformat()
+                next_item["last_refresh_error"] = str(error or "invalid access token")
+                next_item["last_refresh_error_at"] = now.isoformat()
+                next_item["last_remote_checked_at"] = now.isoformat()
+                next_item["last_remote_check_attempt_at"] = now.isoformat()
+                next_item["last_remote_check_error"] = str(error or "invalid access token")
+                next_item["last_remote_check_error_at"] = now.isoformat()
+                next_item["last_remote_check_event"] = event
+                next_item["last_remote_check_result"] = "invalid"
+                next_item["pending_auth_remove_invalid"] = None
+                next_item["pending_auth_scope"] = None
+                if token_refresh_error:
+                    next_item["last_token_refresh_error"] = str(token_refresh_error)
+                    next_item["last_token_refresh_error_at"] = now.isoformat()
+                account = self._normalize_account(next_item)
+                if account is None:
+                    return False
 
             final_status = str(account.get("status") or "异常")
             removed = bool(remove and final_status == "异常")
@@ -1686,16 +2032,17 @@ class AccountService:
                 self._accounts[access_token] = account
             self._save_accounts()
 
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
-                "账号鉴权确认失效" if final_status == "异常" else "已禁用账号鉴权确认失效",
-                {
-                    "source": event,
-                    "token": anonymize_token(access_token),
-                    "status": final_status,
-                    "error": str(error or ""),
-                },
-            )
+            if not terminal_already_recorded:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "账号鉴权确认失效" if final_status == "异常" else "已禁用账号鉴权确认失效",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "status": final_status,
+                        "error": str(error or ""),
+                    },
+                )
             if removed:
                 log_service.add(LOG_TYPE_ACCOUNT, "删除 1 个账号", {"removed": 1})
                 log_service.add(
@@ -1706,14 +2053,48 @@ class AccountService:
         return removed
 
     @staticmethod
-    def _mark_remote_check_pending(account: dict, event: str, now: str) -> None:
+    def _mark_remote_check_pending(
+        account: dict,
+        event: str,
+        now: str,
+        *,
+        remove_invalid: bool | None = None,
+        scope: str = "account",
+    ) -> None:
+        existing_scope = (
+            str(account.get("pending_auth_scope") or "").strip().lower()
+            if account.get("last_remote_check_result") == "pending"
+            else ""
+        )
         account["last_remote_check_result"] = "pending"
         account["last_remote_check_event"] = event
         account["last_remote_check_attempt_at"] = now
         account["last_remote_check_error"] = None
         account["last_remote_check_error_at"] = None
+        account["pending_auth_verification_id"] = uuid4().hex
+        account["pending_auth_scope"] = (
+            "account"
+            if existing_scope == "account" or scope != "image"
+            else "image"
+        )
+        requested_remove = (
+            config.auto_remove_invalid_accounts
+            if remove_invalid is None
+            else bool(remove_invalid)
+        )
+        existing_remove = account.get("pending_auth_remove_invalid")
+        account["pending_auth_remove_invalid"] = bool(existing_remove) or requested_remove
 
-    def schedule_auth_verification(self, access_token: str, event: str) -> bool:
+    def schedule_auth_verification(
+        self,
+        access_token: str,
+        event: str,
+        *,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        remove_invalid: bool | None = None,
+        scope: str = "account",
+    ) -> bool:
         """Block a rejected account now and verify it in the background."""
         if not access_token:
             return False
@@ -1723,8 +2104,21 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return False
+            if expected_access_token is not None and access_token != expected_access_token:
+                return False
+            if expected_refresh_token is not None and (
+                str(current.get("refresh_token") or "").strip()
+                != str(expected_refresh_token or "").strip()
+            ):
+                return False
             next_item = dict(current)
-            self._mark_remote_check_pending(next_item, event, now)
+            self._mark_remote_check_pending(
+                next_item,
+                event,
+                now,
+                remove_invalid=remove_invalid,
+                scope=scope,
+            )
             account = self._normalize_account(next_item)
             if account is None:
                 return False
@@ -1740,11 +2134,170 @@ class AccountService:
             )
         return scheduled
 
+    def _verify_pending_auth(self, access_token: str, event: str) -> None:
+        active_token, refresh_token, account = self._credential_snapshot(access_token)
+        if not account or account.get("last_remote_check_result") != "pending":
+            return
+        pending_remove = account.get("pending_auth_remove_invalid")
+        remove_invalid = (
+            config.auto_remove_invalid_accounts
+            if pending_remove is None
+            else self._bool_value(pending_remove)
+        )
+        initial_token = active_token
+        initial_refresh_token = refresh_token
+        initial_remote_check_marker = self._remote_check_marker(account)
+
+        from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+
+        def request_user_info(token: str) -> dict[str, Any]:
+            with self._image_auth_slot():
+                with OpenAIBackendAPI(token) as backend:
+                    return backend.get_user_info()
+
+        def reschedule_pending(token: str) -> None:
+            current_token, _, current = self._credential_snapshot(token)
+            if current and current.get("last_remote_check_result") == "pending":
+                self._schedule_account_refresh_after_image_failure(
+                    current_token,
+                    force=True,
+                )
+
+        def snapshot_changed(token: str, refresh: str) -> bool:
+            current_token, current_refresh, current = self._credential_snapshot(token)
+            if current and (current_token, current_refresh) == (token, refresh):
+                return False
+            return True
+
+        def request_user_info_for_snapshot(token: str, refresh: str) -> dict[str, Any]:
+            try:
+                result = request_user_info(token)
+            except Exception as exc:
+                if snapshot_changed(token, refresh):
+                    raise RefreshCredentialsChangedError() from exc
+                raise
+            if snapshot_changed(token, refresh):
+                raise RefreshCredentialsChangedError()
+            return result
+
+        try:
+            result = request_user_info_for_snapshot(initial_token, initial_refresh_token)
+        except InvalidAccessTokenError as initial_error:
+            if not initial_refresh_token:
+                self.handle_invalid_token(
+                    initial_token,
+                    event,
+                    error=str(initial_error),
+                    remove=remove_invalid,
+                    expected_access_token=initial_token,
+                    expected_refresh_token=initial_refresh_token,
+                    expected_remote_check_marker=initial_remote_check_marker,
+                )
+                reschedule_pending(initial_token)
+                return
+            try:
+                active_token = self.refresh_access_token(
+                    initial_token,
+                    force=True,
+                    event=f"{event}:auth_recovery",
+                    remove_invalid=remove_invalid,
+                    raise_on_error=True,
+                    image_scope=True,
+                    expected_credentials=(initial_token, initial_refresh_token),
+                )
+            except TerminalRefreshTokenError:
+                reschedule_pending(initial_token)
+                return
+            except Exception as exc:
+                self._record_remote_check_error(
+                    initial_token,
+                    event,
+                    str(exc),
+                    expected_access_token=initial_token,
+                    expected_refresh_token=initial_refresh_token,
+                    expected_remote_check_marker=initial_remote_check_marker,
+                )
+                reschedule_pending(initial_token)
+                return
+
+            verification_token, verification_refresh_token, verification_account = (
+                self._credential_snapshot(active_token)
+            )
+            if not verification_account:
+                return
+            verification_remote_check_marker = self._remote_check_marker(verification_account)
+            try:
+                result = request_user_info_for_snapshot(
+                    verification_token,
+                    verification_refresh_token,
+                )
+            except InvalidAccessTokenError as exc:
+                self.handle_invalid_token(
+                    verification_token,
+                    event,
+                    error=str(exc),
+                    remove=remove_invalid,
+                    expected_access_token=verification_token,
+                    expected_refresh_token=verification_refresh_token,
+                    expected_remote_check_marker=verification_remote_check_marker,
+                )
+                reschedule_pending(verification_token)
+                return
+            except Exception as exc:
+                self._record_remote_check_error(
+                    verification_token,
+                    event,
+                    str(exc),
+                    expected_access_token=verification_token,
+                    expected_refresh_token=verification_refresh_token,
+                    expected_remote_check_marker=verification_remote_check_marker,
+                )
+                reschedule_pending(verification_token)
+                return
+
+            self._record_refresh_success(
+                verification_token,
+                result,
+                event,
+                expected_access_token=verification_token,
+                expected_refresh_token=verification_refresh_token,
+                expected_remote_check_marker=verification_remote_check_marker,
+            )
+            reschedule_pending(verification_token)
+            return
+        except Exception as exc:
+            self._record_remote_check_error(
+                initial_token,
+                event,
+                str(exc),
+                expected_access_token=initial_token,
+                expected_refresh_token=initial_refresh_token,
+                expected_remote_check_marker=initial_remote_check_marker,
+            )
+            reschedule_pending(initial_token)
+            return
+
+        self._record_refresh_success(
+            initial_token,
+            result,
+            event,
+            expected_access_token=initial_token,
+            expected_refresh_token=initial_refresh_token,
+            expected_remote_check_marker=initial_remote_check_marker,
+        )
+        reschedule_pending(initial_token)
+
     def _refresh_account_after_image_failure(self, access_token: str) -> None:
         try:
             account = self.get_account(access_token) or {}
             event = str(account.get("last_remote_check_event") or "account_failure")
-            self.fetch_remote_info(access_token, event)
+            if account.get("last_remote_check_result") == "pending":
+                if account.get("pending_auth_scope") == "image":
+                    self._verify_pending_auth(access_token, event)
+                else:
+                    self.fetch_remote_info(access_token, event)
+            else:
+                self.fetch_remote_info(access_token, event)
         except Exception as exc:
             log_service.add(
                 LOG_TYPE_ACCOUNT,
@@ -1756,47 +2309,134 @@ class AccountService:
         if not access_token:
             return False
         now = time.monotonic()
-        with self._image_failure_refresh_lock:
-            cutoff = now - self._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS
-            self._image_failure_refresh_started_at = {
-                token: started_at
-                for token, started_at in self._image_failure_refresh_started_at.items()
-                if token in self._image_failure_refresh_active or started_at >= cutoff
-            }
-            last_started_at = self._image_failure_refresh_started_at.get(access_token, 0.0)
-            if (
-                access_token in self._image_failure_refresh_active
-                or access_token in self._image_failure_refresh_pending_set
-            ):
-                return True
-            if not force and now - last_started_at < self._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS:
-                return False
-            self._image_failure_refresh_pending.append(access_token)
-            self._image_failure_refresh_pending_set.add(access_token)
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(access_token) or {}
+            requested_scope = (
+                "image" if account.get("pending_auth_scope") == "image" else "account"
+            )
+            with self._image_failure_refresh_lock:
+                cutoff = now - self._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS
+                self._image_failure_refresh_started_at = {
+                    token: started_at
+                    for token, started_at in self._image_failure_refresh_started_at.items()
+                    if token in self._image_failure_refresh_active or started_at >= cutoff
+                }
+                active_refresh_token = next(
+                    (
+                        token for token in self._image_failure_refresh_active
+                        if self._resolve_access_token_locked(token) == access_token
+                    ),
+                    None,
+                )
+                pending_refresh_token = next(
+                    (
+                        token for token in self._image_failure_refresh_pending_set
+                        if self._resolve_access_token_locked(token) == access_token
+                    ),
+                    None,
+                )
+                last_started_at = max(
+                    (
+                        started_at
+                        for token, started_at in self._image_failure_refresh_started_at.items()
+                        if self._resolve_access_token_locked(token) == access_token
+                    ),
+                    default=0.0,
+                )
+                if active_refresh_token is not None:
+                    if force:
+                        self._image_failure_refresh_rerun.add(active_refresh_token)
+                    return True
+                if pending_refresh_token is not None:
+                    existing_scope = self._image_failure_refresh_pending_scopes.get(
+                        pending_refresh_token,
+                        "account",
+                    )
+                    self._image_failure_refresh_pending_scopes[pending_refresh_token] = (
+                        "account"
+                        if "account" in {existing_scope, requested_scope}
+                        else "image"
+                    )
+                    return True
+                if (
+                    not force
+                    and now - last_started_at < self._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS
+                ):
+                    return False
+                self._image_failure_refresh_pending.append(access_token)
+                self._image_failure_refresh_pending_set.add(access_token)
+                self._image_failure_refresh_pending_scopes[access_token] = requested_scope
         self._start_pending_image_failure_refreshes()
         return True
 
     def _start_pending_image_failure_refreshes(self) -> None:
         while True:
             with self._image_failure_refresh_lock:
-                if (
-                    len(self._image_failure_refresh_active) >= self._IMAGE_FAILURE_REFRESH_MAX_CONCURRENT
-                    or not self._image_failure_refresh_pending
-                ):
+                if not self._image_failure_refresh_pending:
                     return
-                access_token = self._image_failure_refresh_pending.popleft()
+
+                active_counts = {"account": 0, "image": 0}
+                for token in self._image_failure_refresh_active:
+                    scope = self._image_failure_refresh_active_scopes.get(token, "account")
+                    active_counts[scope] = active_counts.get(scope, 0) + 1
+
+                selected: tuple[str, str] | None = None
+                for _ in range(len(self._image_failure_refresh_pending)):
+                    token = self._image_failure_refresh_pending.popleft()
+                    scope = self._image_failure_refresh_pending_scopes.get(token, "account")
+                    limit = (
+                        config.image_auth_refresh_concurrency
+                        if scope == "image"
+                        else self._IMAGE_FAILURE_REFRESH_MAX_CONCURRENT
+                    )
+                    if active_counts.get(scope, 0) < limit:
+                        selected = (token, scope)
+                        break
+                    self._image_failure_refresh_pending.append(token)
+                if selected is None:
+                    return
+
+                access_token, refresh_scope = selected
                 self._image_failure_refresh_pending_set.discard(access_token)
+                self._image_failure_refresh_pending_scopes.pop(access_token, None)
                 self._image_failure_refresh_active.add(access_token)
+                self._image_failure_refresh_active_scopes[access_token] = refresh_scope
                 self._image_failure_refresh_started_at[access_token] = time.monotonic()
 
             def refresh(token: str = access_token) -> None:
                 try:
                     self._refresh_account_after_image_failure(token)
                 finally:
-                    with self._image_failure_refresh_lock:
-                        self._image_failure_refresh_active.discard(token)
+                    with self._lock:
+                        resolved_token = self._resolve_access_token_locked(token)
+                        account = self._accounts.get(resolved_token)
+                        with self._image_failure_refresh_lock:
+                            self._image_failure_refresh_active.discard(token)
+                            self._image_failure_refresh_active_scopes.pop(token, None)
+                            rerun_requested = token in self._image_failure_refresh_rerun
+                            self._image_failure_refresh_rerun.discard(token)
+                            if (
+                                rerun_requested
+                                and account is not None
+                                and account.get("last_remote_check_result") == "pending"
+                                and resolved_token not in self._image_failure_refresh_pending_set
+                            ):
+                                self._image_failure_refresh_pending.append(resolved_token)
+                                self._image_failure_refresh_pending_set.add(resolved_token)
+                                self._image_failure_refresh_pending_scopes[resolved_token] = (
+                                    "image"
+                                    if account.get("pending_auth_scope") == "image"
+                                    else "account"
+                                )
                     self._start_pending_image_failure_refreshes()
 
+            (
+                expected_access_token,
+                expected_refresh_token,
+                expected_account,
+            ) = self._credential_snapshot(access_token)
+            expected_remote_check_marker = self._remote_check_marker(expected_account)
             try:
                 Thread(
                     target=refresh,
@@ -1806,7 +2446,15 @@ class AccountService:
             except Exception as exc:
                 with self._image_failure_refresh_lock:
                     self._image_failure_refresh_active.discard(access_token)
-                self._record_remote_check_error(access_token, "image_failure", str(exc))
+                    self._image_failure_refresh_active_scopes.pop(access_token, None)
+                self._record_remote_check_error(
+                    access_token,
+                    "image_failure",
+                    str(exc),
+                    expected_access_token=expected_access_token,
+                    expected_refresh_token=expected_refresh_token,
+                    expected_remote_check_marker=expected_remote_check_marker,
+                )
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "image failure refresh scheduling failed",
@@ -1819,15 +2467,18 @@ class AccountService:
         success: bool,
         *,
         failure: ImageFailure | None = None,
+        quota_consumed: bool | None = None,
         capabilities: set[str] | tuple[str, ...] | None = None,
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
     ) -> dict | None:
         # Retained as call metadata only; capability-specific account state is gone.
         _ = capabilities
         if not access_token:
             return None
         now = datetime.now(timezone.utc)
-        should_refresh_after_failure = False
-        verification_must_finish = False
+        should_verify_after_failure = False
+        consumed_quota = success if quota_consumed is None else bool(quota_consumed)
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             self._release_image_slot_locked(access_token)
@@ -1835,11 +2486,19 @@ class AccountService:
                 current = self._accounts.get(access_token)
                 if current is None:
                     return None
+                if expected_access_token is not None and access_token != expected_access_token:
+                    return dict(current)
+                if expected_refresh_token is not None and (
+                    str(current.get("refresh_token") or "").strip()
+                    != str(expected_refresh_token or "").strip()
+                ):
+                    return dict(current)
                 next_item = dict(current)
                 next_item["last_used_at"] = now.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1
+                if consumed_quota:
                     if not image_quota_unknown:
                         current_quota = max(0, int(next_item.get("quota") or 0))
                         next_item["quota"] = max(0, current_quota - 1)
@@ -1849,23 +2508,19 @@ class AccountService:
                             next_item["image_quota_unknown"] = True
                             next_item["last_quota_estimated_empty_at"] = now.isoformat()
                     if next_item.get("status") == "限流":
-                        # 如果极端竞态下限流账号仍然成功出图，说明远程额度已恢复。
+                        # 上游已经消耗图片额度，说明远程额度已恢复。
                         next_item["status"] = "正常"
                         next_item["image_quota_unknown"] = True
                         next_item["restore_at"] = None
-                else:
-                    # Only failures explicitly attributed to the selected account
-                    # affect account statistics. Request and delivery failures only
-                    # release the slot.
-                    account_failed = bool(failure and failure.account_failure)
-                    if account_failed:
-                        next_item["fail"] = int(next_item.get("fail") or 0) + 1
-                        should_refresh_after_failure = bool(failure.refresh_account)
-                        if failure.code == "auth_invalid":
-                            # A request-level auth failure is not a final account
-                            # state until the background remote check confirms it.
-                            self._mark_remote_check_pending(next_item, "image_failure", now.isoformat())
-                            verification_must_finish = True
+                if not success and failure is not None and failure.verify_account:
+                    next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                    self._mark_remote_check_pending(
+                        next_item,
+                        "image_failure",
+                        now.isoformat(),
+                        scope="image",
+                    )
+                    should_verify_after_failure = True
                 account = self._normalize_account(next_item)
                 if account is None:
                     return None
@@ -1874,12 +2529,12 @@ class AccountService:
                 result = dict(account)
             finally:
                 self._image_slot_condition.notify_all()
-        if should_refresh_after_failure:
+        if should_verify_after_failure:
             scheduled = self._schedule_account_refresh_after_image_failure(
                 access_token,
-                force=verification_must_finish,
+                force=True,
             )
-            if verification_must_finish and not scheduled:
+            if not scheduled:
                 self._record_remote_check_error(
                     access_token,
                     "image_failure",
@@ -1892,97 +2547,177 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         remove_invalid: bool | None = None,
+        *,
+        image_scope: bool = False,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(
-            access_token,
-            event=f"{event}:preflight",
-            remove_invalid=remove_invalid,
-        )
+        refresh_kwargs = {
+            "event": f"{event}:preflight",
+            "remove_invalid": remove_invalid,
+        }
+        if image_scope:
+            refresh_kwargs["image_scope"] = True
+        active_token = self.refresh_access_token(access_token, **refresh_kwargs)
+        from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+
+        def request_user_info(token: str) -> dict[str, Any]:
+            if image_scope:
+                with self._image_auth_slot():
+                    with OpenAIBackendAPI(token) as backend:
+                        return backend.get_user_info()
+            with OpenAIBackendAPI(token) as backend:
+                return backend.get_user_info()
+
+        request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)
+        if not request_account:
+            raise RefreshCredentialsChangedError()
+        successful_snapshot = (request_token, request_refresh_token)
+        successful_remote_check_marker = self._remote_check_marker(request_account)
         try:
-            from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            with OpenAIBackendAPI(active_token) as backend:
-                result = backend.get_user_info()
+            result = request_user_info(request_token)
         except InvalidAccessTokenError as exc:
-            auth_error: InvalidAccessTokenError | None = exc
-            current_token = self.resolve_access_token(active_token)
-            if current_token and current_token != active_token and self.get_account(current_token):
-                active_token = current_token
+            rejected_error: InvalidAccessTokenError | None = exc
+            rejected_snapshot = (request_token, request_refresh_token)
+            current_token, current_refresh_token, current_account = self._credential_snapshot(request_token)
+            current_snapshot = (current_token, current_refresh_token)
+            current_remote_check_marker = self._remote_check_marker(current_account)
+            if current_account and current_snapshot != rejected_snapshot:
                 try:
-                    with OpenAIBackendAPI(active_token) as backend:
-                        result = backend.get_user_info()
+                    result = request_user_info(current_token)
                 except InvalidAccessTokenError as current_exc:
-                    auth_error = current_exc
+                    rejected_error = current_exc
+                    rejected_snapshot = current_snapshot
                 except Exception as current_exc:
-                    self._record_remote_check_error(active_token, event, str(current_exc))
+                    self._record_remote_check_error(
+                        current_token,
+                        event,
+                        str(current_exc),
+                        expected_access_token=current_token,
+                        expected_refresh_token=current_refresh_token,
+                        expected_remote_check_marker=current_remote_check_marker,
+                    )
                     raise
                 else:
-                    auth_error = None
+                    successful_snapshot = current_snapshot
+                    successful_remote_check_marker = current_remote_check_marker
+                    active_token = current_token
+                    rejected_error = None
 
-            if auth_error is not None:
-                before_refresh = self.get_account(active_token) or {}
+            if rejected_error is not None:
+                if image_scope:
+                    self.schedule_auth_verification(
+                        rejected_snapshot[0],
+                        event,
+                        expected_access_token=rejected_snapshot[0],
+                        expected_refresh_token=rejected_snapshot[1],
+                        remove_invalid=remove_invalid,
+                        scope="image",
+                    )
+                    raise rejected_error
+
+                before_refresh = self.get_account(rejected_snapshot[0]) or {}
                 before_refresh_at = str(before_refresh.get("last_token_refresh_at") or "")
                 before_error_at = str(before_refresh.get("last_token_refresh_error_at") or "")
-                refreshed_token = self.refresh_access_token(
-                    active_token,
-                    force=True,
-                    event=f"{event}:invalid_access_token",
-                    remove_invalid=remove_invalid,
-                )
-                after_refresh = self.get_account(refreshed_token or active_token) or {}
+                try:
+                    active_token = self.refresh_access_token(
+                        rejected_snapshot[0],
+                        force=True,
+                        event=f"{event}:invalid_access_token",
+                        remove_invalid=remove_invalid,
+                    )
+                except (TerminalRefreshTokenError, RefreshCredentialsChangedError):
+                    raise
+                except Exception as refresh_exc:
+                    self._record_remote_check_error(
+                        rejected_snapshot[0],
+                        event,
+                        str(refresh_exc),
+                        expected_access_token=rejected_snapshot[0],
+                        expected_refresh_token=rejected_snapshot[1],
+                        expected_remote_check_marker=current_remote_check_marker,
+                    )
+                    raise
+
+                after_refresh = self.get_account(active_token or rejected_snapshot[0]) or {}
                 after_refresh_at = str(after_refresh.get("last_token_refresh_at") or "")
                 after_error_at = str(after_refresh.get("last_token_refresh_error_at") or "")
                 refresh_failed = bool(after_error_at and after_error_at != before_error_at)
                 refresh_succeeded = bool(after_refresh_at and after_refresh_at != before_refresh_at)
-                if refresh_failed:
-                    refresh_error = str(after_refresh.get("last_token_refresh_error") or "refresh token failed")
+                if refresh_failed and not refresh_succeeded:
                     self._record_remote_check_error(
-                        active_token,
+                        rejected_snapshot[0],
                         event,
-                        f"access token rejected; recovery check failed: {refresh_error}",
+                        str(
+                            after_refresh.get("last_token_refresh_error")
+                            or "refresh token failed"
+                        ),
+                        expected_access_token=rejected_snapshot[0],
+                        expected_refresh_token=rejected_snapshot[1],
+                        expected_remote_check_marker=current_remote_check_marker,
                     )
-                    raise auth_error
-                if refreshed_token and (refreshed_token != active_token or refresh_succeeded):
-                    try:
-                        with OpenAIBackendAPI(refreshed_token) as backend:
-                            result = backend.get_user_info()
-                    except InvalidAccessTokenError as retry_exc:
-                        self.handle_invalid_token(
-                            refreshed_token,
-                            event,
-                            error=str(retry_exc),
-                            remove=remove_invalid,
-                            expected_access_token=refreshed_token,
-                        )
-                        raise
-                    except Exception as retry_exc:
-                        self._record_remote_check_error(refreshed_token, event, str(retry_exc))
-                        raise
-                    active_token = refreshed_token
-                else:
+                    raise rejected_error
+
+                verification_token, verification_refresh_token, verification_account = (
+                    self._credential_snapshot(active_token)
+                )
+                if not verification_account:
+                    raise RefreshCredentialsChangedError()
+                verification_remote_check_marker = self._remote_check_marker(verification_account)
+                try:
+                    result = request_user_info(verification_token)
+                except InvalidAccessTokenError as retry_exc:
                     self.handle_invalid_token(
-                        active_token,
+                        verification_token,
                         event,
-                        error=str(auth_error),
+                        error=str(retry_exc),
                         remove=remove_invalid,
-                        expected_access_token=active_token,
+                        expected_access_token=verification_token,
+                        expected_refresh_token=verification_refresh_token,
+                        expected_remote_check_marker=verification_remote_check_marker,
                     )
-                    raise auth_error
+                    raise
+                except Exception as retry_exc:
+                    self._record_remote_check_error(
+                        verification_token,
+                        event,
+                        str(retry_exc),
+                        expected_access_token=verification_token,
+                        expected_refresh_token=verification_refresh_token,
+                        expected_remote_check_marker=verification_remote_check_marker,
+                    )
+                    raise
+                active_token = verification_token
+                successful_snapshot = (verification_token, verification_refresh_token)
+                successful_remote_check_marker = verification_remote_check_marker
         except Exception as exc:
-            self._record_remote_check_error(active_token, event, str(exc))
+            self._record_remote_check_error(
+                request_token,
+                event,
+                str(exc),
+                expected_access_token=request_token,
+                expected_refresh_token=request_refresh_token,
+                expected_remote_check_marker=successful_remote_check_marker,
+            )
             raise
-        current = self.get_account(active_token) or {}
-        if current.get("status") == "禁用":
-            result = {**result, "status": "禁用"}
-        self._record_refresh_success(active_token, event)
-        updated = self.update_account(active_token, result)
+
+        updated = self._record_refresh_success(
+            active_token,
+            result,
+            event,
+            expected_access_token=successful_snapshot[0],
+            expected_refresh_token=successful_snapshot[1],
+            expected_remote_check_marker=successful_remote_check_marker,
+        )
         if updated is not None:
             return updated
         # update_account 可能因为“自动移除额度耗尽账号”删除了远程确认限流的账号。
         # 调用方仍需要知道本次预检的真实结果，不能把它混成普通预检失败。
-        return {**result, "access_token": active_token, "_removed_after_refresh": True}
+        if str(result.get("status") or "") == "\u9650\u6d41" and config.auto_remove_rate_limited_accounts:
+            return {**result, "access_token": active_token, "_removed_after_refresh": True}
+        # A deleted account must not leak its stale token back into the selection path.
+        raise RefreshCredentialsChangedError()
 
     # ---- 刷新进度追踪 ----
 
