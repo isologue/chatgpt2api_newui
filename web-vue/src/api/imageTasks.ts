@@ -157,24 +157,25 @@ export const STANDARD_IMAGE_SIZE_OPTIONS: ImageSizeOption[] = STANDARD_IMAGE_SIZ
 export const HIGH_RES_IMAGE_SIZE_OPTIONS: ImageSizeOption[] = HIGH_RES_IMAGE_SIZE_PRESETS
 export const IMAGE_SIZE_OPTIONS: ImageSizeOption[] = IMAGE_SIZE_PRESETS
 
-export function supportsHighResolutionImageSizes(model: string) {
+export function supportsHighResolutionImageSizes(model: string, upscaleEnabled = false) {
+  if (upscaleEnabled) return true
   const value = String(model || '').toLowerCase()
   return value.includes('codex-gpt-image-2') || value.includes('gpt-image-2-codex')
 }
 
-export function resolveImageSizePresets(model: string): ImageSizePreset[] {
-  return supportsHighResolutionImageSizes(model)
+export function resolveImageSizePresets(model: string, upscaleEnabled = false): ImageSizePreset[] {
+  return supportsHighResolutionImageSizes(model, upscaleEnabled)
     ? IMAGE_SIZE_PRESETS
     : STANDARD_IMAGE_SIZE_PRESETS
 }
 
-export function resolveImageSizeOptions(model: string): ImageSizeOption[] {
-  return resolveImageSizePresets(model)
+export function resolveImageSizeOptions(model: string, upscaleEnabled = false): ImageSizeOption[] {
+  return resolveImageSizePresets(model, upscaleEnabled)
 }
 
-export function isImageSizeSupportedByModel(size: string, model: string) {
+export function isImageSizeSupportedByModel(size: string, model: string, upscaleEnabled = false) {
   if (!size || size === DEFAULT_IMAGE_SIZE) return true
-  return resolveImageSizeOptions(model).some((option) => option.value === size)
+  return resolveImageSizeOptions(model, upscaleEnabled).some((option) => option.value === size)
 }
 
 export const IMAGE_QUALITY_OPTIONS = [

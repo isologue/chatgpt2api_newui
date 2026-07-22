@@ -48,4 +48,5 @@ test/
 tests/
 docs/*.md
 scripts/test_*.py
+scripts/image_upscale/node_modules/
 web/

@@ -7,6 +7,7 @@ from collections import Counter, deque
 from threading import Lock
 from typing import Any
 
+from services.image_failure import is_text_review_failure_code
 from utils.timezone import beijing_from_timestamp, beijing_now_str
 
 
@@ -299,6 +300,11 @@ class RealtimeMonitorService:
         if not call_id:
             return
         status = str(detail.get("status") or "success").strip().lower() or "success"
+        failure_code = detail.get("error_code") or detail.get("failure_code")
+        if is_text_review_failure_code(failure_code):
+            status = "text_review"
+        stage = "completed" if status == "success" else status if status == "text_review" else "failed"
+        stage_label = "文本" if status == "text_review" else STAGE_LABELS[stage]
         with self._lock:
             record = self._active.pop(call_id, None)
             if record is None:
@@ -311,8 +317,8 @@ class RealtimeMonitorService:
                     "role": str(detail.get("role") or ""),
                     "key_name": str(detail.get("key_name") or ""),
                     "status": status,
-                    "stage": "completed" if status == "success" else "failed",
-                    "stage_label": STAGE_LABELS["completed"] if status == "success" else STAGE_LABELS["failed"],
+                    "stage": stage,
+                    "stage_label": stage_label,
                     "started_ts": time.time() - (_int_ms(detail.get("duration_ms")) / 1000),
                     "stage_started_ts": time.time(),
                     "started_at": str(detail.get("started_at") or ""),
@@ -323,8 +329,8 @@ class RealtimeMonitorService:
                 }
 
             record["status"] = status
-            record["stage"] = "completed" if status == "success" else "failed"
-            record["stage_label"] = STAGE_LABELS["completed"] if status == "success" else STAGE_LABELS["failed"]
+            record["stage"] = stage
+            record["stage_label"] = stage_label
             record["ended_at"] = str(detail.get("ended_at") or beijing_now_str())
             record["updated_at"] = record["ended_at"]
             record["duration_ms"] = _int_ms(detail.get("duration_ms"))
@@ -352,6 +358,7 @@ class RealtimeMonitorService:
             all_events = [dict(item) for item in self._events if item.get("call_id") == call_id]
             self._merge_captured_image_attempts(detail, record.pop("_image_attempts", None))
             self._attach_image_attempt_monitors(detail, all_events)
+            self._attach_image_retry_summary(detail, record)
             self._attach_image_result_summary(detail, record)
             events = all_events[-60:]
             diagnostic = self._detail_diagnostic(record, events)
@@ -441,6 +448,8 @@ class RealtimeMonitorService:
         self._merge_metric_dict(metrics, metric_data)
         if data.get("account_email"):
             record["account_email"] = _mask_email(data.get("account_email"))
+        if data.get("previous_account_email"):
+            record["previous_account_email"] = _mask_email(data.get("previous_account_email"))
         if data.get("conversation_id"):
             record["conversation_id"] = str(data.get("conversation_id") or "")
         if data.get("model") and not record.get("model"):
@@ -479,6 +488,16 @@ class RealtimeMonitorService:
                 image["account_email"] = _mask_slot_email(data.get("account_email"))
             if data.get("status"):
                 image["status"] = str(data.get("status") or "")
+            if data.get("account_email"):
+                image["account_email"] = _mask_email(data.get("account_email"))
+            if data.get("previous_account_email"):
+                image["previous_account_email"] = _mask_email(data.get("previous_account_email"))
+            if _int_ms(data.get("attempt")) > 0:
+                image["account_attempt"] = _int_ms(data.get("attempt"))
+            if _int_ms(data.get("max_account_attempts")) > 0:
+                image["max_account_attempts"] = _int_ms(data.get("max_account_attempts"))
+            if "account_switch_count" in data:
+                image["account_switch_count"] = _int_ms(data.get("account_switch_count"))
             if data.get("returned_result") is not None:
                 image["returned_result"] = bool(data.get("returned_result"))
             if data.get("returned_message") is not None:
@@ -504,6 +523,27 @@ class RealtimeMonitorService:
             if "has_proxy" in data:
                 image["has_proxy"] = bool(data.get("has_proxy"))
             self._merge_metric_dict(image.setdefault("metrics", {}), metric_data)
+            self._merge_image_account_summary(record)
+
+    @staticmethod
+    def _merge_image_account_summary(record: dict[str, Any]) -> None:
+        images = record.get("images")
+        if not isinstance(images, dict):
+            return
+        image_items = [item for item in images.values() if isinstance(item, dict)]
+        if not image_items:
+            return
+        record["image_account_attempt"] = max(
+            (_int_ms(item.get("account_attempt")) for item in image_items),
+            default=0,
+        )
+        record["image_account_max_attempts"] = max(
+            (_int_ms(item.get("max_account_attempts")) for item in image_items),
+            default=0,
+        )
+        record["image_account_switch_count"] = sum(
+            _int_ms(item.get("account_switch_count")) for item in image_items
+        )
 
     @staticmethod
     def _merge_failure_fields(target: dict[str, Any], values: dict[str, Any]) -> None:
@@ -626,6 +666,21 @@ class RealtimeMonitorService:
             detail["image_attempts"] = [merged[key] for key in sorted(merged)]
 
     @staticmethod
+    def _attach_image_retry_summary(detail: dict[str, Any], record: dict[str, Any]) -> None:
+        attempts = detail.get("image_attempts")
+        attempt_items = (
+            [item for item in attempts if isinstance(item, dict)]
+            if isinstance(attempts, list)
+            else []
+        )
+        switch_count = sum(1 for item in attempt_items if item.get("switched_account") is True)
+        summary = {
+            "image_account_switched": switch_count > 0,
+            "image_account_switch_count": switch_count,
+        }
+        record.update(summary)
+
+    @staticmethod
     def _attach_image_result_summary(detail: dict[str, Any], record: dict[str, Any]) -> None:
         attempts = detail.get("image_attempts")
         attempt_items = (
@@ -673,37 +728,24 @@ class RealtimeMonitorService:
 
     def _summary(self, active: list[dict[str, Any]], completed: list[dict[str, Any]]) -> dict[str, Any]:
         success = sum(1 for item in completed if str(item.get("status") or "").lower() == "success")
-        failed = len(completed) - success
+        text_review = sum(
+            1
+            for item in completed
+            if str(item.get("status") or "").lower() == "text_review"
+            or is_text_review_failure_code(item.get("error_code") or item.get("failure_code"))
+        )
+        failed = max(0, len(completed) - success - text_review)
+        measured = success + failed
+        account_switch_requests = sum(1 for item in completed if item.get("image_account_switched") is True)
+        account_switches = sum(_int_ms(item.get("image_account_switch_count")) for item in completed)
+        account_switch_success = sum(
+            1
+            for item in completed
+            if item.get("image_account_switched") is True
+            and str(item.get("status") or "").lower() == "success"
+        )
         durations = [_int_ms(item.get("duration_ms")) for item in completed if _int_ms(item.get("duration_ms"))]
         metric_p95 = {key: self._percentile(self._metric_values(completed, key), 95) for key in METRIC_LABELS}
-        bottleneck_key = max(
-            (
-                "handler_queue_ms",
-                "stream_first_queue_ms",
-                "account_wait_ms",
-                "egress_wait_ms",
-                "egress_acquire_ms",
-                "upload_ms",
-                "bootstrap_ms",
-                "requirements_ms",
-                "prepare_conversation_ms",
-                "generation_start_ms",
-                "http_ttfb_ms",
-                "http_wait_ms",
-                "sse_first_event_ms",
-                "sse_max_gap_ms",
-                "conversation_stream_ms",
-                "stream_error_ms",
-                "poll_wait_ms",
-                "poll_request_ms",
-                "resolve_ms",
-                "download_ms",
-            ),
-            key=lambda key: metric_p95.get(key, 0),
-            default="",
-        )
-        if metric_p95.get(bottleneck_key, 0) <= 0:
-            bottleneck_key = ""
         models = Counter(str(item.get("model") or "unknown") for item in completed if item.get("model"))
         active_models = Counter(str(item.get("model") or "unknown") for item in active if item.get("model"))
         active_egress = Counter(self._egress_label(item) for item in active)
@@ -713,7 +755,18 @@ class RealtimeMonitorService:
             "completed": len(completed),
             "success": success,
             "failed": failed,
-            "success_rate": round(success * 100 / len(completed), 1) if completed else 0,
+            "text_review": text_review,
+            "success_rate": round(success * 100 / measured, 1) if measured else 0,
+            "account_switch_requests": account_switch_requests,
+            "account_switches": account_switches,
+            "account_switch_success": account_switch_success,
+            "account_switch_recovery_rate": (
+                round(account_switch_success * 100 / account_switch_requests, 1)
+                if account_switch_requests else 0
+            ),
+            "stream_error_requests": sum(
+                1 for item in completed if self._metric_value(item, "stream_error_ms") > 0
+            ),
             "avg_duration_ms": round(sum(durations) / len(durations)) if durations else 0,
             "p95_duration_ms": self._percentile(durations, 95),
             "metric_p95": metric_p95,
@@ -724,11 +777,6 @@ class RealtimeMonitorService:
                 "egress_wait": sum(1 for item in completed if self._metric_value(item, "egress_wait_ms") >= 1000),
                 "total_over_120s": sum(1 for item in completed if _int_ms(item.get("duration_ms")) >= 120000),
                 "local_reject_or_busy": sum(1 for item in completed if self._is_local_reject_or_busy(item)),
-            },
-            "bottleneck": {
-                "key": bottleneck_key,
-                "label": METRIC_LABELS.get(bottleneck_key, ""),
-                "value_ms": metric_p95.get(bottleneck_key, 0),
             },
             "by_model": dict(models.most_common(10)),
             "active_by_model": dict(active_models.most_common(10)),
@@ -923,6 +971,10 @@ class RealtimeMonitorService:
                 "index",
                 "total",
                 "attempt",
+                "account_email",
+                "previous_account_email",
+                "account_switch_count",
+                "max_account_attempts",
                 "status",
                 "account_wait_ms",
                 "egress_wait_ms",

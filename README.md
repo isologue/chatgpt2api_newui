@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" />
 </p>
-<p align="center"><strong>当前稳定版本：v2.6.2</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.6.2">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
+<p align="center"><strong>当前稳定版本：v2.7.0</strong> | <a href="https://github.com/yukkcat/chatgpt2api/releases/tag/v2.7.0">发布说明</a> | <a href="https://github.com/yukkcat/chatgpt2api/releases">全部版本</a></p>
 
 ---
 
@@ -104,7 +104,7 @@ curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/main/deploy/ins
 固定安装当前稳定版：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.6.2/deploy/install.sh | sudo bash -s -- --branch v2.6.2
+curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/v2.7.0/deploy/install.sh | sudo bash -s -- --branch v2.7.0
 ```
 
 ### Docker 运行
@@ -248,10 +248,10 @@ environment:
 
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `image_stream_timeout_secs` | `300` | 图片上游 SSE / HTTP 流最长等待时间。 |
-| `image_poll_timeout_secs` | `300` | 图片结果解析和轮询最长等待时间。 |
+| `image_stream_timeout_secs` | `80` | 图片上游 SSE / HTTP 流最长等待时间。 |
+| `image_poll_timeout_secs` | `60` | 图片结果解析和轮询最长等待时间。 |
 | `image_parallel_generation` | `true` | 多图请求是否并行生成。 |
-| `image_account_concurrency` | `3` | 单账号图片并发上限。 |
+| `image_account_concurrency` | `1` | 单账号图片并发上限，可设置为 1–3。 |
 | `image_remove_conversation_after_result` | `false` | 图片成功保存后尝试隐藏上游 ChatGPT 官网会话。 |
 | `auto_remove_invalid_accounts` | `true` | 鉴权失效账号是否自动移除。 |
 | `auto_remove_rate_limited_accounts` | `false` | 远程确认图片额度耗尽后是否自动移除账号。 |

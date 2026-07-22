@@ -63,11 +63,7 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        tasks = await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
-        stats = await run_in_threadpool(account_service.get_stats)
-        if isinstance(tasks, dict):
-            return {**tasks, "quota_summary": _image_quota_payload(stats)}
-        return tasks
+        return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
     @router.get("/api/image-tasks/quota")
     async def image_quota_summary(

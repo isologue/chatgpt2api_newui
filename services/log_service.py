@@ -23,6 +23,7 @@ from services.image_failure import (
     classify_image_exception,
     is_rate_limit_failure_code,
     is_structured_failure,
+    is_text_review_failure_code,
     public_image_error_message,
 )
 from services.protocol.error_response import anthropic_error_response, openai_error_response
@@ -119,7 +120,19 @@ class LogService:
         return str(value or "").strip()
 
     @classmethod
+    def _is_text_review(cls, item: dict[str, Any]) -> bool:
+        status = cls._clean(cls._detail_value(item, "status")).lower()
+        failure_code = cls._detail_value(
+            item,
+            "error_code",
+            cls._detail_value(item, "failure_code"),
+        )
+        return status == "text_review" or is_text_review_failure_code(failure_code)
+
+    @classmethod
     def _is_failed(cls, item: dict[str, Any]) -> bool:
+        if cls._is_text_review(item):
+            return False
         return is_structured_failure(
             status=cls._detail_value(item, "status"),
             error=cls._detail_value(item, "error"),
@@ -381,6 +394,7 @@ class LogService:
             "stats": {
                 "total": total,
                 "success": int(stats["success"]),
+                "text_review": int(stats["text_review"]),
                 "failed": int(stats["failed"]),
                 "limited": int(stats["limited"]),
                 "image": int(stats["image"]),
@@ -409,7 +423,9 @@ class LogService:
         if account_label:
             accounts[account_label] += 1
 
-        if status_label.lower() == "success":
+        if self._is_text_review(item):
+            stats["text_review"] += 1
+        elif status_label.lower() == "success":
             stats["success"] += 1
         if self._is_failed(item):
             stats["failed"] += 1
@@ -1237,6 +1253,10 @@ class LoggedCall:
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
             extra: dict[str, object] | None = None) -> None:
+        failure_code = (extra or {}).get("error_code") or (extra or {}).get("failure_code")
+        if is_text_review_failure_code(failure_code):
+            status = "text_review"
+            suffix = "文本"
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),

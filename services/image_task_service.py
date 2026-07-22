@@ -384,19 +384,19 @@ class ImageTaskService:
             self._update_task(key, progress=step)
         published_asset_count = 0
 
-        def partial_result_callback(data: list[dict[str, Any]], _output: object) -> None:
+        def image_result_callback(data: list[dict[str, Any]]) -> None:
             nonlocal published_asset_count
-            assets = [dict(item) for item in data if isinstance(item, dict)]
-            if len(assets) <= published_asset_count:
+            partial_data = [dict(item) for item in data if isinstance(item, dict)]
+            if not partial_data or len(partial_data) <= published_asset_count:
                 return
-            published_asset_count = len(assets)
-            self._update_task(key, data=assets, progress="receiving_image")
+            published_asset_count = len(partial_data)
+            self._update_task(key, data=partial_data, progress="receiving_image")
 
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {
             **payload,
             "progress_callback": progress_callback,
-            "_partial_result_callback": partial_result_callback,
+            "_image_result_callback": image_result_callback,
             "_call_id": call_id,
             "_trace_image_perf": True,
         }
@@ -739,6 +739,7 @@ class ImageTaskService:
                 "b64_json",
                 "",
                 int(time.time()),
+                requested_size=size,
             )
             data = formatted["data"]
             self._update_task(

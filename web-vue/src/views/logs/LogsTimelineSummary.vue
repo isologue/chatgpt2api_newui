@@ -7,11 +7,11 @@
       {{ durationMs > 0 ? formatLogDuration(durationMs) : '-' }}
     </MetaChip>
     <StateBadge
-      :tone="status === 'failed' ? 'danger' : status === 'generated' ? 'warning' : 'success'"
+      :tone="status === 'failed' ? 'danger' : status === 'generated' || status === 'text_review' ? 'warning' : 'success'"
       size="xs"
       shape="rounded"
     >
-      {{ status === 'failed' ? '失败' : status === 'generated' ? '生成成功' : '成功' }}
+      {{ status === 'failed' ? '失败' : status === 'generated' ? '生成成功' : status === 'text_review' ? '文本' : '成功' }}
     </StateBadge>
   </div>
 </template>
@@ -24,7 +24,7 @@ import { formatLogDuration } from '@/api/logs'
 defineProps<{
   stepCount: number
   durationMs: number
-  status: 'success' | 'failed' | 'generated'
+  status: 'success' | 'failed' | 'generated' | 'text_review'
 }>()
 </script>
 

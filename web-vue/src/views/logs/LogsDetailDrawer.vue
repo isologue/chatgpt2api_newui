@@ -79,7 +79,7 @@
           :groups="timelineGroups"
           :step-count="timelineStepCount"
           :duration-ms="timelineSegmentTotal"
-          :status="isSystemLogSuccess(log) ? 'success' : 'failed'"
+          :status="isSystemLogTextReview(log) ? 'text_review' : isSystemLogSuccess(log) ? 'success' : 'failed'"
           :details-visible="timelineDetailsVisible"
           @toggle-details="emit('toggle-timeline-details')"
         />
@@ -146,7 +146,7 @@ import DetailTextBlock from '@/components/ai/DetailTextBlock.vue'
 import ModalHeader from '@/components/ai/ModalHeader.vue'
 import ModalShell from '@/components/ai/ModalShell.vue'
 import StateBadge from '@/components/ai/StateBadge.vue'
-import { isSystemLogSuccess, type SystemLogRow } from '@/api/logs'
+import { isSystemLogSuccess, isSystemLogTextReview, type SystemLogRow } from '@/api/logs'
 import {
   hasImageAttemptBreakdown,
   type DetailField,

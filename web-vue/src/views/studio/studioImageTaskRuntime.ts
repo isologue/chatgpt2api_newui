@@ -132,7 +132,6 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     } finally {
       if (!input.pageRuntime.isLatestRequest(IMAGE_TASKS_REQUEST_KEY, requestSeq)) return
       isFetchingTasks.value = false
-      schedulePoll()
       if (imageRefreshQueued) {
         const queuedForce = imageRefreshQueuedForce
         imageRefreshQueued = false
@@ -192,10 +191,10 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
   }
 
   function schedulePoll() {
-    input.pageRuntime.clearTimer(IMAGE_POLL_TIMER_KEY)
+    input.pageRuntime.clearInterval(IMAGE_POLL_TIMER_KEY)
     if (!input.pageRuntime.canRun.value) return
     if (!pendingImageTaskIds.value.length) return
-    input.pageRuntime.setTimer(IMAGE_POLL_TIMER_KEY, 1200, () => {
+    input.pageRuntime.setInterval(IMAGE_POLL_TIMER_KEY, 4000, () => {
       void refresh(true)
     })
   }
@@ -212,7 +211,7 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     isFetchingTasks.value = false
     imageRefreshQueued = false
     imageRefreshQueuedForce = false
-    input.pageRuntime.clearTimer(IMAGE_POLL_TIMER_KEY)
+    input.pageRuntime.clearInterval(IMAGE_POLL_TIMER_KEY)
     input.pageRuntime.clearTimer(IMAGE_REFRESH_TIMER_KEY)
   }
 

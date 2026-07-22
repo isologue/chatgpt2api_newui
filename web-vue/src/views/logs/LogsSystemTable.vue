@@ -1,17 +1,16 @@
 <template>
   <PagePanel flush>
     <TableShell>
-      <table class="w-full min-w-[1120px] table-fixed text-left">
+      <table class="w-full min-w-[900px] table-fixed text-left">
         <colgroup>
-          <col class="w-12" />
-          <col class="w-36" />
-          <col class="w-24" />
-          <col class="w-40" />
-          <col class="w-28" />
-          <col class="w-24" />
-          <col class="w-28" />
-          <col />
-          <col class="w-36" />
+          <col class="w-[4%]" />
+          <col class="w-[9%]" />
+          <col class="w-[19%]" />
+          <col class="w-[16%]" />
+          <col class="w-[9%]" />
+          <col class="w-[9%]" />
+          <col class="w-[19%]" />
+          <col class="w-[15%]" />
         </colgroup>
         <thead class="bg-muted/40 text-xs text-muted-foreground">
           <tr>
@@ -25,18 +24,17 @@
               </Checkbox>
             </th>
             <th class="py-3 pr-5">时间</th>
-            <th class="py-3 pr-5">类型</th>
-            <th class="py-3 pr-5">令牌名称</th>
-            <th class="py-3 pr-5">调用耗时</th>
-            <th class="py-3 pr-5">状态</th>
+            <th class="py-3 pr-5">请求</th>
+            <th class="py-3 pr-5">执行</th>
+            <th class="py-3 pr-5">耗时</th>
             <th class="py-3 pr-5">图片</th>
-            <th class="py-3 pr-5">简述</th>
+            <th class="py-3 pr-5">结果</th>
             <th class="py-3 pr-4 text-right">操作</th>
           </tr>
         </thead>
         <tbody class="text-sm text-foreground">
           <tr v-if="!isFetching && logs.length === 0">
-            <td colspan="9" class="py-8">
+            <td colspan="8" class="py-8">
               <EmptyState
                 plain
                 :title="logsLoadError ? '日志加载失败' : '暂无日志'"

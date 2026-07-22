@@ -4,9 +4,11 @@ import type { ActionMenuItem } from 'nanocat-ui'
 import { actionMenuGroups } from '@/components/ai/menuItems'
 import {
   formatLogDuration,
+  imageFailureLabel,
   isSystemLogFailed as isFailed,
   isSystemLogLimited as isLimited,
   isSystemLogSuccess as isSuccess,
+  isSystemLogTextReview as isTextReview,
 } from '@/api/logs'
 
 export type LogFilterOption = { label: string; value: string }
@@ -68,6 +70,15 @@ export type SystemLogRowSignatureInput = {
 type LogDurationDisplay = {
   total: string
   breakdown: string
+}
+
+export type LogCellDisplay = {
+  primary: string
+  secondary: string
+}
+
+export type LogRequestDisplay = LogCellDisplay & {
+  kind: string
 }
 
 export const typeOptions = [
@@ -233,16 +244,87 @@ export function typeLabel(type: string): string {
   return type || '日志'
 }
 
-export function tokenLabel(item: SystemLogRow): string {
-  return item.keyName || item.keyId || item.accountEmail
+function requestKind(item: SystemLogRow): string {
+  const endpoint = item.endpoint.toLowerCase()
+  const model = item.model.toLowerCase()
+  let kind = item.type === 'account' ? '账号操作' : ''
+  if (endpoint.includes('/images/edits')) kind = '图生图'
+  else if (endpoint.includes('/images/generations')) kind = '文生图'
+  else if (endpoint.includes('/chat/completions')) kind = model.includes('image') ? '对话生图' : '对话'
+  else if (endpoint.includes('/search')) kind = '搜索'
+  else if (endpoint.includes('/responses')) kind = '响应'
+  else if (endpoint.includes('/messages')) kind = '消息'
+  else if (!kind) kind = item.endpoint || typeLabel(item.type)
+  return kind
+}
+
+export function requestDisplay(item: SystemLogRow): LogRequestDisplay {
+  const kind = requestKind(item)
+  return {
+    kind: item.type === 'account' ? '' : kind,
+    primary: item.model || typeLabel(item.type),
+    secondary: item.endpoint,
+  }
+}
+
+export function executionDisplay(item: SystemLogRow): LogCellDisplay {
+  const taskCount = item.imageRequestedCount
+  const attemptCount = item.imageAttempts.length
+  const caller = item.keyName || item.keyId
+  const primary = [
+    taskCount > 0 ? `${taskCount} 个任务` : '',
+    attemptCount > 0 ? `${attemptCount} 次尝试` : '',
+  ].filter(Boolean).join(' · ') || caller || '-'
+  const secondary = taskCount > 0 ? caller : ''
+  return { primary, secondary }
+}
+
+export function outcomeText(item: SystemLogRow): string {
+  if (item.imageResultStatus === 'partial_success') {
+    return `生成 ${item.imageSucceededCount}/${item.imageRequestedCount} 张图片`
+  }
+  if (isTextReview(item)) return '上游返回文本'
+
+  const failureLabel = imageFailureLabel(item.errorCode)
+  if (isFailed(item) || isLimited(item)) {
+    return failureLabel || item.error || item.reason || item.summary || '调用失败'
+  }
+
+  const imageCount = Math.max(item.imageSucceededCount, item.imageUrls.length)
+  if (imageCount > 0) {
+    return item.imageRequestedCount > 1
+      ? `生成 ${imageCount}/${item.imageRequestedCount} 张图片`
+      : `生成 ${imageCount} 张图片`
+  }
+  if (isSuccess(item)) {
+    const kind = requestKind(item)
+    if (kind === '文生图' || kind === '图生图' || kind === '对话生图') return '图片生成完成'
+    if (kind === '搜索') return '搜索完成'
+    if (kind === '对话' || kind === '响应' || kind === '消息') return '文本响应完成'
+    if (kind === '账号操作') return item.summary || '账号操作完成'
+    return '调用完成'
+  }
+  return item.summary || item.preview || '调用完成'
+}
+
+export function resultDiagnostics(item: SystemLogRow): string {
+  const showFailureDetails = isFailed(item) || isLimited(item)
+  return [
+    showFailureDetails && item.statusCode ? `HTTP ${item.statusCode}` : '',
+    showFailureDetails ? item.errorCode : '',
+  ].filter(Boolean).join(' · ')
 }
 
 export function summaryText(item: SystemLogRow): string {
+  if (isTextReview(item) && item.summary) {
+    return item.summary.replace('流式调用失败', '文本').replace('调用失败', '文本')
+  }
   return item.summary || item.error || item.reason || item.preview
 }
 
 export function statusLabel(item: SystemLogRow): string {
   if (item.imageResultStatus === 'partial_success') return '部分成功'
+  if (isTextReview(item)) return '文本'
   if (isSuccess(item)) return '成功'
   if (isFailed(item)) return '失败'
   if (isLimited(item)) return '受限'
@@ -251,6 +333,7 @@ export function statusLabel(item: SystemLogRow): string {
 
 export function statusTone(item: SystemLogRow): LogStatusTone {
   if (item.imageResultStatus === 'partial_success') return 'warning'
+  if (isTextReview(item)) return 'warning'
   if (isSuccess(item)) return 'success'
   if (isFailed(item)) return 'danger'
   if (isLimited(item)) return 'warning'
@@ -285,21 +368,40 @@ export function logDurationDisplay(item: SystemLogRow): LogDurationDisplay {
   return { total, breakdown: `(${expressions.join('；')})` }
 }
 
+export function logDurationTone(item: SystemLogRow): LogStatusTone {
+  if (isFailed(item)) return 'danger'
+  const durationMs = Number(item.durationMs)
+  if (!Number.isFinite(durationMs) || durationMs < 0) return 'muted'
+  return durationMs >= 60_000 ? 'warning' : 'success'
+}
+
 export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSignatureInput): string {
   const durationDisplay = logDurationDisplay(item)
+  const request = requestDisplay(item)
+  const execution = executionDisplay(item)
   return [
     item.id,
     input.selected ? 1 : 0,
     input.firstImageBroken ? 1 : 0,
     boundedSignatureText(item.time),
-    boundedSignatureText(typeLabel(item.type), 64),
-    boundedSignatureText(tokenLabel(item), 96),
+    boundedSignatureText(request.primary, 96),
+    boundedSignatureText(request.kind, 64),
+    boundedSignatureText(request.secondary, 128),
+    boundedSignatureText(execution.primary, 96),
+    boundedSignatureText(execution.secondary, 96),
     boundedSignatureText(item.durationMs, 64),
     boundedSignatureText(durationDisplay.breakdown, 160),
     boundedSignatureText(statusLabel(item), 64),
     statusTone(item),
-    boundedSignatureText(summaryText(item)),
+    boundedSignatureText(outcomeText(item)),
+    boundedSignatureText(resultDiagnostics(item), 160),
+    boundedSignatureText(item.statusCode, 32),
+    boundedSignatureText(item.errorCode, 64),
+    boundedSignatureText(item.imageResultStatus, 32),
+    item.imageRequestedCount,
+    item.imageSucceededCount,
     item.imageUrls.length,
+    item.imageAttempts.length,
     item.accountSwitchCount,
     item.imageUrls.slice(0, 4).map((url) => boundedSignatureText(url, 96)).join(','),
     boundedSignatureText(item.preview),
@@ -393,6 +495,7 @@ export function systemMetricItems(logMeta: Pick<SystemLogsResponse, 'stats' | 's
   return [
     { label: '总数', value: stats.total, class: 'text-foreground' },
     { label: pageScope ? '本页成功' : '成功', value: stats.success, class: 'text-emerald-600' },
+    { label: pageScope ? '本页文本' : '文本', value: stats.text_review, class: 'text-violet-600' },
     { label: pageScope ? '本页失败' : '失败', value: stats.failed, class: 'text-rose-600' },
     { label: pageScope ? '本页限流' : '限流', value: stats.limited, class: 'text-amber-600' },
     { label: pageScope ? '本页图片' : '图片接口', value: stats.image, class: 'text-cyan-600' },

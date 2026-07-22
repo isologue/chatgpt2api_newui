@@ -179,11 +179,17 @@ class UpstreamHTTPError(RuntimeError):
         status_code: int,
         body: Any,
         retry_after: int | None = None,
+        credential_scope: str = "account",
     ) -> None:
         self.context = context
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
+        self.credential_scope = (
+            credential_scope
+            if credential_scope in {"account", "signed_asset", "public"}
+            else "account"
+        )
         if isinstance(body, (dict, list)):
             try:
                 body_str = json.dumps(body, ensure_ascii=False)
@@ -196,7 +202,12 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
-def ensure_ok(response: requests.Response, context: str) -> None:
+def ensure_ok(
+    response: requests.Response,
+    context: str,
+    *,
+    credential_scope: str = "account",
+) -> None:
     if 200 <= response.status_code < 300:
         return
     body: Any = response.text
@@ -210,7 +221,13 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         ra_str = str(retry_after_header).strip()
         if ra_str.isdigit():
             retry_after = int(ra_str)
-    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+    raise UpstreamHTTPError(
+        context,
+        response.status_code,
+        body,
+        retry_after=retry_after,
+        credential_scope=credential_scope,
+    )
 
 
 def _stream_error_payload(

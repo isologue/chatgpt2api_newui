@@ -62,6 +62,10 @@ SETTINGS_UPDATE_KEYS = {
     "image_poll_initial_wait_secs",
     "image_account_concurrency",
     "image_account_retry_enabled",
+    "image_preflight_token_refresh_enabled",
+    "image_upscale_enabled",
+    "image_upscale_engine",
+    "image_auth_refresh_concurrency",
     "image_max_account_attempts",
     "image_parallel_generation",
     "image_remove_conversation_after_result",
@@ -616,7 +620,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/model-catalog")
     async def model_catalog(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        require_identity(authorization)
         return get_model_catalog()
 
     @router.get("/api/images")

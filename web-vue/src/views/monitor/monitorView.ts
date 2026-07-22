@@ -37,8 +37,6 @@ export type MonitorStageCountItem = {
 }
 
 const ENTRY_QUEUE_METRIC_KEYS = ['handler_queue_ms', 'stream_first_queue_ms'] as const
-const ENTRY_ACCOUNT_METRIC_KEYS = ['handler_queue_ms', 'stream_first_queue_ms', 'account_wait_ms', 'egress_wait_ms'] as const
-
 const DIGEST_METRIC_PAIRS = [
   ['等待入口', 'handler_queue_ms'],
   ['首包', 'stream_first_queue_ms'],
@@ -212,9 +210,25 @@ export function accountEgressDigest(row: RealtimeMonitorRecord) {
   return `账号 ${accountWait} / 出口 ${egressWait}`
 }
 
+export function activeAccountAttemptText(row: RealtimeMonitorRecord) {
+  const attempt = Math.max(0, Number(row.image_account_attempt || 0))
+  const maxAttempts = Math.max(attempt, Number(row.image_account_max_attempts || 0))
+  const switches = Math.max(0, Number(row.image_account_switch_count || 0))
+  if (!attempt && !maxAttempts && !switches) return ''
+  const imageCount = Object.values(row.images || {}).reduce(
+    (count, image) => Math.max(count, Number(image.total || 0)),
+    0,
+  )
+  const attemptText = attempt && maxAttempts
+    ? `${imageCount > 1 ? '最高第 ' : '第 '}${attempt}/${maxAttempts} 次`
+    : ''
+  const switchText = switches > 0 ? `已切换 ${switches} 次` : '未切换'
+  return [attemptText, switchText].filter(Boolean).join(' · ')
+}
+
 export function activeEgressMeta(summary?: RealtimeMonitorSummary) {
   const items = Object.entries(summary?.active_by_egress || {})
-  if (!items.length) return '代理组、默认出口、Runtime 或直连出口'
+  if (!items.length) return '暂无活跃出口'
   return items
     .slice(0, 2)
     .map(([key, count]) => {
@@ -358,6 +372,7 @@ export function slowRowReason(row: RealtimeMonitorRecord) {
 export function statusLabel(status: unknown) {
   const value = String(status || '').toLowerCase()
   if (value === 'success') return '成功'
+  if (value === 'text_review') return '文本'
   if (value === 'failed' || value === 'error' || value === 'fail') return '失败'
   if (value === 'running') return '运行中'
   return value || '-'
@@ -366,6 +381,7 @@ export function statusLabel(status: unknown) {
 export function statusTone(status: unknown): BadgeTone {
   const value = String(status || '').toLowerCase()
   if (value === 'success') return 'success'
+  if (value === 'text_review') return 'warning'
   if (value === 'failed' || value === 'error' || value === 'fail') return 'danger'
   if (value === 'running') return 'info'
   return 'muted'
@@ -401,6 +417,10 @@ export function activeRowSignature(row: RealtimeMonitorRecord) {
     Math.round(Number(row.elapsed_ms || 0)),
     Math.round(Number(row.stage_elapsed_ms || 0)),
     row.account_email,
+    row.previous_account_email,
+    row.image_account_attempt,
+    row.image_account_max_attempts,
+    row.image_account_switch_count,
     row.proxy_source,
     row.proxy_hash,
     row.egress_label,
@@ -467,71 +487,105 @@ export function buildDiagnosticGroups(
   completedWindowText: string,
 ) {
   const p95 = summary?.metric_p95 || {}
-  const bottleneckValue = Number(summary?.bottleneck?.value_ms || 0)
   const localBusy = summary?.slow_counts?.local_reject_or_busy ?? 0
-  const entryAccountTotal = sumMetricFromMap(p95, ENTRY_ACCOUNT_METRIC_KEYS)
-  const httpConnectTotal = sumMetricFromMap(p95, ['http_dns_ms', 'http_tcp_ms', 'http_tls_ms'])
-  const currentEntryQueueText = entryQueueText(summary)
+  const switchRequests = Number(summary?.account_switch_requests || 0)
+  const switchCount = Number(summary?.account_switches || 0)
+  const switchSuccess = Number(summary?.account_switch_success || 0)
+  const switchRecoveryRate = Number(summary?.account_switch_recovery_rate || 0)
+  const switchUnrecovered = Math.max(0, switchRequests - switchSuccess)
+  const switchAverage = switchRequests > 0 ? (switchCount / switchRequests).toFixed(1) : '0'
+  const activeEgressCount = Object.keys(summary?.active_by_egress || {}).length
+  const windowModelCount = Object.keys(summary?.by_model || {}).length
 
   return [
     {
       key: 'overview',
       title: '实时概览',
-      meta: '窗口、成功率、瓶颈',
+      meta: '窗口与结果',
       items: [
         { key: 'active', label: '当前并发', value: summary?.active ?? 0, meta: `线程容量 ${threadTokens}`, valueClass: 'text-foreground' },
         { key: 'completed', label: '完成窗口', value: summary?.completed ?? 0, meta: completedWindowText, valueClass: 'text-foreground' },
-        { key: 'success', label: '成功率', value: `${summary?.success_rate ?? 0}%`, meta: `成功 ${summary?.success ?? 0}`, valueClass: 'text-emerald-600 dark:text-emerald-400' },
+        { key: 'success', label: '成功数', value: summary?.success ?? 0, meta: '窗口内成功', valueClass: 'text-emerald-600 dark:text-emerald-400' },
         { key: 'failed', label: '失败数', value: summary?.failed ?? 0, meta: '窗口内失败', valueClass: Number(summary?.failed || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
-        { key: 'average', label: '平均耗时', value: formatMs(summary?.avg_duration_ms), meta: '窗口均值', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'p95', label: 'P95 耗时', value: formatMs(summary?.p95_duration_ms), meta: '慢请求参考', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'bottleneck', label: '当前瓶颈', value: summary?.bottleneck?.label || '-', meta: 'P95 最大阶段', valueClass: 'text-foreground' },
-        { key: 'bottleneck_ms', label: '瓶颈耗时', value: formatMs(bottleneckValue), meta: '阶段 P95', valueClass: 'text-foreground' },
+        { key: 'text_review', label: '文本数', value: summary?.text_review ?? 0, meta: '返回文本，不计失败', valueClass: 'text-amber-600 dark:text-amber-400' },
+        { key: 'success_rate', label: '成功率', value: `${summary?.success_rate ?? 0}%`, meta: '不含文本', valueClass: 'text-emerald-600 dark:text-emerald-400' },
+        { key: 'slow_total', label: '慢请求', value: summary?.slow_counts?.total_over_120s ?? 0, meta: '总耗时超过 120 秒', valueClass: Number(summary?.slow_counts?.total_over_120s || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'window_models', label: '窗口模型', value: windowModelCount, meta: '窗口内调用模型', valueClass: 'text-foreground' },
       ],
     },
     {
-      key: 'account',
-      title: '入口、账号与出口',
-      meta: '本地线程、账号池、代理出口',
+      key: 'entry_egress',
+      title: '入口与出口',
+      meta: '本地线程、请求入口、代理出口',
       items: [
-        { key: 'handler_queue_ms', label: '入口排队', value: formatMs(p95.handler_queue_ms), meta: '等待后端线程', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'stream_first_queue_ms', label: '首包排队', value: formatMs(p95.stream_first_queue_ms), meta: '等待流式首包', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'account_wait_ms', label: '账号等待', value: formatMs(p95.account_wait_ms), meta: '账号池筛选', valueClass: 'text-cyan-600 dark:text-cyan-400' },
-        { key: 'egress_wait_ms', label: '出口等待', value: formatMs(p95.egress_wait_ms), meta: activeEgressMeta(summary), valueClass: 'text-teal-600 dark:text-teal-400' },
-        { key: 'egress_acquire_ms', label: '出口租约', value: formatMs(p95.egress_acquire_ms), meta: '代理节点并发', valueClass: 'text-teal-600 dark:text-teal-400' },
-        { key: 'entry_account_total_ms', label: '入口账号合计', value: formatMs(entryAccountTotal), meta: '入口 + 首包 + 账号 + 出口', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'entry_p95', label: '入口排队 P95', value: currentEntryQueueText, meta: `线程容量 ${threadTokens} · 慢 ${summary?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'local_busy', label: '本地拒绝/繁忙', value: `${localBusy}`, meta: '无号 / 并发 / 策略', valueClass: 'text-foreground' },
+        { key: 'thread_capacity', label: '线程容量', value: threadTokens, meta: '入口执行上限', valueClass: 'text-foreground' },
+        { key: 'handler_queue_ms', label: '入口排队 P95', value: formatMs(p95.handler_queue_ms), meta: `线程容量 ${threadTokens} · 慢 ${summary?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'stream_first_queue_ms', label: '首包排队 P95', value: formatMs(p95.stream_first_queue_ms), meta: `慢 ${summary?.slow_counts?.stream_first_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'egress_wait_ms', label: '出口等待 P95', value: formatMs(p95.egress_wait_ms), meta: activeEgressMeta(summary), valueClass: 'text-teal-600 dark:text-teal-400' },
+        { key: 'egress_acquire_ms', label: '出口租约 P95', value: formatMs(p95.egress_acquire_ms), meta: '获取图片出口', valueClass: 'text-teal-600 dark:text-teal-400' },
+        { key: 'active_egress', label: '活跃出口', value: activeEgressCount, meta: activeEgressMeta(summary), valueClass: 'text-teal-600 dark:text-teal-400' },
+        { key: 'egress_wait_slow', label: '出口等待慢请求', value: summary?.slow_counts?.egress_wait ?? 0, meta: '等待超过 1 秒', valueClass: Number(summary?.slow_counts?.egress_wait || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'local_busy', label: '本地拒绝/繁忙', value: `${localBusy}`, meta: '无号 / 并发 / 策略', valueClass: localBusy > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+      ],
+    },
+    {
+      key: 'account_switch',
+      title: '账号与切换',
+      meta: '账号等待、切换动作、恢复结果',
+      items: [
+        { key: 'account_wait_ms', label: '账号等待 P95', value: formatMs(p95.account_wait_ms), meta: '账号池筛选', valueClass: 'text-cyan-600 dark:text-cyan-400' },
+        { key: 'account_wait_slow', label: '账号等待慢请求', value: summary?.slow_counts?.account_wait ?? 0, meta: '等待超过 5 秒', valueClass: Number(summary?.slow_counts?.account_wait || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'account_switch_requests', label: '切号请求', value: switchRequests, meta: '发生过账号切换', valueClass: switchRequests > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'account_switches', label: '切换次数', value: switchCount, meta: '窗口内实际切换', valueClass: switchCount > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'account_switch_success', label: '切号后成功', value: switchSuccess, meta: switchRequests > 0 ? '已恢复请求' : '暂无切号请求', valueClass: switchSuccess > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground' },
+        { key: 'account_switch_recovery_rate', label: '切号恢复率', value: `${switchRecoveryRate}%`, meta: '切号后成功 / 切号请求', valueClass: switchSuccess > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground' },
+        { key: 'account_switch_unrecovered', label: '切号未恢复', value: switchUnrecovered, meta: '切号后仍失败', valueClass: switchUnrecovered > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'account_switch_average', label: '平均切换', value: switchAverage, meta: '每个切号请求', valueClass: switchCount > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
       ],
     },
     {
       key: 'upstream_prepare',
-      title: '上游准备与 HTTP',
-      meta: '上传、令牌、建连、首包',
+      title: '上游准备',
+      meta: '上传、令牌、会话、建连',
       items: [
         { key: 'upload_ms', label: '图片上传', value: formatMs(p95.upload_ms), meta: '参考图上传', valueClass: 'text-foreground' },
         { key: 'bootstrap_ms', label: '上游初始化', value: formatMs(p95.bootstrap_ms), meta: 'ChatGPT 会话', valueClass: 'text-foreground' },
         { key: 'requirements_ms', label: '令牌获取', value: formatMs(p95.requirements_ms), meta: 'requirements / token', valueClass: 'text-foreground' },
         { key: 'prepare_conversation_ms', label: '会话准备', value: formatMs(p95.prepare_conversation_ms), meta: '准备图片会话', valueClass: 'text-foreground' },
         { key: 'generation_start_ms', label: '启动生成', value: formatMs(p95.generation_start_ms), meta: '提交上游请求', valueClass: 'text-foreground' },
-        { key: 'http_connect_ms', label: 'HTTP 建连', value: formatMs(httpConnectTotal), meta: 'DNS + TCP + TLS', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'http_wait_ms', label: 'HTTP 等待', value: formatMs(p95.http_wait_ms), meta: '发出请求到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
-        { key: 'http_ttfb_ms', label: 'HTTP 首包', value: formatMs(p95.http_ttfb_ms), meta: '请求开始到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_dns_ms', label: 'DNS 解析', value: formatMs(p95.http_dns_ms), meta: 'HTTP DNS P95', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_tcp_ms', label: 'TCP 连接', value: formatMs(p95.http_tcp_ms), meta: 'HTTP TCP P95', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_tls_ms', label: 'TLS 握手', value: formatMs(p95.http_tls_ms), meta: 'HTTP TLS P95', valueClass: 'text-sky-600 dark:text-sky-400' },
       ],
     },
     {
-      key: 'upstream_result',
-      title: '生成与结果',
-      meta: '流、轮询、下载',
+      key: 'generation_transport',
+      title: '生成与传输',
+      meta: 'HTTP、SSE、上游生成、断流',
       items: [
-        { key: 'sse_first_event_ms', label: 'SSE 首事件', value: formatMs(p95.sse_first_event_ms), meta: '首个 data 事件', valueClass: 'text-indigo-600 dark:text-indigo-400' },
+        { key: 'http_wait_ms', label: 'HTTP 等待', value: formatMs(p95.http_wait_ms), meta: '发出请求到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'http_ttfb_ms', label: 'HTTP 首包', value: formatMs(p95.http_ttfb_ms), meta: '请求开始到首包', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'sse_first_event_ms', label: 'SSE 首事件', value: formatMs(p95.sse_first_event_ms), meta: '连接后首个事件', valueClass: 'text-indigo-600 dark:text-indigo-400' },
         { key: 'sse_max_gap_ms', label: 'SSE 最大空窗', value: formatMs(p95.sse_max_gap_ms), meta: '两次事件最大间隔', valueClass: 'text-indigo-600 dark:text-indigo-400' },
+        { key: 'sse_last_gap_ms', label: 'SSE 收尾空窗', value: formatMs(p95.sse_last_gap_ms), meta: '最后事件到结束', valueClass: 'text-indigo-600 dark:text-indigo-400' },
         { key: 'conversation_stream_ms', label: '上游生成', value: formatMs(p95.conversation_stream_ms), meta: '会话流响应', valueClass: 'text-emerald-600 dark:text-emerald-400' },
-        { key: 'stream_error_ms', label: '上游断流', value: formatMs(p95.stream_error_ms), meta: 'HTTP2 / SSE', valueClass: 'text-slate-600 dark:text-slate-300' },
+        { key: 'stream_error_requests', label: '断流请求', value: summary?.stream_error_requests ?? 0, meta: '窗口内发生断流', valueClass: Number(summary?.stream_error_requests || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'stream_error_ms', label: '断流耗时 P95', value: formatMs(p95.stream_error_ms), meta: 'HTTP2 / SSE', valueClass: 'text-slate-600 dark:text-slate-300' },
+      ],
+    },
+    {
+      key: 'result_delivery',
+      title: '结果与交付',
+      meta: '总耗时、轮询、解析、下载',
+      items: [
+        { key: 'average', label: '平均总耗时', value: formatMs(summary?.avg_duration_ms), meta: '窗口均值', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'p95', label: 'P95 总耗时', value: formatMs(summary?.p95_duration_ms), meta: '慢请求参考', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'poll_wait_ms', label: '等待结果', value: formatMs(p95.poll_wait_ms), meta: '间隔 / 退避', valueClass: 'text-amber-600 dark:text-amber-400' },
         { key: 'poll_request_ms', label: '查询结果', value: formatMs(p95.poll_request_ms), meta: 'task / conversation', valueClass: 'text-cyan-600 dark:text-cyan-400' },
         { key: 'resolve_ms', label: '结果处理', value: formatMs(p95.resolve_ms), meta: 'file ID / 下载地址', valueClass: 'text-orange-600 dark:text-orange-400' },
         { key: 'download_ms', label: '图片下载', value: formatMs(p95.download_ms), meta: '下载并返回', valueClass: 'text-foreground' },
+        { key: 'response_ms', label: '响应整理', value: formatMs(p95.response_ms), meta: '整理 API 响应', valueClass: 'text-foreground' },
+        { key: 'stream_ms', label: '协议处理 P95', value: formatMs(p95.stream_ms), meta: '图片协议完整处理', valueClass: 'text-sky-600 dark:text-sky-400' },
       ],
     },
   ] satisfies MonitorDiagnosticGroup[]

@@ -136,6 +136,9 @@ def get_model_catalog() -> dict[str, Any]:
         "chat_models": chat_models,
         "image_models": image_models,
         "all_models": all_models,
+        "capabilities": {
+            "image_upscale": config.image_upscale_enabled,
+        },
         "source": {
             "chat": chat_source,
             "image": image_source,

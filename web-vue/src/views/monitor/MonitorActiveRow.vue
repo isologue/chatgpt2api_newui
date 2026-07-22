@@ -17,7 +17,17 @@
     <td>
       <MetaChip size="xs" tone="muted">{{ egressText(row) }}</MetaChip>
     </td>
-    <td class="max-w-[12rem] truncate">{{ row.account_email || '-' }}</td>
+    <td class="max-w-[14rem]">
+      <p
+        class="truncate"
+        :title="row.previous_account_email ? `上一账号：${row.previous_account_email}` : row.account_email"
+      >
+        {{ row.account_email || '-' }}
+      </p>
+      <p v-if="activeAccountAttemptText(row)" class="mt-1 text-[11px] text-muted-foreground">
+        {{ activeAccountAttemptText(row) }}
+      </p>
+    </td>
   </tr>
 </template>
 
@@ -26,6 +36,7 @@ import type { RealtimeMonitorRecord } from '@/api/monitor'
 import MetaChip from '@/components/ai/MetaChip.vue'
 import StateBadge from '@/components/ai/StateBadge.vue'
 import {
+  activeAccountAttemptText,
   egressText,
   formatMs,
   metricDigest,

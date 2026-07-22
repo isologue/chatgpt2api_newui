@@ -19,6 +19,9 @@ export interface ModelCatalogResponse {
   chat_models: string[]
   image_models: string[]
   all_models?: string[]
+  capabilities?: {
+    image_upscale?: boolean
+  }
   source?: {
     chat?: string
     image?: string

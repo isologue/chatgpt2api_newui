@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR
-from services.image_failure import is_rate_limit_failure_code, is_structured_failure
+from services.image_failure import (
+    is_rate_limit_failure_code,
+    is_structured_failure,
+    is_text_review_failure_code,
+)
 from services.json_file import read_json_object, write_json_file
 from utils.log import logger
 from utils.timezone import beijing_now, parse_to_beijing_naive
@@ -96,6 +100,7 @@ def _empty_bucket() -> dict[str, Any]:
         "total": 0,
         "success": 0,
         "failed": 0,
+        "text_review": 0,
         "rate_limited": 0,
         "by_endpoint": {},
         "by_model": {},
@@ -107,7 +112,7 @@ def _empty_bucket() -> dict[str, Any]:
 
 
 def _merge_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
-    for key in ("total", "success", "failed", "rate_limited"):
+    for key in ("total", "success", "failed", "text_review", "rate_limited"):
         target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
     for key in ("by_endpoint", "by_model", "by_status", "by_error_code", "model_total_times", "model_time_counts"):
         target_map = target.setdefault(key, {})
@@ -269,6 +274,7 @@ class DashboardMetricsService:
         error_code = _clean_text(
             _detail_value(item, "error_code", _detail_value(item, "failure_code"))
         ).lower()
+        is_text_review = is_text_review_failure_code(error_code)
         is_failed = is_structured_failure(
             status=status,
             error=_detail_value(item, "error"),
@@ -277,7 +283,9 @@ class DashboardMetricsService:
         )
 
         bucket["total"] = int(bucket.get("total", 0) or 0) + 1
-        if is_failed:
+        if is_text_review:
+            bucket["text_review"] = int(bucket.get("text_review", 0) or 0) + 1
+        elif is_failed:
             bucket["failed"] = int(bucket.get("failed", 0) or 0) + 1
             if is_rate_limit_failure_code(error_code) or is_rate_limit_failure_code(status):
                 bucket["rate_limited"] = int(bucket.get("rate_limited", 0) or 0) + 1
@@ -411,6 +419,7 @@ class DashboardMetricsService:
             "total": int(total_bucket.get("total", 0) or 0),
             "success": int(total_bucket.get("success", 0) or 0),
             "failed": int(total_bucket.get("failed", 0) or 0),
+            "text_review": int(total_bucket.get("text_review", 0) or 0),
             "by_endpoint": total_bucket.get("by_endpoint", {}),
             "by_model": total_bucket.get("by_model", {}),
             "by_status": total_bucket.get("by_status", {}),
@@ -423,6 +432,7 @@ class DashboardMetricsService:
                 "total_requests": [int(bucket.get("total", 0) or 0) for bucket in series_buckets],
                 "success_requests": [int(bucket.get("success", 0) or 0) for bucket in series_buckets],
                 "failed_requests": failed_requests,
+                "text_review_requests": [int(bucket.get("text_review", 0) or 0) for bucket in series_buckets],
                 "rate_limited_requests": [int(bucket.get("rate_limited", 0) or 0) for bucket in series_buckets],
                 "model_requests": model_requests,
                 "model_ttfb_times": {},

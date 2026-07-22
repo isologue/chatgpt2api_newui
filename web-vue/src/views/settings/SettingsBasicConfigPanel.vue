@@ -88,7 +88,7 @@
           :model-value="imagePollTimeoutField.input.value"
           type="number"
           block
-          placeholder="120"
+          placeholder="60"
           @update:model-value="imagePollTimeoutField.update"
         />
       </FormField>
@@ -101,20 +101,20 @@
           :model-value="imageStreamTimeoutField.input.value"
           type="number"
           block
-          placeholder="300"
+          placeholder="80"
           @update:model-value="imageStreamTimeoutField.update"
         />
       </FormField>
 
       <FormField label="单账号图片并发">
         <template #label-extra>
-          <HelpTip text="限制每个账号同时处理的图片请求数量。" />
+          <HelpTip text="限制每个账号同时处理的图片请求数量。默认 1，可设置为 1–3。" />
         </template>
         <Input
           :model-value="imageAccountConcurrencyField.input.value"
           type="number"
           block
-          placeholder="3"
+          placeholder="1"
           @update:model-value="imageAccountConcurrencyField.update"
         />
       </FormField>

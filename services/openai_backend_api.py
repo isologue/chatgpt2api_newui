@@ -34,6 +34,7 @@ from services.image_failure import (
     image_failure,
     is_terminal_message_status,
     merge_message_failure,
+    structured_upstream_codes,
     terminal_assistant_text,
 )
 from services.protocol.reasoning import normalize_thinking_effort
@@ -222,6 +223,8 @@ class OpenAIBackendAPI:
         self.access_token = access_token
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
+        self._credential_access_token = str(self.access_token or "").strip()
+        self._credential_refresh_token = str(self.account.get("refresh_token") or "").strip()
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
@@ -276,9 +279,6 @@ class OpenAIBackendAPI:
             "OAI-Client-Version": self.client_version,
             "OAI-Client-Build-Number": self.client_build_number,
         })
-        if self.access_token:
-            self.session.headers["Authorization"] = f"Bearer {self.access_token}"
-
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
@@ -332,11 +332,35 @@ class OpenAIBackendAPI:
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
         headers = dict(self.session.headers)
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
         return headers
+
+    @staticmethod
+    def _signed_asset_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        return dict(extra or {})
+
+    def _schedule_auth_recovery(self, event: str) -> None:
+        if not self._credential_access_token:
+            return
+        try:
+            account_service.schedule_auth_verification(
+                self._credential_access_token,
+                event,
+                expected_access_token=self._credential_access_token,
+                expected_refresh_token=self._credential_refresh_token,
+                scope="image",
+            )
+        except Exception as exc:
+            logger.warning({
+                "event": "auth_recovery_schedule_failed",
+                "source": event,
+                "error": diagnostic_excerpt(exc, 500),
+            })
 
     def _merge_http_timing(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
         if not name or not data:
@@ -527,7 +551,25 @@ class OpenAIBackendAPI:
             me_future = executor.submit(self._get_me)
             init_future = executor.submit(self._get_conversation_init)
             account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            results = []
+            errors = []
+            for future in (me_future, init_future, account_future):
+                try:
+                    results.append(future.result())
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as exc:
+                    results.append(None)
+                    errors.append(exc)
+
+            if errors:
+                auth_error = next(
+                    (exc for exc in errors if isinstance(exc, InvalidAccessTokenError)),
+                    None,
+                )
+                raise auth_error or errors[0]
+
+            me_payload, init_payload, default_account = results
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -927,20 +969,28 @@ class OpenAIBackendAPI:
             body_parts.append(chunk)
             body_preview_len += len(chunk)
 
-        def _flush_sse_event(lines: list[str]) -> None:
+        def _flush_sse_event(lines: list[str]) -> bool:
             if not lines:
-                return
+                return False
             payload_text = "\n".join(lines).strip()
             lines.clear()
-            if not payload_text or payload_text == "[DONE]":
-                return
+            if not payload_text:
+                return False
+            if payload_text == "[DONE]":
+                return True
             try:
                 data = json.loads(payload_text)
             except Exception as exc:
                 parse_errors.append(str(exc))
-                return
+                return False
             if isinstance(data, dict):
                 events.append(data)
+                return str(data.get("type") or "") in {
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                }
+            return False
 
         if timeout_secs > 0:
             timer = threading.Timer(timeout_secs, _abort_stream)
@@ -969,9 +1019,14 @@ class OpenAIBackendAPI:
                     line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
                     _append_body(line + "\n")
                     if not line:
-                        _flush_sse_event(lines)
+                        if _flush_sse_event(lines):
+                            break
                     elif line.startswith("data:"):
-                        lines.append(line[5:].lstrip())
+                        data_line = line[5:].lstrip()
+                        if data_line == "[DONE]":
+                            lines.clear()
+                            break
+                        lines.append(data_line)
                 _flush_sse_event(lines)
                 _raise_if_timeout()
         except Exception as exc:
@@ -1185,7 +1240,7 @@ class OpenAIBackendAPI:
             data=data,
             timeout=120,
         )
-        ensure_ok(response, "image_upload")
+        ensure_ok(response, "image_upload", credential_scope="signed_asset")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         response = self.session.post(
             self.base_url + path,
@@ -1320,7 +1375,12 @@ class OpenAIBackendAPI:
             json={"is_visible": False},
             timeout=timeout_secs,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        except Exception as exc:
+            if classify_image_exception(exc).capability == "auth":
+                self._schedule_auth_recovery("image_conversation_cleanup_after_success")
+            raise
         try:
             return response.json()
         except Exception:
@@ -1343,6 +1403,10 @@ class OpenAIBackendAPI:
             data = response.json()
             return data.get("items") or data.get("conversations") or []
         except Exception as exc:
+            failure = classify_image_exception(exc)
+            if failure.capability == "auth":
+                setattr(exc, "failure", failure)
+                raise
             logger.debug({"event": "list_conversations_failed", "error": diagnostic_excerpt(exc, 300)})
             return []
 
@@ -1385,12 +1449,12 @@ class OpenAIBackendAPI:
                 # 简单的关键词匹配
                 prompt_words = set(prompt_lower.split())
                 title_words = set(title.split())
-                common = prompt_words & title_words
+                common = (prompt_words & title_words) - {
+                    "create", "created", "generate", "generated",
+                    "generation", "image", "images",
+                }
                 if common:
                     score = len(common) / max(len(prompt_words), 1)
-            # 图生图通常标题为 "Image" 开头
-            if title.startswith("image"):
-                score += 0.3
             if score > best_score:
                 best_score = score
                 best_match = conv_id
@@ -1401,17 +1465,6 @@ class OpenAIBackendAPI:
                 "match_score": round(best_score, 2),
             })
             return best_match
-        # 如果没有标题匹配，返回最新的对话（时间最近的）
-        for item in items:
-            conv_id = str(item.get("id") or item.get("conversation_id") or "")
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
-            if conv_id and updated_at and started_at and updated_at >= started_at - 30:
-                logger.info({
-                    "event": "conversation_latest_match",
-                    "conversation_id": conv_id,
-                    "updated_at": updated_at,
-                })
-                return conv_id
         return ""
 
     @staticmethod
@@ -1540,7 +1593,7 @@ class OpenAIBackendAPI:
             raise RuntimeError(f"invalid upload response: {payload}")
         response = self.session.put(
             upload_url,
-            headers={
+            headers=self._signed_asset_headers({
                 "Content-Type": mime_type,
                 "x-ms-blob-type": "BlockBlob",
                 "x-ms-version": "2020-04-08",
@@ -1549,11 +1602,11 @@ class OpenAIBackendAPI:
                 "User-Agent": self.user_agent,
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.8",
-            },
+            }),
             data=data,
             timeout=120,
         )
-        ensure_ok(response, "image_upload")
+        ensure_ok(response, "image_upload", credential_scope="signed_asset")
         path = f"/backend-api/files/{file_id}/uploaded"
         response = self.session.post(
             self.base_url + path,
@@ -2457,6 +2510,31 @@ class OpenAIBackendAPI:
         return file_ids, sediment_ids
 
     @classmethod
+    def _extract_image_asset_pointer_ids(
+        cls,
+        payload: Any,
+    ) -> tuple[list[str], list[str]]:
+        file_ids: list[str] = []
+        sediment_ids: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                asset_pointer = value.get("asset_pointer")
+                if isinstance(asset_pointer, str):
+                    cls._add_unique(file_ids, FILE_SERVICE_ID_RE.findall(asset_pointer))
+                    cls._add_unique(file_ids, REAL_IMAGE_FILE_ID_RE.findall(asset_pointer))
+                    cls._add_unique(sediment_ids, SEDIMENT_ID_RE.findall(asset_pointer))
+                for item in value.values():
+                    if isinstance(item, (dict, list)):
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(payload)
+        return file_ids, sediment_ids
+
+    @classmethod
     def _has_image_asset_pointer(cls, payload: Any) -> bool:
         if isinstance(payload, dict):
             if str(payload.get("content_type") or "") == "image_asset_pointer":
@@ -2484,9 +2562,16 @@ class OpenAIBackendAPI:
                 continue
             is_image_gen = metadata.get("async_task_type") == "image_gen"
             has_asset_pointer = self._has_image_asset_pointer(content) or self._has_image_asset_pointer(metadata)
-            if role == "assistant" and not (is_image_gen or has_asset_pointer):
-                continue
-            file_ids, sediment_ids = self._extract_image_reference_ids({"content": content, "metadata": metadata})
+            if role == "assistant":
+                if not has_asset_pointer:
+                    continue
+                file_ids, sediment_ids = self._extract_image_asset_pointer_ids(
+                    {"content": content, "metadata": metadata}
+                )
+            else:
+                file_ids, sediment_ids = self._extract_image_reference_ids(
+                    {"content": content, "metadata": metadata}
+                )
             if not is_image_gen and not has_asset_pointer and not file_ids and not sediment_ids:
                 continue
             records.append(
@@ -2707,6 +2792,25 @@ class OpenAIBackendAPI:
                     "status_code": task_probe_failure.status_code,
                     "error": diagnostic_excerpt(exc, 300),
                 })
+                if task_probe_failure.capability == "auth":
+                    setattr(exc, "failure", task_probe_failure)
+                    if file_ids or sediment_ids:
+                        try:
+                            self._schedule_auth_recovery("image_task_probe_after_success")
+                        except Exception as recovery_exc:
+                            logger.warning({
+                                "event": "image_auth_recovery_schedule_failed",
+                                "source": "image_task_probe_after_success",
+                                "conversation_id": conversation_id,
+                                "error": diagnostic_excerpt(recovery_exc, 300),
+                            })
+                        return file_ids, sediment_ids
+                    _raise_final_failure(
+                        task_probe_failure,
+                        raw_detail=str(exc),
+                        source_error=exc,
+                        upstream_error=str(exc),
+                    )
             except Exception as exc:
                 # tasks 查询失败不影响正常轮询流程
                 logger.debug({
@@ -2843,9 +2947,9 @@ class OpenAIBackendAPI:
             if wait > 0:
                 self._sleep_for_image_poll(wait)
         timeout_failure = image_failure("image_poll_timeout")
-        final_failure = merge_message_failure(timeout_failure, pending_task_failure)
-        final_failure = merge_message_failure(final_failure, task_probe_failure)
+        final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
         final_failure = merge_message_failure(final_failure, conversation_transport_failure)
+        final_failure = merge_message_failure(final_failure, timeout_failure)
         assert final_failure is not None
         logger.info({
             "event": "image_poll_terminal_failure",
@@ -2974,7 +3078,7 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls: list[str] = []
-        resolution_errors: list[Exception] = []
+        resolution_errors: list[tuple[ImageFailure, Exception]] = []
         skip_patterns = {"file_upload"}
 
         def resolve_candidate(
@@ -2982,15 +3086,24 @@ class OpenAIBackendAPI:
                 asset_id: str,
                 resolver: Callable[[], str],
         ) -> str:
-            last_error: Exception | None = None
             for attempt in range(2):
                 try:
                     url = str(resolver() or "").strip()
                 except Exception as exc:
-                    last_error = exc
                     failure = classify_image_exception(exc)
+                    missing_candidate = (
+                        isinstance(exc, UpstreamHTTPError)
+                        and exc.status_code == 404
+                        and "file_not_ready" in structured_upstream_codes(exc.body)
+                    )
                     logger.warning({
-                        "event": "image_download_url_retry" if attempt == 0 else "image_download_url_failed",
+                        "event": (
+                            "image_download_url_missing"
+                            if missing_candidate
+                            else "image_download_url_retry"
+                            if attempt == 0 and failure.capability != "auth"
+                            else "image_download_url_failed"
+                        ),
                         "source": source,
                         "conversation_id": conversation_id,
                         "id": asset_id,
@@ -2998,25 +3111,42 @@ class OpenAIBackendAPI:
                         "failure_code": failure.code,
                         "error": diagnostic_excerpt(repr(exc), 300),
                     })
-                    if attempt == 0:
+                    if missing_candidate:
+                        if attempt == 0:
+                            continue
+                        delivery_error = ImageDownloadError(
+                            "image download URL resolution failed: "
+                            f"{diagnostic_excerpt(exc, 500)}"
+                        )
+                        resolution_errors.append(
+                            (delivery_error.failure, delivery_error)
+                        )
+                        return ""
+                    if attempt == 0 and failure.capability != "auth":
                         continue
-                    break
+                    resolution_errors.append((failure, exc))
+                    return ""
                 if url:
                     return url
                 logger.warning({
-                    "event": "image_download_url_retry" if attempt == 0 else "image_download_url_failed",
+                    "event": (
+                        "image_download_url_retry"
+                        if attempt == 0
+                        else "image_download_url_failed"
+                    ),
                     "source": source,
                     "conversation_id": conversation_id,
                     "id": asset_id,
                     "attempt": attempt + 1,
                     "failure_code": "empty_download_url",
                 })
-
-            resolution_errors.append(
-                last_error or ImageDownloadError(
+                if attempt == 0:
+                    continue
+                delivery_error = ImageDownloadError(
                     f"empty download URL for {source} result {asset_id}"
                 )
-            )
+                resolution_errors.append((delivery_error.failure, delivery_error))
+                return ""
             return ""
 
         for file_id in file_ids:
@@ -3053,15 +3183,25 @@ class OpenAIBackendAPI:
             "conversation_id": conversation_id,
             "file_ids": file_ids,
             "sediment_ids": sediment_ids,
-            "urls": urls,
+            "url_count": len(urls),
+            "url_hosts": sorted({urlparse(url).netloc for url in urls if urlparse(url).netloc}),
         })
-        if not urls and resolution_errors:
-            detail = diagnostic_excerpt(resolution_errors[0], 500)
-            error = ImageDownloadError(
-                f"image download URL resolution failed: {detail}"
+        auth_failed = any(failure.capability == "auth" for failure, _ in resolution_errors)
+        if urls:
+            if auth_failed:
+                self._schedule_auth_recovery("image_url_resolution_after_success")
+            return urls
+        if resolution_errors:
+            _, error = max(
+                resolution_errors,
+                key=lambda item: (
+                    item[0].capability == "auth",
+                    item[0].switch_account,
+                    not item[0].retryable,
+                ),
             )
             setattr(error, "conversation_id", conversation_id or "")
-            raise error from resolution_errors[0]
+            raise error
         return urls
 
     def _resolve_image_urls_with_timing(
@@ -3129,11 +3269,15 @@ class OpenAIBackendAPI:
             except Exception as exc:
                 if not file_ids and not sediment_ids:
                     raise
+                failure = classify_image_exception(exc)
+                if failure.capability == "auth":
+                    self._schedule_auth_recovery("image_result_probe_after_success")
                 logger.warning({
                     "event": "image_resolve_poll_partial_error",
                     "conversation_id": conversation_id,
                     "file_ids": file_ids,
                     "sediment_ids": sediment_ids,
+                    "failure_code": failure.code,
                     "error": diagnostic_excerpt(repr(exc), 300),
                 })
             else:
@@ -3144,10 +3288,28 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
         for url in urls:
+            parsed_url = urlparse(url)
+            same_origin = (
+                not parsed_url.netloc
+                or parsed_url.netloc.lower() == urlparse(self.base_url).netloc.lower()
+            )
+            download_headers = (
+                self._headers(parsed_url.path or "/")
+                if same_origin
+                else self._signed_asset_headers()
+            )
             for attempt in range(2):
                 try:
-                    response = self.session.get(url, timeout=120)
-                    ensure_ok(response, "image_download")
+                    response = self.session.get(
+                        url,
+                        headers=download_headers,
+                        timeout=120,
+                    )
+                    ensure_ok(
+                        response,
+                        "image_download",
+                        credential_scope="account" if same_origin else "signed_asset",
+                    )
                     content = bytes(response.content or b"")
                     if not content:
                         if attempt == 0:
@@ -3164,16 +3326,18 @@ class OpenAIBackendAPI:
                 except ImageDownloadError:
                     raise
                 except Exception as exc:
+                    failure = classify_image_exception(exc)
                     if attempt == 0:
                         logger.warning({
                             "event": "image_download_retry",
-                            "reason": classify_image_exception(exc).code,
+                            "reason": failure.code,
                             "url_host": urlparse(url).netloc,
                             "error": diagnostic_excerpt(repr(exc), 300),
                         })
                         continue
                     raise ImageDownloadError(
-                        f"image download failed: {diagnostic_excerpt(exc, 500)}"
+                        f"image download failed: {diagnostic_excerpt(exc, 500)}",
+                        failure=failure,
                     ) from exc
         return images
 
@@ -3259,7 +3423,7 @@ class OpenAIBackendAPI:
             headers=self._bootstrap_headers(),
             timeout=30,
         )
-        ensure_ok(response, "bootstrap")
+        ensure_ok(response, "bootstrap", credential_scope="public")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]

@@ -39,6 +39,9 @@ function normalizeCatalog(payload: ModelCatalogResponse | null | undefined): Mod
     all_models: normalizeList(payload.all_models).length
       ? normalizeList(payload.all_models)
       : normalizeList([...chatModels, ...imageModels]),
+    capabilities: {
+      image_upscale: Boolean(payload.capabilities?.image_upscale),
+    },
   }
 }
 
@@ -50,6 +53,9 @@ function catalogFromOpenAIModels(response: ModelListResponse): ModelCatalogRespo
     chat_models: ids.filter(model => !isImageModelId(model)),
     image_models: ids.filter(model => isImageModelId(model)),
     all_models: ids,
+    capabilities: {
+      image_upscale: false,
+    },
     source: {
       chat: 'openai_models_endpoint',
       image: 'openai_models_endpoint',

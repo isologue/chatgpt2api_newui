@@ -122,6 +122,9 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
         while not stop_event.is_set():
             try:
                 account_service.cleanup_auto_remove_accounts()
+                pending_auth = account_service.list_pending_auth_verification_tokens()
+                if pending_auth:
+                    account_service.resume_pending_auth_verifications()
                 limited_tokens = account_service.list_limited_tokens()
                 suspicious_tokens = account_service.list_suspicious_tokens()
                 normal_tokens = account_service.list_normal_tokens()
@@ -136,7 +139,8 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         f"{len(suspicious_tokens)} suspicious accounts, "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(expiring_tokens)} expiring access tokens "
-                        f"(skipping {len(normal_tokens)} normal accounts)"
+                        f"(skipping {len(normal_tokens)} normal accounts, "
+                        f"recovering {len(pending_auth)} pending auth accounts)"
                     )
                     account_service.refresh_accounts(tokens)
                 if keepalive_tokens:

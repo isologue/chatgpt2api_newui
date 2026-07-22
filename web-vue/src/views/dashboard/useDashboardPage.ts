@@ -147,6 +147,7 @@ export function useDashboardPage() {
         labels: [] as string[],
         totalRequests: [] as number[],
         failedRequests: [] as number[],
+        textReviewRequests: [] as number[],
       },
       model: {
         modelRequests: {} as Record<string, number[]>,
@@ -549,6 +550,7 @@ export function useDashboardPage() {
     const failed = normalizeNumberSeries(trend.failed_requests, pointCount)
     const limited = normalizeNumberSeries(trend.rate_limited_requests, pointCount)
     const success = normalizeNumberSeries(trend.success_requests, pointCount)
+    const textReview = normalizeNumberSeries(trend.text_review_requests, pointCount)
     const modelRequests = normalizeModelSeries(trend.model_requests, pointCount)
     const modelTtfbTimes = normalizeModelSeries(trend.model_ttfb_times, pointCount)
     const modelTotalTimes = normalizeModelSeries(trend.model_total_times, pointCount)
@@ -575,6 +577,7 @@ export function useDashboardPage() {
         chartData.value.successRate.labels = labels
         chartData.value.successRate.totalRequests = totalSeries
         chartData.value.successRate.failedRequests = failureSeries
+        chartData.value.successRate.textReviewRequests = textReview
         break
       case 'model':
         chartData.value.model.modelRequests = modelRequests
@@ -683,7 +686,8 @@ export function useDashboardPage() {
     const theme = getLineChartTheme()
     const successRates = chartData.value.successRate.totalRequests.map((total, idx) => {
       const failure = chartData.value.successRate.failedRequests[idx] || 0
-      return total > 0 ? Math.round(((total - failure) / total) * 100) : 100
+      const measured = Math.max(0, total - (chartData.value.successRate.textReviewRequests[idx] || 0))
+      return measured > 0 ? Math.round(((measured - failure) / measured) * 100) : 100
     })
 
     applyAnimatedOption('successRate', {

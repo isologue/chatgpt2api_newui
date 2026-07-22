@@ -100,6 +100,7 @@
         :image-form="imageForm"
         :chat-model-options="chatModelOptions"
         :image-model-options="imageModelOptions"
+        :image-upscale-enabled="imageUpscaleEnabled"
         :references="referenceRuntime.references.value"
         :is-sending="isSending"
         :is-streaming="isStreaming"
@@ -249,6 +250,7 @@ const toggleFullscreen = layoutRuntime.toggleFullscreen
 const chatModel = modelFormRuntime.chatModel
 const chatReasoningEffort = modelFormRuntime.chatReasoningEffort
 const imageForm = modelFormRuntime.imageForm
+const imageUpscaleEnabled = modelFormRuntime.imageUpscaleEnabled
 
 const conversations = ref<StudioConversation[]>(persistedConversationState.conversations)
 const activeConversationId = ref(persistedConversationState.activeConversationId)
@@ -659,6 +661,7 @@ function initializeStudio() {
   void modelFormRuntime.loadModelCatalog()
   void preloadPromptLibrary()
   void imageTaskRuntime.refresh()
+  imageTaskRuntime.schedulePoll()
 }
 
 function activateStudio() {

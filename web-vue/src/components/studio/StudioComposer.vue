@@ -273,6 +273,7 @@ const props = defineProps<{
   imageForm: StudioImageForm
   chatModelOptions: string[]
   imageModelOptions: string[]
+  imageUpscaleEnabled: boolean
   references: StudioReference[]
   isSending: boolean
   isStreaming: boolean
@@ -365,7 +366,7 @@ const imageModelSelectOptions = computed(() => props.imageModelOptions.map((mode
   value: model,
 })))
 
-const sizePresets = computed(() => resolveImageSizePresets(props.imageForm.model))
+const sizePresets = computed(() => resolveImageSizePresets(props.imageForm.model, props.imageUpscaleEnabled))
 const selectedPreset = computed(() => sizePresets.value.find((preset) => preset.value === props.imageForm.size))
 const selectedRatio = computed(() => selectedPreset.value?.ratio || 'auto')
 const selectedResolution = computed(() => selectedPreset.value?.resolution || 'auto')

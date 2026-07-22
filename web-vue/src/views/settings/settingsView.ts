@@ -66,6 +66,11 @@ export const settingsTabs: SettingsSelectOption[] = [
 
 export const logLevelOptions = ['debug', 'info', 'warning', 'error'] as const
 
+export const imageUpscaleEngineOptions: SettingsSelectOption[] = [
+  { label: 'Sharp / Lanczos3', value: 'sharp_lanczos3' },
+  { label: 'Pillow / Lanczos', value: 'pillow_lanczos' },
+]
+
 export const backupIncludeOptions: SettingsBackupIncludeOption[] = [
   { value: 'config', label: '系统配置' },
   { value: 'register', label: '注册配置' },

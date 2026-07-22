@@ -49,7 +49,7 @@
             <p class="text-sm font-semibold text-foreground">{{ group.title }}</p>
             <p class="text-xs text-muted-foreground">{{ group.meta }}</p>
           </div>
-          <div class="mt-3 grid gap-2 sm:grid-cols-2 2xl:grid-cols-4">
+          <div class="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
             <div
               v-for="item in group.items"
               :key="`${group.key}-${item.key}`"

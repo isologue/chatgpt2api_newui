@@ -34,6 +34,7 @@ type BackendLogsResponse = {
   stats?: {
     total?: number
     success?: number
+    text_review?: number
     failed?: number
     limited?: number
     image?: number
@@ -72,6 +73,7 @@ export type SystemLogsResponse = {
   stats: {
     total: number
     success: number
+    text_review: number
     failed: number
     limited: number
     image: number
@@ -221,6 +223,11 @@ const RATE_LIMIT_FAILURE_CODES = new Set([
   '限流',
 ])
 
+const TEXT_REVIEW_FAILURE_CODES = new Set([
+  'content_policy_violation',
+  'upstream_text_reply',
+])
+
 const IMAGE_FAILURE_LABELS: Record<string, string> = {
   upstream_error: '上游请求失败',
   internal_error: '内部处理异常',
@@ -248,6 +255,10 @@ const IMAGE_FAILURE_LABELS: Record<string, string> = {
 
 export function isRateLimitFailureCode(value: unknown): boolean {
   return RATE_LIMIT_FAILURE_CODES.has(cleanString(value).toLowerCase())
+}
+
+export function isTextReviewFailureCode(value: unknown): boolean {
+  return TEXT_REVIEW_FAILURE_CODES.has(cleanString(value).toLowerCase())
 }
 
 export function imageFailureLabel(value: unknown): string {
@@ -279,6 +290,7 @@ function normalizeLevel(item: SystemLog): LogEntry['level'] {
   const imageResultStatus = cleanString(detail.image_result_status).toLowerCase()
   const error = cleanString(detail.error)
   const errorCode = structuredFailureCode(detail)
+  if (isTextReviewFailureCode(errorCode)) return 'WARNING'
   if (status === 'failed' || error || errorCode) return 'ERROR'
   if (status === 'warning' || status === 'limited' || imageResultStatus === 'partial_success') return 'WARNING'
   return 'INFO'
@@ -590,11 +602,16 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
 }
 
 export function isSystemLogFailed(item: SystemLogRow): boolean {
+  if (isSystemLogTextReview(item)) return false
   return item.status.toLowerCase() === 'failed' || Boolean(item.error || item.errorCode)
 }
 
 export function isSystemLogSuccess(item: SystemLogRow): boolean {
   return item.status.toLowerCase() === 'success'
+}
+
+export function isSystemLogTextReview(item: SystemLogRow): boolean {
+  return item.status.toLowerCase() === 'text_review' || isTextReviewFailureCode(item.errorCode)
 }
 
 export function isSystemLogLimited(item: SystemLogRow): boolean {
@@ -791,9 +808,16 @@ function normalizeSystemParams(params?: SystemLogsListParams) {
 }
 
 function buildSystemStatsFallback(items: SystemLog[]) {
-  const isSuccess = (item: SystemLog) => cleanString(detailValue(item.detail || {}, 'status')).toLowerCase() === 'success'
+  const isTextReview = (item: SystemLog) => {
+    const detail = item.detail || {}
+    return cleanString(detailValue(detail, 'status')).toLowerCase() === 'text_review'
+      || isTextReviewFailureCode(structuredFailureCode(detail))
+  }
+  const isSuccess = (item: SystemLog) => !isTextReview(item)
+    && cleanString(detailValue(item.detail || {}, 'status')).toLowerCase() === 'success'
   const isFailed = (item: SystemLog) => {
     const detail = item.detail || {}
+    if (isTextReview(item)) return false
     return cleanString(detailValue(detail, 'status')).toLowerCase() === 'failed'
       || Boolean(detailValue(detail, 'error') || structuredFailureCode(detail))
   }
@@ -806,6 +830,7 @@ function buildSystemStatsFallback(items: SystemLog[]) {
   return {
     total: items.length,
     success: items.filter(isSuccess).length,
+    text_review: items.filter(isTextReview).length,
     failed: items.filter(isFailed).length,
     limited: items.filter(isLimited).length,
     image: items.filter((item) => {
@@ -906,6 +931,7 @@ function normalizeSystemResponse(response: BackendLogsResponse): SystemLogsRespo
     stats: {
       total: Number(stats.total ?? total),
       success: Number(stats.success ?? fallbackStats.success),
+      text_review: Number(stats.text_review ?? fallbackStats.text_review),
       failed: Number(stats.failed ?? fallbackStats.failed),
       limited: Number(stats.limited ?? fallbackStats.limited),
       image: Number(stats.image ?? fallbackStats.image),

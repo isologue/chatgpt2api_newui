@@ -13,6 +13,14 @@ COPY web-vue ./
 RUN npm run build
 
 
+FROM node:22-bookworm-slim AS image-upscale-build
+
+WORKDIR /app/scripts/image_upscale
+
+COPY scripts/image_upscale/package.json scripts/image_upscale/package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+
 FROM python:3.13-slim AS app
 
 ARG TARGETARCH
@@ -51,6 +59,8 @@ COPY api ./api
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
+COPY --from=image-upscale-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=image-upscale-build /app/scripts/image_upscale/node_modules ./scripts/image_upscale/node_modules
 COPY --from=web-build /app/web-vue/dist ./web_dist
 
 EXPOSE 80

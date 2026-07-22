@@ -5,6 +5,11 @@ export type MonitorMetricMap = Record<string, number>
 export interface RealtimeMonitorImage {
   index?: number
   total?: number
+  account_email?: string
+  previous_account_email?: string
+  account_attempt?: number
+  max_account_attempts?: number
+  account_switch_count?: number
   stage?: string
   stage_label?: string
   status?: string
@@ -48,6 +53,10 @@ export interface RealtimeMonitorRecord {
   perf?: MonitorMetricMap
   images?: Record<string, RealtimeMonitorImage>
   account_email?: string
+  previous_account_email?: string
+  image_account_attempt?: number
+  image_account_max_attempts?: number
+  image_account_switch_count?: number
   conversation_id?: string
   error?: string
   raw_error?: string
@@ -72,7 +81,13 @@ export interface RealtimeMonitorSummary {
   completed: number
   success: number
   failed: number
+  text_review: number
   success_rate: number
+  account_switch_requests: number
+  account_switches: number
+  account_switch_success: number
+  account_switch_recovery_rate: number
+  stream_error_requests: number
   avg_duration_ms: number
   p95_duration_ms: number
   metric_p95: MonitorMetricMap
@@ -83,11 +98,6 @@ export interface RealtimeMonitorSummary {
     egress_wait: number
     total_over_120s: number
     local_reject_or_busy: number
-  }
-  bottleneck: {
-    key: string
-    label: string
-    value_ms: number
   }
   by_model: Record<string, number>
   active_by_model: Record<string, number>

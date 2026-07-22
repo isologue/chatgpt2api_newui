@@ -19,7 +19,7 @@ export type StudioModelFormRuntimeInput = {
 }
 
 export function useStudioModelFormRuntime(input: StudioModelFormRuntimeInput) {
-  const { chatModels, imageModels, loadModelCatalog } = useModelCatalog(() => input.settingsStore.settings)
+  const { catalog, chatModels, imageModels, loadModelCatalog } = useModelCatalog(() => input.settingsStore.settings)
   const chatModel = ref(getStringPreference(preferenceKeys.studioChatModel, 'auto') || 'auto')
   const chatReasoningEffort = ref(getStringPreference(preferenceKeys.studioChatReasoningEffort, ''))
   const imageForm = reactive<StudioImageForm>({
@@ -31,12 +31,18 @@ export function useStudioModelFormRuntime(input: StudioModelFormRuntimeInput) {
 
   const chatModelOptions = computed(() => uniqueStrings(['auto', ...chatModels.value]))
   const imageModelOptions = computed(() => uniqueStrings([imageForm.model, DEFAULT_IMAGE_MODEL, ...imageModels.value]))
+  const imageUpscaleEnabled = computed(() => Boolean(
+    input.settingsStore.settings?.image_upscale_enabled
+      ?? catalog.value?.capabilities?.image_upscale,
+  ))
 
   watch(chatModel, (model) => setStringPreference(preferenceKeys.studioChatModel, model || 'auto'))
   watch(chatReasoningEffort, (effort) => setStringPreference(preferenceKeys.studioChatReasoningEffort, effort || ''))
   watch(() => imageForm.model, (model) => {
     setStringPreference(preferenceKeys.studioImageModel, model || DEFAULT_IMAGE_MODEL)
-    if (!isImageSizeSupportedByModel(imageForm.size, model)) imageForm.size = DEFAULT_IMAGE_SIZE
+  })
+  watch([() => imageForm.model, imageUpscaleEnabled], ([model, upscaleEnabled]) => {
+    if (!isImageSizeSupportedByModel(imageForm.size, model, upscaleEnabled)) imageForm.size = DEFAULT_IMAGE_SIZE
   })
 
   return {
@@ -45,6 +51,7 @@ export function useStudioModelFormRuntime(input: StudioModelFormRuntimeInput) {
     chatReasoningEffort,
     imageForm,
     imageModelOptions,
+    imageUpscaleEnabled,
     loadModelCatalog,
   }
 }
