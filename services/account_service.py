@@ -82,6 +82,12 @@ class RefreshCredentialsChangedError(RuntimeError):
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
+    STATUS_NORMAL = "正常"
+    STATUS_LIMITED = "限流"
+    STATUS_SUSPICIOUS = "存疑"
+    STATUS_ABNORMAL = "异常"
+    STATUS_DISABLED = "禁用"
+
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
