@@ -93,7 +93,7 @@ export const providerCommonKeys = ['id', 'enable', 'type', 'label'] as const
 
 export const providerTypeKeys: Record<string, string[]> = {
   cloudmail_gen: ['api_base', 'admin_email', 'admin_password', 'domain', 'subdomain', 'email_prefix'],
-  cloudflare_temp_email: ['api_base', 'admin_password', 'domain'],
+  cloudflare_temp_email: ['api_base', 'admin_password', 'domain', 'enableRandomSubdomain'],
   tempmail_lol: ['api_key', 'domain'],
   moemail: ['api_base', 'api_key', 'domain', 'expiry_time'],
   inbucket: ['api_base', 'domain', 'random_subdomain'],
@@ -157,7 +157,7 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
     case 'cloudmail_gen':
       return { ...base, api_base: '', admin_email: '', admin_password: '', domain: [], subdomain: [], email_prefix: '' }
     case 'cloudflare_temp_email':
-      return { ...base, api_base: '', admin_password: '', domain: [] }
+      return { ...base, api_base: '', admin_password: '', domain: [], enableRandomSubdomain: true }
     case 'tempmail_lol':
       return { ...base, api_key: '', domain: [] }
     case 'moemail':

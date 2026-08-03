@@ -43,6 +43,7 @@ export type RegisterProvider = {
   domain?: string[]
   cf_domain?: string[]
   random_subdomain?: boolean
+  enableRandomSubdomain?: boolean
   wildcard?: boolean
   expiry_time?: number
   mailboxes?: string

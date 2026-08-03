@@ -256,6 +256,16 @@
           />
         </label>
 
+        <label v-if="currentType === 'cloudflare_temp_email'" class="register-checkbox-field">
+          <Checkbox
+            :model-value="provider.enableRandomSubdomain !== false"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'enableRandomSubdomain', Boolean(value))"
+          >
+            启用随机二级子域名
+          </Checkbox>
+        </label>
+
         <label v-if="currentType === 'inbucket'" class="register-checkbox-field">
           <Checkbox
             :model-value="provider.random_subdomain"

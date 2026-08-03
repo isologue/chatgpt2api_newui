@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import imaplib
@@ -729,6 +729,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
+        self.enable_random_subdomain = _normalize_bool(entry.get("enableRandomSubdomain"), True)
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
@@ -738,7 +739,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         return {} if resp.status_code == 204 else resp.json()
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
+        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "enableRandomSubdomain": self.enable_random_subdomain, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:
