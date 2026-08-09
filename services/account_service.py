@@ -357,6 +357,9 @@ class AccountService:
             "rate_limited": "限流",
             "cooling": "限流",
             "backoff": "限流",
+            "存疑": "存疑",
+            "suspicious": "存疑",
+            "suspected": "存疑",
             "异常": "异常",
             "abnormal": "异常",
             "invalid": "异常",
@@ -464,6 +467,8 @@ class AccountService:
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
+        normalized["last_suspect_reason"] = normalized.get("last_suspect_reason") or None
+        normalized["last_suspect_at"] = normalized.get("last_suspect_at") or None
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
         normalized["last_remote_checked_at"] = normalized.get("last_remote_checked_at") or None
         normalized["last_remote_check_attempt_at"] = normalized.get("last_remote_check_attempt_at") or None
@@ -504,6 +509,82 @@ class AccountService:
             normalized.pop(key, None)
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
+
+    @classmethod
+    def _account_created_sort_key(cls, account: dict) -> tuple[float, str]:
+        created_at = cls._parse_time(account.get("created_at"))
+        created_ts = created_at.timestamp() if created_at is not None else 0.0
+        return (-created_ts, str(account.get("access_token") or ""))
+
+    @classmethod
+    def _sorted_accounts_newest_first(cls, accounts: list[dict]) -> list[dict]:
+        return sorted(accounts, key=cls._account_created_sort_key)
+
+    @classmethod
+    def _is_free_account(cls, account: dict | None) -> bool:
+        return (cls._normalize_account_type((account or {}).get("type")) or "").lower() == "free"
+
+    @staticmethod
+    def _is_token_invalid_text(message: str) -> bool:
+        text = str(message or "").lower()
+        return (
+            "token_invalidated" in text
+            or "token_revoked" in text
+            or "authentication token has been invalidated" in text
+            or "invalidated oauth token" in text
+            or "invalid access token" in text
+            or "token invalidated" in text
+        )
+
+    @classmethod
+    def is_auth_invalid_error(cls, error: object) -> bool:
+        """Return whether an exception confirms that the access token is invalid."""
+        if error is None:
+            return False
+        failure = error if isinstance(error, ImageFailure) else getattr(error, "failure", None)
+        if isinstance(failure, ImageFailure) and failure.code == "auth_invalid":
+            return True
+        if cls._is_token_invalid_text(str(error or "")):
+            return True
+        try:
+            status_code = int(getattr(error, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        code = str(getattr(error, "code", "") or "").strip().lower()
+        return status_code == 401 or code in {"invalid_access_token", "token_invalidated", "token_revoked"}
+
+    @classmethod
+    def should_mark_free_account_suspicious(cls, error: object) -> bool:
+        if error is None or cls.is_auth_invalid_error(error):
+            return False
+        failure = error if isinstance(error, ImageFailure) else getattr(error, "failure", None)
+        if isinstance(failure, ImageFailure):
+            if not failure.account_failure:
+                return False
+            if 400 <= int(failure.status_code or 0) < 500:
+                return False
+            return failure.code not in {
+                "content_policy_violation",
+                "request_cancelled",
+                "upstream_text_reply",
+                "unsupported_model",
+            }
+        class_name = type(error).__name__.lower()
+        if class_name in {"requestcancellederror", "imagecontentpolicyerror", "imagetextreplyerror"}:
+            return False
+        try:
+            status_code = int(getattr(error, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        code = str(getattr(error, "code", "") or "").strip().lower()
+        if status_code == 499 or 400 <= status_code < 500:
+            return False
+        return code not in {
+            "content_policy_violation",
+            "request_cancelled",
+            "upstream_text_reply",
+            "unsupported_model",
+        }
 
     @staticmethod
     def _jwt_exp(access_token: str) -> int:
@@ -1375,6 +1456,61 @@ class AccountService:
             quiet=quiet,
         )
 
+    def mark_free_account_suspicious(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        quiet: bool = False,
+    ) -> dict | None:
+        if not access_token:
+            return None
+        reason = str(error or "system failure") or "system failure"
+        if isinstance(error, ImageFailure):
+            reason = str(error.raw_detail or error.code or reason)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None or not self._is_free_account(current):
+                return None
+            next_item = dict(current)
+            next_item["status"] = self.STATUS_SUSPICIOUS
+            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_suspect_reason"] = reason
+            next_item["last_suspect_at"] = now
+            next_item["last_refresh_error"] = reason
+            next_item["last_refresh_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+        if not quiet:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "标记存疑账号",
+                {"source": event, "token": anonymize_token(access_token), "error": reason},
+            )
+        return self.get_account(access_token)
+
+    def handle_request_failure(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        quiet: bool = False,
+    ) -> bool:
+        if not access_token:
+            return False
+        account = self.get_account(access_token)
+        if account is None or not self._is_free_account(account):
+            return False
+        if not self.should_mark_free_account_suspicious(error):
+            return False
+        return self.mark_free_account_suspicious(access_token, event, error, quiet=quiet) is not None
+
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
             return None
@@ -1404,6 +1540,16 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "限流"
+                   and item.get("last_remote_check_result") != "pending"
+                   and (token := item.get("access_token") or "")
+            ]
+
+    def list_suspicious_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == self.STATUS_SUSPICIOUS
                    and item.get("last_remote_check_result") != "pending"
                    and (token := item.get("access_token") or "")
             ]
