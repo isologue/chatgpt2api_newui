@@ -840,7 +840,7 @@ class PlatformRegistrar:
             step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
         return bundle
 
-    def _platform_authorize(self, email: str, index: int, screen_hint: str = "login_or_signup") -> str:
+    def _platform_authorize(self, email: str | None, index: int, screen_hint: str = "login_or_signup") -> str:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
@@ -854,7 +854,6 @@ class PlatformRegistrar:
             # 官网当前的新账号流程使用 passwordless signup。
             "screen_hint": screen_hint,
             "max_age": "0",
-            "login_hint": email,
             "scope": "openid profile email offline_access",
             "response_type": "code",
             "response_mode": "query",
@@ -864,6 +863,9 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
+        # 首次预热授权时邮箱尚未创建，不能发送空 login_hint；拿到授权会话后再创建邮箱并提交。
+        if str(email or "").strip():
+            params["login_hint"] = str(email).strip()
         target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
         headers = self._navigate_headers(f"{platform_base}/")
         headers = _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent)
@@ -1260,6 +1262,10 @@ class PlatformRegistrar:
         return tokens
 
     def register(self, index: int) -> dict:
+        # 先建立并验证平台授权会话。若 Cloudflare/IP 拦截，任务会在领邮箱前结束，
+        # 避免消耗 Remail 订单或占用邮箱池。
+        landed = self._platform_authorize(None, index)
+
         step(index, "开始创建邮箱")
         mailbox = create_mailbox(register_proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
@@ -1270,13 +1276,18 @@ class PlatformRegistrar:
         step(index, f"邮箱创建完成[{label}]: {email}")
         try:
             first_name, last_name = _random_name()
-            # authorize 可能直接发送 OTP，先记录收信边界，避免慢跳转后漏掉验证码。
+            # 邮箱创建完成后才提交邮箱；记录边界，避免读取到历史验证码。
             mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-            landed = self._platform_authorize(email, index)
             if landed == "login":
                 tokens = self._passwordless_login(email, mailbox, index)
             else:
-                if not self.passwordless_signup:
+                # 预热授权没有 login_hint，因此无论落在哪个注册页，都必须在这里提交
+                # 新建邮箱，确认当前会话已绑定邮箱并决定是否已自动发送验证码。
+                otp_ready = self._authorize_continue_signup(email, index)
+                if otp_ready:
+                    self.passwordless_signup = True
+                    step(index, "authorize/continue 已进入验证码页，跳过重复 send-otp", "yellow")
+                else:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                     self._start_passwordless_signup(email, index)
                 step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
@@ -1301,6 +1312,7 @@ class PlatformRegistrar:
             "source_type": "web",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
 
 
 def worker(index: int) -> dict:
