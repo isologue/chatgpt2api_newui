@@ -409,7 +409,7 @@ curl http://localhost:8000/v1/images/generations \
     "model": "gpt-image-2",
     "prompt": "一只漂浮在太空里的猫",
     "n": 1,
-    "response_format": "b64_json"
+    "response_format": "url"
   }'
 ```
 
@@ -419,7 +419,7 @@ curl http://localhost:8000/v1/images/generations \
 | `prompt` | 图片生成提示词。 |
 | `n` | 生成数量，当前限制 `1-4`。 |
 | `size` | 可传官方尺寸字段，具体解析取决于上游能力。 |
-| `response_format` | 默认兼容 `b64_json`，也会保存本地图片 URL 供日志和图库使用。 |
+| `response_format` | 默认返回 `url`；需要 base64 时传 `b64_json`、`base64`、`base64_json` 或 `b64`。 |
 
 </details>
 

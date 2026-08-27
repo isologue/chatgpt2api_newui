@@ -17,6 +17,7 @@ from services.protocol.conversation import (
     count_text_tokens,
     encode_images,
     normalize_messages,
+    normalize_image_response_format,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
@@ -173,7 +174,7 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
     raise HTTPException(status_code=400, detail={"error": "messages or prompt is required"})
 
 
-def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]], str | None]:
+def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]], str | None, str]:
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
     prompt = extract_chat_prompt(body)
     if not prompt:
@@ -183,7 +184,8 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
         for idx, (data, mime) in enumerate(extract_chat_image(body), start=1)
     ]
     base_url = str(body.get("base_url") or "").strip() or None
-    return model, prompt, parse_image_count(body.get("n")), images, base_url
+    response_format = normalize_image_response_format(body.get("response_format"), default="url")
+    return model, prompt, parse_image_count(body.get("n")), images, base_url, response_format
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -243,12 +245,12 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
-    model, prompt, n, images, base_url = chat_image_args(body)
+    model, prompt, n, images, base_url, response_format = chat_image_args(body)
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
-        response_format="b64_json",
+        response_format=response_format,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,
@@ -273,12 +275,12 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    model, prompt, n, images, base_url = chat_image_args(body)
+    model, prompt, n, images, base_url, response_format = chat_image_args(body)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
-        response_format="b64_json",
+        response_format=response_format,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,

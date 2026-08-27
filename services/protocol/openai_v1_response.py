@@ -15,6 +15,7 @@ from services.protocol.conversation import (
     count_text_tokens,
     encode_images,
     normalize_messages,
+    normalize_image_response_format,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
@@ -213,14 +214,19 @@ def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | N
     output = []
     for item in data:
         b64_json = str(item.get("b64_json") or "").strip()
-        if b64_json:
-            output.append({
+        image_url = str(item.get("url") or item.get("image_url") or "").strip()
+        result = b64_json or image_url
+        if result:
+            payload = {
                 "id": item_id or f"ig_{len(output) + 1}",
                 "type": "image_generation_call",
                 "status": "completed",
-                "result": b64_json,
+                "result": result,
                 "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
-            })
+            }
+            if image_url and not b64_json:
+                payload["url"] = image_url
+            output.append(payload)
     return output
 
 
@@ -474,12 +480,16 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
+    response_format = normalize_image_response_format(
+        body.get("response_format") or tool.get("response_format"),
+        default="url",
+    )
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
-        response_format="b64_json",
+        response_format=response_format,
         images=images,
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),

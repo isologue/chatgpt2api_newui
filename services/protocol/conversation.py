@@ -462,6 +462,14 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+IMAGE_BASE64_RESPONSE_FORMATS = {"b64_json", "base64", "base64_json", "b64"}
+
+
+def normalize_image_response_format(value: object, default: str = "url") -> str:
+    raw = str(value or default or "url").strip().lower()
+    return "b64_json" if raw in IMAGE_BASE64_RESPONSE_FORMATS else "url"
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -471,6 +479,7 @@ def format_image_result(
     message: str = "",
     requested_size: str | None = None,
 ) -> dict[str, Any]:
+    response_format = normalize_image_response_format(response_format, default="url")
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
     for item in items:
@@ -510,7 +519,7 @@ class ConversationRequest:
     n: int = 1
     size: str | None = None
     quality: str = "auto"
-    response_format: str = "b64_json"
+    response_format: str = "url"
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
@@ -2780,9 +2789,13 @@ def stream_image_chunks(
                 if not isinstance(item, dict):
                     continue
                 b64_json = str(item.get("b64_json") or "").strip()
-                if not b64_json:
+                image_url = str(item.get("url") or item.get("image_url") or "").strip()
+                if b64_json:
+                    completed: dict[str, Any] = {"b64_json": b64_json}
+                elif image_url:
+                    completed = {"url": image_url}
+                else:
                     continue
-                completed: dict[str, Any] = {"b64_json": b64_json}
                 if usage_builder:
                     usage = usage_builder([item])
                     if usage:
