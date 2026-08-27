@@ -1276,18 +1276,14 @@ class PlatformRegistrar:
         step(index, f"邮箱创建完成[{label}]: {email}")
         try:
             first_name, last_name = _random_name()
-            # 邮箱创建完成后才提交邮箱；记录边界，避免读取到历史验证码。
+            # 预热授权只用于提前发现 Cloudflare/IP 拦截；邮箱创建后重新走一遍
+            # 带 login_hint 的原始授权流程，避免复用无邮箱会话导致 invalid_state。
             mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+            landed = self._platform_authorize(email, index)
             if landed == "login":
                 tokens = self._passwordless_login(email, mailbox, index)
             else:
-                # 预热授权没有 login_hint，因此无论落在哪个注册页，都必须在这里提交
-                # 新建邮箱，确认当前会话已绑定邮箱并决定是否已自动发送验证码。
-                otp_ready = self._authorize_continue_signup(email, index)
-                if otp_ready:
-                    self.passwordless_signup = True
-                    step(index, "authorize/continue 已进入验证码页，跳过重复 send-otp", "yellow")
-                else:
+                if not self.passwordless_signup:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                     self._start_passwordless_signup(email, index)
                 step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")

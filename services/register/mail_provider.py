@@ -1434,8 +1434,10 @@ class RemailProvider(BaseMailProvider):
         finally:
             session.close()
 
-    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201), include_api_key: bool = True) -> Any:
         merged_headers = dict(self.session.headers)
+        if not include_api_key:
+            merged_headers.pop("Authorization", None)
         merged_headers.update(headers or {})
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", params=params, json=payload, headers=merged_headers, timeout=self.conf["request_timeout"], verify=False)
         if resp.status_code not in expected:
@@ -1462,14 +1464,111 @@ class RemailProvider(BaseMailProvider):
         order_no = self._first_text(payload, ("orderNo", "order_no", "orderNumber", "id"))
         if not address or not order_no:
             raise RuntimeError("Remail 创建订单缺少 deliveryEmail 或 orderNo")
+        order_context = {"order_no": order_no}
+        service_token = self._first_text(payload, ("serviceToken", "service_token"))
+        if service_token:
+            # 仅作为本次注册进程内的取件兜底上下文，不写日志、不入库。
+            order_context["_service_token"] = service_token
         return {
             "provider": self.name,
             "provider_ref": self.provider_ref,
             "address": address,
-            # Open API 收码仅需要订单号；不要保存网页会话的 serviceToken。
-            "token": {"order_no": order_no},
+            "token": order_context,
             "label": f"Remail-{self.project_id}",
         }
+
+    def _message_from_order_payload(self, mailbox: dict[str, Any], order_no: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in self.FAILED_ORDER_STATUSES:
+            raise RuntimeError(f"Remail 订单已失败: status={status}")
+        code = self._first_text(payload, ("verificationCode", "verification_code", "code"))
+        if not code:
+            return None
+        address = self._first_text(payload, ("deliveryEmail", "delivery_email", "email", "address")) or str(mailbox.get("address") or "").strip()
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": order_no,
+            "subject": "Remail verification code",
+            "sender": "Remail",
+            "text_content": f"Verification code: {code}",
+            "html_content": "",
+            "received_at": _parse_received_at(
+                payload.get("lastMailReceivedAt")
+                or payload.get("last_mail_received_at")
+                or payload.get("updatedAt")
+                or payload.get("updated_at")
+                or payload.get("createdAt")
+                or payload.get("created_at")
+            ) or datetime.now(timezone.utc),
+            "raw": {"order_no": order_no, "status": status},
+        }
+
+    def _message_from_pickup_item(self, mailbox: dict[str, Any], order_no: str, status: str, item: dict[str, Any]) -> dict[str, Any]:
+        pickup_code = self._first_text(item, ("verificationCode", "verification_code", "code"))
+        preview = self._first_text(item, ("bodyPreview", "body_preview", "text", "body", "content"))
+        address = str(mailbox.get("address") or "").strip()
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": str(item.get("id") or item.get("messageId") or item.get("message_id") or order_no),
+            "subject": str(item.get("subject") or ""),
+            "sender": str(item.get("sender") or item.get("from") or "Remail"),
+            "text_content": "\n".join(part for part in (f"Verification code: {pickup_code}" if pickup_code else "", preview) if part),
+            "html_content": "",
+            "received_at": _parse_received_at(item.get("receivedAt") or item.get("received_at") or item.get("createdAt") or item.get("created_at")) or datetime.now(timezone.utc),
+            "raw": {
+                "order_no": order_no,
+                "status": status,
+                "message_id": str(item.get("id") or item.get("messageId") or item.get("message_id") or ""),
+            },
+        }
+
+    def _fetch_pickup_message(self, mailbox: dict[str, Any], order_no: str, order_payload: dict[str, Any] | None, status: str) -> dict[str, Any] | None:
+        token = mailbox.get("token")
+        service_token = ""
+        address = str(mailbox.get("address") or "").strip()
+        if isinstance(order_payload, dict):
+            service_token = self._first_text(order_payload, ("serviceToken", "service_token"))
+            address = self._first_text(order_payload, ("deliveryEmail", "delivery_email", "email", "address")) or address
+        if not service_token and isinstance(token, dict):
+            service_token = str(token.get("_service_token") or token.get("service_token") or token.get("serviceToken") or "").strip()
+        if not service_token or not address:
+            return None
+        if isinstance(token, dict):
+            # 进程内缓存即可，避免把订单级 token 放进日志或返回值。
+            token["_service_token"] = service_token
+
+        pickup_data = None
+        try:
+            pickup_data = self._request(
+                "GET",
+                "/v1/pickup",
+                params={"email": address, "token": service_token},
+                include_api_key=False,
+            )
+        except RuntimeError as first_error:
+            # 有些部署可能要求同时带 Bearer；作为兜底再试一次，但不把 serviceToken 写入错误。
+            if "HTTP 401" not in str(first_error):
+                return None
+            try:
+                pickup_data = self._request("GET", "/v1/pickup", params={"email": address, "token": service_token})
+            except RuntimeError:
+                return None
+        pickup_payload = self._nested_payload(pickup_data)
+        if not isinstance(pickup_payload, dict):
+            return None
+        items = pickup_payload.get("items") or pickup_payload.get("messages") or []
+        if not isinstance(items, list):
+            return None
+        messages = [item for item in items if isinstance(item, dict)]
+        if not messages:
+            return None
+        messages.sort(
+            key=lambda item: _parse_received_at(item.get("receivedAt") or item.get("received_at") or item.get("createdAt") or item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return self._message_from_pickup_item({**mailbox, "address": address}, order_no, status, messages[0])
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         token = mailbox.get("token")
@@ -1481,8 +1580,9 @@ class RemailProvider(BaseMailProvider):
         if not order_no:
             raise RuntimeError("Remail 订单上下文缺少 order_no")
 
-        # 后端接入必须使用 Open API，而不是网页订单页的 /v1/orders、/v1/pickup
-        # 会话接口。Open API 以配置的 Bearer Token 查询订单并返回 verificationCode。
+        # 正式后端 Open API 仍是主路径：/v1/open/orders/{orderNo} 返回 verificationCode。
+        # 但实际网页“查看邮件”会额外触发订单详情 + pickup；当 Open API 暂未带出
+        # verificationCode 时，使用该链路做兜底，避免必须人工打开订单页。
         data = self._request("GET", f"/v1/open/orders/{quote(order_no, safe='')}")
         payload = self._nested_payload(data)
         if not isinstance(payload, dict):
@@ -1490,25 +1590,26 @@ class RemailProvider(BaseMailProvider):
         status = str(payload.get("status") or "").strip().lower()
         if status in self.FAILED_ORDER_STATUSES:
             raise RuntimeError(f"Remail 订单已失败: status={status}")
-        code = self._first_text(payload, ("verificationCode", "verification_code", "code"))
-        if not code:
-            return None
-        return {
-            "provider": self.name,
-            "mailbox": str(mailbox.get("address") or ""),
-            "message_id": order_no,
-            "subject": "Remail verification code",
-            "sender": "Remail",
-            "text_content": f"Verification code: {code}",
-            "html_content": "",
-            "received_at": _parse_received_at(
-                payload.get("updatedAt")
-                or payload.get("updated_at")
-                or payload.get("createdAt")
-                or payload.get("created_at")
-            ) or datetime.now(timezone.utc),
-            "raw": {"order_no": order_no, "status": status},
-        }
+        message = self._message_from_order_payload(mailbox, order_no, payload)
+        if message:
+            return message
+
+        detail_payload: dict[str, Any] | None = None
+        try:
+            detail_data = self._request("GET", f"/v1/orders/{quote(order_no, safe='')}")
+            detail_nested = self._nested_payload(detail_data)
+            if isinstance(detail_nested, dict):
+                detail_payload = detail_nested
+                detail_status = str(detail_payload.get("status") or "").strip().lower()
+                if detail_status:
+                    status = detail_status
+                message = self._message_from_order_payload(mailbox, order_no, detail_payload)
+                if message:
+                    return message
+        except RuntimeError:
+            # /v1/orders 是网页订单详情接口；若当前 Token/部署不可用，保留 Open API 轮询，不中断注册。
+            detail_payload = None
+        return self._fetch_pickup_message(mailbox, order_no, detail_payload, status)
 
     def close(self) -> None:
         self.session.close()
