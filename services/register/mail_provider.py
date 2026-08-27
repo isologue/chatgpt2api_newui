@@ -1490,8 +1490,9 @@ class RemailProvider(BaseMailProvider):
 
         # 网页的“查看订单”会先读订单详情，取得 serviceToken，再读 pickup。
         # 原先只轮询 /v1/open/orders/{orderNo}，没有走这条收件箱读取链路，
-        # 因而在不打开网页时可能永远拿不到验证码。
-        data = self._request("GET", f"/v1/orders/{quote(order_no, safe='')}", include_api_key=False)
+        # 因而在不打开网页时可能永远拿不到验证码。订单详情在服务端仍需
+        # 使用配置的开放 API Key 鉴权；serviceToken 仅用于后续 pickup。
+        data = self._request("GET", f"/v1/orders/{quote(order_no, safe='')}")
         payload = self._nested_payload(data)
         if not isinstance(payload, dict):
             raise RuntimeError("Remail 查询订单响应不是对象")
