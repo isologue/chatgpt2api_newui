@@ -43,7 +43,7 @@
 - 图片链路诊断：记录账号、出口、conversation id、上游原始错误、SSE/轮询/下载阶段耗时，支持实时监控和调用日志排查。
 - 多账号调度：支持账号导入、刷新、额度读取、分组、代理优先级、异常账号自动移除和批量管理。
 - 远程账号导入：支持本地 CPA JSON、远程 CPA、Sub2API、access token 导入；Sub2API / CPA 可按远程分组折叠选择、全组选中、去重和批量导入。
-- 注册账号链路：支持临时邮箱、GPTMail、Outlook Token 邮箱池和 Microsoft plus alias，提供验证码等待、注册进度、邮箱池状态和实时日志。
+- 注册账号链路：支持临时邮箱、Remail 接码邮箱、GPTMail、Outlook Token 邮箱池和 Microsoft plus alias，提供验证码等待、注册进度、邮箱池状态和实时日志。
 - 代理与稳定出口：支持账号代理、账号组代理、多出口代理组、节点并发、备用出口、WARP / Privoxy / FlareSolverr 稳定代理运行时和 Cloudflare clearance 测试。
 - 管理控制台：包含概览中心、账号管理、日志管理、实时监控、图片管理/存储管理、代理管理、注册账号、对话画图、调试中心和系统设置。
 - 自托管部署：支持 Docker、一键脚本、JSON / SQLite / PostgreSQL / Git 账号存储后端、WebDAV 图片存储和 R2 备份。
@@ -233,7 +233,7 @@ environment:
 - 支持本地 CPA JSON、远程 CPA、Sub2API、access token 导入。
 - 远程 CPA / Sub2API 连接可在设置页维护，也可在账号管理里打开统一导入弹窗。
 - Sub2API 导入支持读取远程分组，按分组折叠、全组选中、单账号选择、按组导入和去重保存。
-- 注册账号支持临时邮箱、GPTMail、Outlook Token 邮箱池、Microsoft passwordless 验证和 plus alias 分裂。
+- 注册账号支持临时邮箱、Remail 接码邮箱、GPTMail、Outlook Token 邮箱池、Microsoft passwordless 验证和 plus alias 分裂。
 
 ### 代理、存储和运维
 

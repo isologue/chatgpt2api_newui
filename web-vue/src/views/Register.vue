@@ -64,11 +64,13 @@
                 :saving="legacySaving"
                 :outlook-pool-action-items="outlookPoolActionItems"
                 :gpt-mail="registerProviderGptMailUi"
+                :remail="registerProviderRemailUi"
                 @update-type="updateProviderType"
                 @update-field="updateProviderField"
                 @update-array="updateProviderArray"
                 @delete="deleteProvider"
                 @check-gptmail="checkGptMailStatus"
+                @load-remail-projects="loadRemailProjects"
                 @outlook-action="handleOutlookPoolAction"
               />
             </div>
@@ -120,6 +122,7 @@ import { useRegisterGptMailRuntime } from '@/views/register/registerGptMailRunti
 import { useRegisterLiveRuntime } from '@/views/register/registerLiveRuntime'
 import { useRegisterOutlookPoolRuntime } from '@/views/register/registerOutlookPoolRuntime'
 import { useRegisterProviderRuntime } from '@/views/register/registerProviderRuntime'
+import { useRegisterRemailRuntime } from '@/views/register/registerRemailRuntime'
 
 defineOptions({ name: 'Register' })
 
@@ -181,6 +184,24 @@ const registerProviderGptMailUi = {
   resetText: gptMailResetText,
   statusHint: gptMailStatusHint,
 }
+const remailRuntime = useRegisterRemailRuntime({
+  providers: registerProviders,
+  notifySuccess: (message) => toast.success(message),
+  notifyError: (message) => toast.error(message),
+})
+const clearRemailState = remailRuntime.clearState
+const clearAllRemailStates = remailRuntime.clearAllStates
+const pruneRemailStates = remailRuntime.pruneStates
+const loadRemailProjects = remailRuntime.loadProjects
+const registerProviderRemailUi = {
+  stateByIndex: remailRuntime.stateByIndex,
+  hasProjectOptions: remailRuntime.hasProjectOptions,
+  hasSuffixOptions: remailRuntime.hasSuffixOptions,
+  projectGroups: remailRuntime.projectGroups,
+  suffixGroups: remailRuntime.suffixGroups,
+  statusTone: remailRuntime.statusTone,
+  statusText: remailRuntime.statusText,
+}
 const outlookPoolRuntime = useRegisterOutlookPoolRuntime({
   saving: legacySaving,
   confirm: confirmDialog.ask,
@@ -198,7 +219,10 @@ const liveRuntime = useRegisterLiveRuntime({
   isTaskEnabled: registerConfigRuntime.isTaskEnabled,
 })
 const startLiveUpdates = liveRuntime.startLiveUpdates
-registerConfigRuntime.onConfigApplied(() => pruneGptMailStates())
+registerConfigRuntime.onConfigApplied(() => {
+  pruneGptMailStates()
+  pruneRemailStates()
+})
 const enabledProviderCount = computed(() => buildEnabledRegisterProviderCount(registerProviders.value))
 const enabledProviderIssueCount = computed(() => buildRegisterProviderIssueCount(registerProviders.value))
 const registerActionDisabled = computed(() => buildRegisterActionDisabled(
@@ -224,6 +248,8 @@ const providerRuntime = useRegisterProviderRuntime({
   confirm: confirmDialog.ask,
   clearGptMailState,
   clearAllGptMailStates,
+  clearRemailState,
+  clearAllRemailStates,
 })
 const providerKey = providerRuntime.providerKey
 const updateProviderType = providerRuntime.updateProviderType

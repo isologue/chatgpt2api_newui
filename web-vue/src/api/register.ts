@@ -36,6 +36,9 @@ export type RegisterProvider = {
   cf_create_path?: string
   cf_messages_path?: string
   default_domain?: string
+  project_id?: string | number
+  email_suffix?: string
+  supply?: 'private_first' | 'public_only' | string
   key_mode?: 'public' | 'custom' | string
   local_compose?: boolean
   email_prefix?: string
@@ -133,6 +136,23 @@ export type GptMailStatus = {
   default_domain?: string
 }
 
+export type RemailSuffix = {
+  suffix: string
+  total_available?: number
+  public_available?: number
+}
+
+export type RemailProject = {
+  id: string | number
+  name: string
+  suffixes: RemailSuffix[]
+}
+
+export type RemailProjectsResponse = {
+  count: number
+  projects: RemailProject[]
+}
+
 export const registerApi = {
   getConfig() {
     return apiClient.get<any, { register: LegacyRegisterConfig }>('/api/register')
@@ -157,5 +177,8 @@ export const registerApi = {
   },
   refreshGptMailKey(provider: RegisterProvider, force = true) {
     return apiClient.post<any, { status: GptMailStatus }>('/api/register/gptmail/refresh-key', { provider, force })
+  },
+  getRemailProjects(provider: RegisterProvider) {
+    return apiClient.post<any, RemailProjectsResponse>('/api/register/remail/projects', { provider })
   },
 }

@@ -40,6 +40,7 @@ export const providerTypeOptions = [
   { value: 'inbucket', label: 'Inbucket' },
   { value: 'duckmail', label: 'DuckMail' },
   { value: 'gptmail', label: 'GPTMail' },
+  { value: 'remail', label: 'Remail' },
   { value: 'donemail', label: 'DoneMail' },
   { value: 'yyds_mail', label: 'YYDS Mail' },
   { value: 'ddg_mail', label: 'DDG + CF 收件箱' },
@@ -89,6 +90,13 @@ export const outlookModeOptions = [
 
 export const outlookModeGroups = [{ options: outlookModeOptions }]
 
+export const remailSupplyOptions = [
+  { value: 'private_first', label: '私库优先' },
+  { value: 'public_only', label: '仅公库' },
+] as const
+
+export const remailSupplyGroups = [{ options: remailSupplyOptions }]
+
 export const providerCommonKeys = ['id', 'enable', 'type', 'label'] as const
 
 export const providerTypeKeys: Record<string, string[]> = {
@@ -99,6 +107,7 @@ export const providerTypeKeys: Record<string, string[]> = {
   inbucket: ['api_base', 'domain', 'random_subdomain'],
   duckmail: ['api_key', 'default_domain'],
   gptmail: ['key_mode', 'api_key', 'default_domain', 'local_compose'],
+  remail: ['api_base', 'api_key', 'project_id', 'email_suffix', 'supply'],
   donemail: ['api_base', 'admin_key', 'domain', 'email_prefix', 'message_limit'],
   yyds_mail: ['api_base', 'api_key', 'domain', 'subdomain', 'wildcard'],
   ddg_mail: ['api_base', 'ddg_token', 'cf_inbox_jwt', 'admin_password', 'cf_api_key', 'cf_auth_mode', 'cf_create_path', 'cf_messages_path'],
@@ -168,6 +177,8 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
       return { ...base, api_key: '', default_domain: 'duckmail.sbs' }
     case 'gptmail':
       return { ...base, key_mode: 'public', api_key: '', default_domain: '', local_compose: false }
+    case 'remail':
+      return { ...base, api_base: '', api_key: '', project_id: '', email_suffix: '', supply: 'private_first' }
     case 'donemail':
       return { ...base, api_base: '', admin_key: '', domain: [], email_prefix: '', message_limit: 20 }
     case 'yyds_mail':
@@ -448,6 +459,12 @@ export function providerRequirementMessages(provider: RegisterProvider) {
       if (!providerUsesPublicGptMailKey(provider)) requireValue(provider.api_key, 'API Key')
       if (provider.local_compose) requireValue(provider.default_domain, '默认域名')
       break
+    case 'remail':
+      requireValue(provider.api_base, 'Remail API URL')
+      requireValue(provider.api_key, 'API Token')
+      requireValue(provider.project_id, '项目')
+      requireValue(provider.email_suffix, '邮箱后缀')
+      break
     case 'donemail':
       requireValue(provider.api_base, 'DoneMail URL')
       requireValue(provider.admin_key, 'Admin Key')
@@ -474,11 +491,11 @@ export function providerRequirementMessages(provider: RegisterProvider) {
 }
 
 export function providerUsesApiBase(provider: RegisterProvider) {
-  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail'].includes(providerType(provider))
+  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'remail'].includes(providerType(provider))
 }
 
 export function providerUsesApiKey(provider: RegisterProvider) {
-  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail'].includes(providerType(provider))
+  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail', 'remail'].includes(providerType(provider))
 }
 
 export function providerUsesAdminPassword(provider: RegisterProvider) {
@@ -498,6 +515,7 @@ export function apiBaseLabel(provider: RegisterProvider) {
   if (type === 'cloudmail_gen') return 'CloudMail URL'
   if (type === 'ddg_mail') return 'CF API Base'
   if (type === 'donemail') return 'DoneMail URL'
+  if (type === 'remail') return 'Remail API URL'
   return 'API Base'
 }
 
@@ -505,6 +523,7 @@ export function apiBasePlaceholder(provider: RegisterProvider) {
   const type = providerType(provider)
   if (type === 'donemail') return 'https://sow.us.kg'
   if (type === 'yyds_mail') return 'https://maliapi.215.im/v1'
+  if (type === 'remail') return 'https://remail.example.com'
   return ''
 }
 

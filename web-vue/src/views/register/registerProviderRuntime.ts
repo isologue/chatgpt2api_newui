@@ -21,6 +21,8 @@ type RegisterProviderRuntimeInput = {
   confirm: (options: ConfirmOptions) => Promise<boolean>
   clearGptMailState: (index: number) => void
   clearAllGptMailStates: () => void
+  clearRemailState?: (index: number) => void
+  clearAllRemailStates?: () => void
 }
 
 export function useRegisterProviderRuntime(input: RegisterProviderRuntimeInput) {
@@ -31,6 +33,7 @@ export function useRegisterProviderRuntime(input: RegisterProviderRuntimeInput) 
   function updateProviderType(index: number, type: string) {
     if (!input.config.value) return
     input.clearGptMailState(index)
+    input.clearRemailState?.(index)
     const providers = [...input.providers.value]
     const current = providers[index] || {}
     providers[index] = providerWithTypeDraft(current, type)
@@ -40,6 +43,9 @@ export function useRegisterProviderRuntime(input: RegisterProviderRuntimeInput) 
   function updateProviderField(index: number, key: string, value: unknown) {
     const provider = input.providers.value[index]
     if (!provider) return
+    if (providerType(provider) === 'remail' && key === 'project_id' && String(provider.project_id || '') !== String(value || '')) {
+      provider.email_suffix = ''
+    }
     provider[key] = value
   }
 
@@ -57,6 +63,7 @@ export function useRegisterProviderRuntime(input: RegisterProviderRuntimeInput) 
     })
     if (!ok) return
     input.clearAllGptMailStates()
+    input.clearAllRemailStates?.()
     input.config.value.mail.providers = input.providers.value.filter((_, itemIndex) => itemIndex !== index)
   }
 

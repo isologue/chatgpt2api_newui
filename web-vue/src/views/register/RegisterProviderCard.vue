@@ -116,13 +116,70 @@
         </label>
 
         <label v-if="providerUsesApiKey(provider) && !providerUsesPublicGptMailKey(provider)" class="register-field">
-          <span class="register-label">API Key</span>
+          <span class="register-label">{{ currentType === 'remail' ? 'API Token' : 'API Key' }}</span>
           <Input
             :model-value="provider.api_key"
             block
             root-class="font-mono"
             :disabled="disabled"
             @update:model-value="value => emit('update-field', index, 'api_key', String(value || '').trim())"
+          />
+        </label>
+
+        <label v-if="currentType === 'remail'" class="register-field">
+          <span class="register-label">项目</span>
+          <GroupedSelectMenu
+            v-if="remail.hasProjectOptions(index)"
+            :model-value="String(provider.project_id || '')"
+            :groups="remail.projectGroups(index, provider)"
+            selected-indicator="none"
+            :disabled="disabled"
+            placeholder="请选择项目"
+            block
+            @update:model-value="value => emit('update-field', index, 'project_id', String(value || '').trim())"
+          />
+          <Input
+            v-else
+            :model-value="provider.project_id"
+            block
+            root-class="font-mono"
+            :disabled="disabled"
+            placeholder="先读取项目列表，或手动填写 project_id"
+            @update:model-value="value => emit('update-field', index, 'project_id', String(value || '').trim())"
+          />
+        </label>
+
+        <label v-if="currentType === 'remail'" class="register-field">
+          <span class="register-label">邮箱后缀</span>
+          <GroupedSelectMenu
+            v-if="remail.hasSuffixOptions(index, provider)"
+            :model-value="String(provider.email_suffix || '')"
+            :groups="remail.suffixGroups(index, provider)"
+            selected-indicator="none"
+            :disabled="disabled"
+            placeholder="请选择后缀"
+            block
+            @update:model-value="value => emit('update-field', index, 'email_suffix', String(value || '').trim())"
+          />
+          <Input
+            v-else
+            :model-value="provider.email_suffix"
+            block
+            :disabled="disabled"
+            placeholder="先读取项目列表，或手动填写后缀"
+            @update:model-value="value => emit('update-field', index, 'email_suffix', String(value || '').trim())"
+          />
+        </label>
+
+        <label v-if="currentType === 'remail'" class="register-field">
+          <span class="register-label">供给策略</span>
+          <GroupedSelectMenu
+            :model-value="String(provider.supply || 'private_first')"
+            :groups="remailSupplyGroups"
+            selected-indicator="none"
+            :disabled="disabled"
+            block
+            @update:model-value="value => emit('update-field', index, 'supply', value)"
           />
         </label>
 
@@ -295,6 +352,35 @@
             已知域名本地拼接
           </Checkbox>
         </label>
+      </div>
+    </div>
+
+    <div v-if="currentType === 'remail'" class="register-provider-section register-provider-section--soft">
+      <div class="register-provider-section-title">Remail 项目目录</div>
+      <div class="register-gptmail-panel">
+        <div class="register-gptmail-summary">
+          <MetaChip size="xs" :tone="remail.statusTone(index)">
+            {{ remail.statusText(index) }}
+          </MetaChip>
+          <MetaChip v-if="provider.project_id" size="xs" tone="muted">项目 {{ provider.project_id }}</MetaChip>
+          <MetaChip v-if="provider.email_suffix" size="xs" tone="muted">{{ provider.email_suffix }}</MetaChip>
+        </div>
+        <div class="register-provider-actions register-provider-actions--left">
+          <Button
+            size="xs"
+            variant="outline"
+            :disabled="disabled || remail.stateByIndex(index)?.loading"
+            @click="emit('load-remail-projects', index, provider)"
+          >
+            {{ remail.stateByIndex(index)?.loading ? '读取中' : '读取项目列表' }}
+          </Button>
+        </div>
+        <p v-if="remail.stateByIndex(index)?.error" class="register-preview-line register-preview-line--danger">
+          {{ remail.stateByIndex(index)?.error }}
+        </p>
+        <p v-else class="register-preview-line">
+          会读取 /v1/open/projects 并只展示 enabled 且支持验证码的项目/后缀；邮箱 API 请求沿用注册配置里的邮箱 API 代理。
+        </p>
       </div>
     </div>
 
@@ -541,6 +627,7 @@ import {
   providerUsesDefaultDomain,
   providerUsesDomainList,
   providerUsesPublicGptMailKey,
+  remailSupplyGroups,
 } from '@/views/register/registerProviderView'
 
 type MetaChipTone = 'default' | 'muted' | 'success' | 'warning' | 'danger' | 'info'
@@ -556,6 +643,16 @@ type GptMailUiRuntime = {
   statusHint: (index: number, provider: RegisterProvider) => string
 }
 
+type RemailUiRuntime = {
+  stateByIndex: (index: number) => { loading: boolean; error: string; count: number } | null | undefined
+  hasProjectOptions: (index: number) => boolean
+  hasSuffixOptions: (index: number, provider: RegisterProvider) => boolean
+  projectGroups: (index: number, provider: RegisterProvider) => Array<{ label?: string; options: Array<{ label: string; value: string; disabled?: boolean }> }>
+  suffixGroups: (index: number, provider: RegisterProvider) => Array<{ label?: string; options: Array<{ label: string; value: string; disabled?: boolean }> }>
+  statusTone: (index: number) => MetaChipTone
+  statusText: (index: number) => string
+}
+
 const props = defineProps<{
   provider: RegisterProvider
   index: number
@@ -564,6 +661,7 @@ const props = defineProps<{
   saving: boolean
   outlookPoolActionItems: ActionMenuItem[]
   gptMail: GptMailUiRuntime
+  remail: RemailUiRuntime
 }>()
 
 const emit = defineEmits<{
@@ -572,6 +670,7 @@ const emit = defineEmits<{
   (e: 'update-array', index: number, key: ProviderArrayKey, value: string): void
   (e: 'delete', index: number): void
   (e: 'check-gptmail', index: number, provider: RegisterProvider): void
+  (e: 'load-remail-projects', index: number, provider: RegisterProvider): void
   (e: 'outlook-action', key: string): void
 }>()
 
@@ -651,6 +750,10 @@ function numberModelValue(value: unknown) {
   font-size: 12px;
   line-height: 1.45;
   color: hsl(var(--muted-foreground));
+}
+
+.register-preview-line--danger {
+  color: hsl(var(--destructive));
 }
 
 .register-outlook-toolbar {

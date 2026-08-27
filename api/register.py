@@ -31,6 +31,10 @@ class GptMailStatusRequest(BaseModel):
     force: bool | None = None
 
 
+class RemailProjectsRequest(BaseModel):
+    provider: dict | None = None
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -77,6 +81,14 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         try:
             return {"status": register_service.refresh_gptmail_public_key(body.provider, force=body.force is not False)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/register/remail/projects")
+    async def get_remail_projects(body: RemailProjectsRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return register_service.remail_projects(body.provider)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

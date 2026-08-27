@@ -327,6 +327,11 @@ class RegisterService:
             mail = self._mail_config_with_proxy()
         return mail_provider.refresh_gptmail_public_key(mail, provider, force=force)
 
+    def remail_projects(self, provider: dict | None = None) -> dict:
+        with self._lock:
+            mail = self._mail_config_with_proxy()
+        return mail_provider.remail_projects(mail, provider)
+
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})

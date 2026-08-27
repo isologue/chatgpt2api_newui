@@ -6,12 +6,14 @@ import random
 import re
 import string
 import time
+import uuid
 from datetime import datetime, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
+from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -1215,6 +1217,294 @@ class GptMailProvider(BaseMailProvider):
         self.session.close()
 
 
+class RemailProvider(BaseMailProvider):
+    name = "remail"
+    FAILED_ORDER_STATUSES = {"failed", "closed", "refunded"}
+    SUPPLY_VALUES = {"private_first", "public_only"}
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        if not self.api_base:
+            raise RuntimeError("Remail API URL 不能为空")
+        if not self.api_key:
+            raise RuntimeError("Remail API Token 不能为空")
+        self.project_id = self._positive_int(entry.get("project_id"), "Remail 项目")
+        self.email_suffix = str(entry.get("email_suffix") or "").strip().lower().lstrip("@")
+        if not self.email_suffix:
+            raise RuntimeError("Remail 邮箱后缀不能为空")
+        self.supply = self._normalize_supply(entry.get("supply"))
+        self.session = _create_session(conf)
+        self.session.headers.update({
+            "User-Agent": conf["user_agent"],
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        })
+
+    @staticmethod
+    def _positive_int(value: Any, label: str) -> int:
+        try:
+            parsed = int(str(value).strip())
+        except Exception as exc:
+            raise RuntimeError(f"{label} ID 无效") from exc
+        if parsed <= 0:
+            raise RuntimeError(f"{label} ID 无效")
+        return parsed
+
+    @classmethod
+    def _normalize_supply(cls, value: Any) -> str:
+        text = str(value or "private_first").strip().lower()
+        return text if text in cls.SUPPLY_VALUES else "private_first"
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _first_text(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _nested_payload(data: Any) -> Any:
+        if isinstance(data, dict):
+            for key in ("data", "result", "order"):
+                value = data.get(key)
+                if isinstance(value, (dict, list)):
+                    return value
+        return data
+
+    @classmethod
+    def _project_items(cls, data: Any) -> list[dict[str, Any]]:
+        payload = cls._nested_payload(data)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("items", "projects", "records", "results", "list"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
+    @classmethod
+    def _total_count(cls, data: Any) -> int | None:
+        candidates: list[Any] = []
+        if isinstance(data, dict):
+            candidates.extend(data.get(key) for key in ("total", "count"))
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                candidates.extend(nested.get(key) for key in ("total", "count"))
+        for value in candidates:
+            try:
+                parsed = int(value)
+            except Exception:
+                continue
+            if parsed >= 0:
+                return parsed
+        return None
+
+    @staticmethod
+    def _suffix_text(item: Any) -> str:
+        if isinstance(item, str):
+            return item.strip().lower()
+        if isinstance(item, dict):
+            for key in ("suffix", "emailSuffix", "email_suffix", "domain", "name"):
+                value = item.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip().lower().lstrip("@")
+        return ""
+
+    @staticmethod
+    def _int_field(item: Any, keys: tuple[str, ...]) -> int:
+        if not isinstance(item, dict):
+            return 0
+        for key in keys:
+            try:
+                value = item.get(key)
+                if value is not None and str(value).strip() != "":
+                    return max(0, int(float(str(value).strip())))
+            except Exception:
+                continue
+        return 0
+
+    @classmethod
+    def _product_suffixes(cls, product: dict[str, Any], fallback: dict[str, Any]) -> list[Any]:
+        for source in (product, fallback):
+            for key in ("suffixes", "emailSuffixes", "email_suffixes", "domains"):
+                value = source.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    @classmethod
+    def _normalize_project(cls, item: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            project_id = int(str(item.get("id") or item.get("projectId") or item.get("project_id") or "").strip())
+        except Exception:
+            return None
+        if project_id <= 0:
+            return None
+
+        products = item.get("products")
+        if not isinstance(products, list) or not products:
+            products = [item]
+
+        suffixes_by_name: dict[str, dict[str, Any]] = {}
+        for product in (product for product in products if isinstance(product, dict)):
+            status = str(product.get("status") or "").strip().lower()
+            code_enabled = product.get("codeEnabled") if "codeEnabled" in product else product.get("code_enabled")
+            if status != "enabled" or not cls._truthy(code_enabled):
+                continue
+            for suffix_item in cls._product_suffixes(product, item):
+                suffix = cls._suffix_text(suffix_item)
+                if not suffix:
+                    continue
+                normalized = {
+                    "suffix": suffix,
+                    "total_available": cls._int_field(suffix_item, ("totalAvailable", "total_available", "available", "count", "total")),
+                    "public_available": cls._int_field(suffix_item, ("publicAvailable", "public_available", "publicAvailableCount", "public_count", "public")),
+                }
+                old = suffixes_by_name.get(suffix)
+                if not old or normalized["total_available"] > int(old.get("total_available") or 0):
+                    suffixes_by_name[suffix] = normalized
+
+        suffixes = sorted(suffixes_by_name.values(), key=lambda value: (-int(value.get("total_available") or 0), str(value.get("suffix") or "")))
+        if not suffixes:
+            return None
+        return {"id": project_id, "name": str(item.get("name") or item.get("title") or f"Project {project_id}").strip(), "suffixes": suffixes}
+
+    @classmethod
+    def _normalize_projects(cls, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        projects_by_id: dict[int, dict[str, Any]] = {}
+        for item in items:
+            project = cls._normalize_project(item)
+            if not project:
+                continue
+            projects_by_id[int(project["id"])] = project
+        return sorted(projects_by_id.values(), key=lambda value: (str(value.get("name") or "").lower(), int(value.get("id") or 0)))
+
+    @classmethod
+    def list_projects(cls, entry: dict, conf: dict) -> dict[str, Any]:
+        api_base = str(entry.get("api_base") or "").rstrip("/")
+        api_key = str(entry.get("api_key") or "").strip()
+        if not api_base:
+            raise RuntimeError("Remail API URL 不能为空")
+        if not api_key:
+            raise RuntimeError("Remail API Token 不能为空")
+
+        session = _create_session(conf)
+        session.headers.update({
+            "User-Agent": conf["user_agent"],
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        })
+        try:
+            all_items: list[dict[str, Any]] = []
+            offset = 0
+            limit = 100
+            for _ in range(100):
+                resp = session.get(
+                    f"{api_base}/v1/open/projects",
+                    params={"scope": "visible", "status": "listed", "offset": offset, "limit": limit},
+                    timeout=conf["request_timeout"],
+                    verify=False,
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Remail 项目列表请求失败: GET /v1/open/projects, HTTP {resp.status_code}, body={resp.text[:300]}")
+                data = resp.json()
+                items = cls._project_items(data)
+                if not items:
+                    break
+                all_items.extend(items)
+                total = cls._total_count(data)
+                offset += len(items)
+                if len(items) < limit or (total is not None and offset >= total):
+                    break
+            else:
+                raise RuntimeError("Remail 项目列表分页超过 100 页，已停止")
+            projects = cls._normalize_projects(all_items)
+            return {"count": len(projects), "projects": projects}
+        finally:
+            session.close()
+
+    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+        merged_headers = dict(self.session.headers)
+        merged_headers.update(headers or {})
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", params=params, json=payload, headers=merged_headers, timeout=self.conf["request_timeout"], verify=False)
+        if resp.status_code not in expected:
+            raise RuntimeError(f"Remail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        if resp.status_code == 204:
+            return {}
+        return resp.json()
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            "/v1/open/orders",
+            params={"serviceMode": "code", "supply": self.supply},
+            payload={"projectId": self.project_id, "emailSuffix": self.email_suffix},
+            headers={"Idempotency-Key": f"chatgpt2api-{uuid.uuid4().hex}"},
+        )
+        payload = self._nested_payload(data)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Remail 创建订单响应不是对象")
+        status = str(payload.get("status") or "").strip().lower()
+        if status in self.FAILED_ORDER_STATUSES:
+            raise RuntimeError(f"Remail 创建订单失败: status={status}")
+        address = self._first_text(payload, ("deliveryEmail", "delivery_email", "email", "address"))
+        order_no = self._first_text(payload, ("orderNo", "order_no", "orderNumber", "id"))
+        if not address or not order_no:
+            raise RuntimeError("Remail 创建订单缺少 deliveryEmail 或 orderNo")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "token": {"order_no": order_no},
+            "label": f"Remail-{self.project_id}",
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        token = mailbox.get("token")
+        order_no = ""
+        if isinstance(token, dict):
+            order_no = str(token.get("order_no") or token.get("orderNo") or "").strip()
+        else:
+            order_no = str(token or "").strip()
+        if not order_no:
+            raise RuntimeError("Remail 订单上下文缺少 order_no")
+        data = self._request("GET", f"/v1/open/orders/{quote(order_no, safe='')}")
+        payload = self._nested_payload(data)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Remail 查询订单响应不是对象")
+        status = str(payload.get("status") or "").strip().lower()
+        if status in self.FAILED_ORDER_STATUSES:
+            raise RuntimeError(f"Remail 订单已失败: status={status}")
+        code = self._first_text(payload, ("verificationCode", "verification_code", "code"))
+        if not code:
+            return None
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": order_no,
+            "subject": "Remail verification code",
+            "sender": "Remail",
+            "text_content": f"Verification code: {code}",
+            "html_content": "",
+            "received_at": _parse_received_at(payload.get("updatedAt") or payload.get("updated_at") or payload.get("createdAt") or payload.get("created_at")) or datetime.now(timezone.utc),
+            "raw": {"order_no": order_no, "status": status},
+        }
+
+    def close(self) -> None:
+        self.session.close()
+
+
 class DoneMailProvider(BaseMailProvider):
     name = "donemail"
 
@@ -2155,6 +2445,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return DuckMailProvider(entry, conf)
     if entry["type"] == "gptmail":
         return GptMailProvider(entry, conf)
+    if entry["type"] == "remail":
+        return RemailProvider(entry, conf)
     if entry["type"] in {"donemail", "done_mail"}:
         return DoneMailProvider(entry, conf)
     if entry["type"] == "moemail":
@@ -2166,6 +2458,36 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
+
+
+def _merge_provider_for_lookup(mail_config: dict, provider: dict | None, provider_type: str) -> dict:
+    """合并前端临时字段和已保存配置，用于目录读取一类管理接口。"""
+    incoming = dict(provider or {})
+    provider_id = str(incoming.get("id") or incoming.get("provider_id") or "").strip()
+    saved: dict[str, Any] = {}
+    for item in _entries(mail_config):
+        if item.get("type") != provider_type:
+            continue
+        if provider_id and provider_id not in {str(item.get("id") or ""), str(item.get("provider_id") or ""), str(item.get("provider_ref") or "")}:
+            continue
+        saved = dict(item)
+        break
+    merged = {**saved}
+    for key, value in incoming.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        merged[key] = value
+    merged["type"] = provider_type
+    return merged
+
+
+def remail_projects(mail_config: dict, provider: dict | None = None) -> dict[str, Any]:
+    entry = _merge_provider_for_lookup(mail_config, provider, "remail")
+    return RemailProvider.list_projects(entry, _config(mail_config))
 
 
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
