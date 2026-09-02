@@ -110,6 +110,76 @@
       </div>
     </FormSection>
 
+    <FormSection title="生图压力动态补号" density="roomy">
+      <div class="register-form-grid">
+        <label class="register-checkbox-field register-field--full">
+          <Checkbox
+            v-model="config.dynamic_image_scale_enabled"
+            :disabled="config.enabled"
+          >
+            启用生图排队压力动态补号
+          </Checkbox>
+          <span class="register-checkbox-hint">目标可用账号 X 仍是保底值；生图请求排队时临时提高补号目标，低压后自动回落。</span>
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">最多额外补号</span>
+          <Input
+            v-model.number="config.dynamic_image_scale_max_extra"
+            type="number"
+            min="0"
+            block
+            :disabled="config.enabled || !config.dynamic_image_scale_enabled"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">压力持续（秒）</span>
+          <Input
+            v-model.number="config.dynamic_image_scale_pressure_seconds"
+            type="number"
+            min="1"
+            block
+            :disabled="config.enabled || !config.dynamic_image_scale_enabled"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">低压回落（秒）</span>
+          <Input
+            v-model.number="config.dynamic_image_scale_cooldown_seconds"
+            type="number"
+            min="1"
+            block
+            :disabled="config.enabled || !config.dynamic_image_scale_enabled"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">等待阈值（毫秒）</span>
+          <Input
+            v-model.number="config.dynamic_image_scale_wait_threshold_ms"
+            type="number"
+            min="0"
+            step="500"
+            block
+            :disabled="config.enabled || !config.dynamic_image_scale_enabled"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">预留账号数</span>
+          <Input
+            v-model.number="config.dynamic_image_scale_buffer"
+            type="number"
+            min="0"
+            block
+            :disabled="config.enabled || !config.dynamic_image_scale_enabled"
+          />
+        </label>
+      </div>
+    </FormSection>
+
     <FormSection title="邮箱请求" density="roomy">
       <div class="register-form-grid register-form-grid--mail">
         <label class="register-field">
@@ -162,7 +232,7 @@
 </template>
 
 <script setup lang="ts">
-import { Input } from 'nanocat-ui'
+import { Checkbox, Input } from 'nanocat-ui'
 
 import FormSection from '@/components/ai/FormSection.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'

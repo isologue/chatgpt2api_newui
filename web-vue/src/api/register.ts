@@ -95,6 +95,12 @@ export type LegacyRegisterConfig = {
   target_quota: number
   target_available: number
   check_interval: number
+  dynamic_image_scale_enabled?: boolean
+  dynamic_image_scale_max_extra?: number
+  dynamic_image_scale_pressure_seconds?: number
+  dynamic_image_scale_cooldown_seconds?: number
+  dynamic_image_scale_wait_threshold_ms?: number
+  dynamic_image_scale_buffer?: number
   enabled: boolean
   stats?: {
     success?: number
@@ -107,6 +113,11 @@ export type LegacyRegisterConfig = {
     success_rate?: number
     current_quota?: number
     current_available?: number
+    dynamic_target_available?: number
+    dynamic_extra_buffer?: number
+    queue_pressure_score?: number
+    image_inflight?: number
+    image_waiting?: number
     [key: string]: unknown
   }
   logs?: Array<{

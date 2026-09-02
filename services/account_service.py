@@ -125,6 +125,11 @@ class AccountService:
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        self._image_waiting = 0
+        self._image_pressure_started_at = 0.0
+        self._image_last_pressure_at = 0.0
+        self._image_pressure_peak_demand = 0
+        self._image_wait_events: deque[dict[str, float]] = deque(maxlen=2000)
         self._image_failure_refresh_lock = Lock()
         self._image_failure_refresh_active: set[str] = set()
         self._image_failure_refresh_active_scopes: dict[str, str] = {}
@@ -1189,6 +1194,69 @@ class AccountService:
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
+    def _current_image_slot_demand_locked(self) -> int:
+        return max(0, sum(max(0, int(value or 0)) for value in self._image_inflight.values())) + max(0, int(self._image_waiting or 0))
+
+    def _mark_image_slot_pressure_locked(self, now: float | None = None) -> None:
+        now = float(now or time.monotonic())
+        if self._image_waiting > 0:
+            if self._image_pressure_started_at <= 0:
+                self._image_pressure_started_at = now
+                self._image_pressure_peak_demand = 0
+            self._image_last_pressure_at = now
+            self._image_pressure_peak_demand = max(
+                int(self._image_pressure_peak_demand or 0),
+                self._current_image_slot_demand_locked(),
+            )
+        elif self._image_pressure_started_at > 0:
+            self._image_pressure_started_at = 0.0
+
+    def _record_image_slot_wait_locked(self, wait_ms: int, now: float | None = None) -> None:
+        if wait_ms <= 0:
+            return
+        now = float(now or time.monotonic())
+        self._image_wait_events.append({"ts": now, "wait_ms": float(wait_ms)})
+        self._image_last_pressure_at = now
+        self._image_pressure_peak_demand = max(
+            int(self._image_pressure_peak_demand or 0),
+            self._current_image_slot_demand_locked(),
+        )
+
+    def get_image_pressure_stats(self, window_seconds: int | float = 300) -> dict[str, Any]:
+        now = time.monotonic()
+        window = max(1.0, float(window_seconds or 300))
+        cutoff = now - window
+        with self._image_slot_condition:
+            while self._image_wait_events and float(self._image_wait_events[0].get("ts") or 0) < cutoff:
+                self._image_wait_events.popleft()
+            max_concurrency = max(1, int(config.image_account_concurrency or 1))
+            ready_tokens = self._list_ready_candidate_tokens()
+            inflight = max(0, sum(max(0, int(value or 0)) for value in self._image_inflight.values()))
+            waiting = max(0, int(self._image_waiting or 0))
+            current_demand = inflight + waiting
+            current_wait_ms = int(max(0.0, now - self._image_pressure_started_at) * 1000) if waiting > 0 and self._image_pressure_started_at > 0 else 0
+            recent_waits = [int(item.get("wait_ms") or 0) for item in self._image_wait_events]
+            recent_max_wait_ms = max(recent_waits, default=0)
+            recent_avg_wait_ms = int(sum(recent_waits) / len(recent_waits)) if recent_waits else 0
+            pressure_duration_seconds = round(max(0.0, now - self._image_pressure_started_at), 1) if waiting > 0 and self._image_pressure_started_at > 0 else 0.0
+            seconds_since_pressure = round(max(0.0, now - self._image_last_pressure_at), 1) if self._image_last_pressure_at > 0 else None
+            peak_demand = max(int(self._image_pressure_peak_demand or 0), current_demand)
+            return {
+                "image_inflight": inflight,
+                "image_waiting": waiting,
+                "image_ready_accounts": len(ready_tokens),
+                "image_account_concurrency": max_concurrency,
+                "image_slot_capacity": len(ready_tokens) * max_concurrency,
+                "image_current_demand": current_demand,
+                "image_peak_demand": peak_demand,
+                "image_current_wait_ms": current_wait_ms,
+                "image_recent_max_wait_ms": recent_max_wait_ms,
+                "image_recent_avg_wait_ms": recent_avg_wait_ms,
+                "image_recent_wait_samples": len(recent_waits),
+                "image_pressure_duration_seconds": pressure_duration_seconds,
+                "image_seconds_since_pressure": seconds_since_pressure,
+            }
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1196,40 +1264,55 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        wait_started = 0.0
+        wait_registered = False
         with self._image_slot_condition:
-            while True:
-                # Token refresh can rotate an attempted account's access token while
-                # this request waits for a slot. Resolve aliases on every pass so the
-                # same account cannot be selected again under its refreshed token.
-                resolved_excluded_tokens = {
-                    self._resolve_access_token_locked(token)
-                    for token in (excluded_tokens or set())
-                    if token
-                }
-                if not self._list_ready_candidate_tokens(
-                    resolved_excluded_tokens,
-                    plan_type,
-                    source_type,
-                    plan_types,
-                ):
-                    raise self._no_ready_candidate_error(
+            try:
+                while True:
+                    # Token refresh can rotate an attempted account's access token while
+                    # this request waits for a slot. Resolve aliases on every pass so the
+                    # same account cannot be selected again under its refreshed token.
+                    resolved_excluded_tokens = {
+                        self._resolve_access_token_locked(token)
+                        for token in (excluded_tokens or set())
+                        if token
+                    }
+                    if not self._list_ready_candidate_tokens(
+                        resolved_excluded_tokens,
                         plan_type,
                         source_type,
                         plan_types,
+                    ):
+                        raise self._no_ready_candidate_error(
+                            plan_type,
+                            source_type,
+                            plan_types,
+                            resolved_excluded_tokens,
+                        )
+                    tokens = self._list_available_candidate_tokens(
                         resolved_excluded_tokens,
+                        plan_type,
+                        source_type,
+                        plan_types,
                     )
-                tokens = self._list_available_candidate_tokens(
-                    resolved_excluded_tokens,
-                    plan_type,
-                    source_type,
-                    plan_types,
-                )
-                if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
-                    self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
-                    return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                    if tokens:
+                        access_token = tokens[self._index % len(tokens)]
+                        self._index += 1
+                        self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
+                        if wait_started > 0:
+                            self._record_image_slot_wait_locked(int((time.monotonic() - wait_started) * 1000))
+                        self._mark_image_slot_pressure_locked()
+                        return access_token
+                    if not wait_registered:
+                        wait_started = time.monotonic()
+                        self._image_waiting += 1
+                        wait_registered = True
+                    self._mark_image_slot_pressure_locked()
+                    self._image_slot_condition.wait(timeout=1.0)
+            finally:
+                if wait_registered:
+                    self._image_waiting = max(0, int(self._image_waiting or 0) - 1)
+                    self._mark_image_slot_pressure_locked()
 
     def _no_ready_candidate_error(
             self,
@@ -1280,6 +1363,7 @@ class AccountService:
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             self._release_image_slot_locked(access_token)
+            self._mark_image_slot_pressure_locked()
             self._image_slot_condition.notify_all()
 
     def _release_image_slot_locked(self, access_token: str) -> None:
@@ -3137,6 +3221,7 @@ class AccountService:
     def get_stats(self) -> dict:
         with self._lock:
             items = list(self._accounts.values())
+            cumulative_total = self._cumulative_total
         total = len(items)
         status_categories = [self._account_status_category_for_stats(a) for a in items]
         active = sum(1 for category in status_categories if category == "normal")
@@ -3162,9 +3247,10 @@ class AccountService:
         for a in items:
             t = a.get("type") or "unknown"
             by_type[t] = by_type.get(t, 0) + 1
+        image_pressure = self.get_image_pressure_stats()
         return {
             "total": total,
-            "cumulative_total": self._cumulative_total,
+            "cumulative_total": cumulative_total,
             "active": active,
             "limited": limited,
             "suspicious": suspicious,
@@ -3176,6 +3262,7 @@ class AccountService:
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,
+            "image_pressure": image_pressure,
         }
 
     def account_health(self) -> dict:

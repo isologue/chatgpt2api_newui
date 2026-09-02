@@ -133,6 +133,12 @@ export const defaultRegisterConfig: LegacyRegisterConfig = {
   target_quota: 100,
   target_available: 10,
   check_interval: 5,
+  dynamic_image_scale_enabled: true,
+  dynamic_image_scale_max_extra: 100,
+  dynamic_image_scale_pressure_seconds: 20,
+  dynamic_image_scale_cooldown_seconds: 600,
+  dynamic_image_scale_wait_threshold_ms: 5000,
+  dynamic_image_scale_buffer: 2,
   enabled: false,
   stats: {
     success: 0,
@@ -406,6 +412,12 @@ export function legacyRegisterPayload(config: LegacyRegisterConfig): Partial<Leg
     target_quota: Math.max(1, Number(config.target_quota) || 1),
     target_available: Math.max(1, Number(config.target_available) || 1),
     check_interval: Math.max(1, Number(config.check_interval) || 5),
+    dynamic_image_scale_enabled: config.dynamic_image_scale_enabled !== false,
+    dynamic_image_scale_max_extra: Math.max(0, Number(config.dynamic_image_scale_max_extra) || 0),
+    dynamic_image_scale_pressure_seconds: Math.max(1, Number(config.dynamic_image_scale_pressure_seconds) || 20),
+    dynamic_image_scale_cooldown_seconds: Math.max(1, Number(config.dynamic_image_scale_cooldown_seconds) || 600),
+    dynamic_image_scale_wait_threshold_ms: Math.max(0, Number(config.dynamic_image_scale_wait_threshold_ms) || 0),
+    dynamic_image_scale_buffer: Math.max(0, Number(config.dynamic_image_scale_buffer) || 0),
   }
 }
 
@@ -747,6 +759,8 @@ export function registerMetricItems(
     { key: 'avg', label: '平均耗时', value: `${stats.avg_seconds || 0}s` },
     { key: 'quota', label: '当前额度', value: stats.current_quota || 0 },
     { key: 'available', label: '正常账号', value: stats.current_available || 0 },
+    { key: 'dynamic-target', label: '动态目标', value: stats.dynamic_target_available || 0, meta: `额外 ${stats.dynamic_extra_buffer || 0}` },
+    { key: 'image-waiting', label: '生图等待', value: stats.image_waiting || 0, meta: `在途 ${stats.image_inflight || 0}` },
   ]
 }
 

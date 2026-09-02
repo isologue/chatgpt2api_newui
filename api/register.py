@@ -20,6 +20,12 @@ class RegisterConfigRequest(BaseModel):
     target_quota: int | None = None
     target_available: int | None = None
     check_interval: int | None = None
+    dynamic_image_scale_enabled: bool | None = None
+    dynamic_image_scale_max_extra: int | None = None
+    dynamic_image_scale_pressure_seconds: int | None = None
+    dynamic_image_scale_cooldown_seconds: int | None = None
+    dynamic_image_scale_wait_threshold_ms: int | None = None
+    dynamic_image_scale_buffer: int | None = None
 
 
 class OutlookPoolResetRequest(BaseModel):

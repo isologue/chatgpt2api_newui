@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
@@ -53,6 +54,14 @@ def _safe_bool(value: object, fallback: bool = False) -> bool:
     return fallback
 
 
+def _safe_int(value: object, fallback: int, minimum: int = 0) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except Exception:
+        parsed = fallback
+    return max(minimum, parsed)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -73,7 +82,36 @@ def _ensure_provider_id(provider: dict) -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {
+        **openai_register.config,
+        "mode": "total",
+        "target_quota": 100,
+        "target_available": 10,
+        "check_interval": 5,
+        "dynamic_image_scale_enabled": True,
+        "dynamic_image_scale_max_extra": 100,
+        "dynamic_image_scale_pressure_seconds": 20,
+        "dynamic_image_scale_cooldown_seconds": 600,
+        "dynamic_image_scale_wait_threshold_ms": 5000,
+        "dynamic_image_scale_buffer": 2,
+        "enabled": False,
+        "stats": {
+            "success": 0,
+            "fail": 0,
+            "done": 0,
+            "running": 0,
+            "threads": openai_register.config["threads"],
+            "elapsed_seconds": 0,
+            "avg_seconds": 0,
+            "success_rate": 0,
+            "current_quota": 0,
+            "current_available": 0,
+            "dynamic_target_available": 10,
+            "dynamic_extra_buffer": 0,
+            "queue_pressure_score": 0,
+            "last_dynamic_adjust_reason": "",
+        },
+    }
 
 
 def _normalize(raw: dict) -> dict:
@@ -85,6 +123,12 @@ def _normalize(raw: dict) -> dict:
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
+    cfg["dynamic_image_scale_enabled"] = _safe_bool(cfg.get("dynamic_image_scale_enabled"), True)
+    cfg["dynamic_image_scale_max_extra"] = _safe_int(cfg.get("dynamic_image_scale_max_extra"), 100, 0)
+    cfg["dynamic_image_scale_pressure_seconds"] = _safe_int(cfg.get("dynamic_image_scale_pressure_seconds"), 20, 1)
+    cfg["dynamic_image_scale_cooldown_seconds"] = _safe_int(cfg.get("dynamic_image_scale_cooldown_seconds"), 600, 1)
+    cfg["dynamic_image_scale_wait_threshold_ms"] = _safe_int(cfg.get("dynamic_image_scale_wait_threshold_ms"), 5000, 0)
+    cfg["dynamic_image_scale_buffer"] = _safe_int(cfg.get("dynamic_image_scale_buffer"), 2, 0)
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
@@ -106,6 +150,9 @@ class RegisterService:
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        self._dynamic_image_target_available = int(self._config.get("target_available") or 10)
+        self._dynamic_image_last_pressure_at = 0.0
+        self._dynamic_image_last_reason = ""
         if self._config["enabled"]:
             self.start()
 
@@ -350,21 +397,115 @@ class RegisterService:
             target_available=target_available,
         )
 
+    def _image_pressure_target(self, cfg: dict, base_target: int) -> dict:
+        pressure = account_service.get_image_pressure_stats()
+        base_target = max(1, int(base_target or 1))
+        if not _safe_bool(cfg.get("dynamic_image_scale_enabled"), True):
+            self._dynamic_image_target_available = base_target
+            self._dynamic_image_last_reason = "动态补号已关闭"
+            return {
+                **pressure,
+                "target_available_base": base_target,
+                "dynamic_target_available": base_target,
+                "dynamic_extra_buffer": 0,
+                "queue_pressure_score": 0,
+                "last_dynamic_adjust_reason": self._dynamic_image_last_reason,
+            }
+
+        max_extra = _safe_int(cfg.get("dynamic_image_scale_max_extra"), 100, 0)
+        pressure_seconds = _safe_int(cfg.get("dynamic_image_scale_pressure_seconds"), 20, 1)
+        cooldown_seconds = _safe_int(cfg.get("dynamic_image_scale_cooldown_seconds"), 600, 1)
+        wait_threshold_ms = _safe_int(cfg.get("dynamic_image_scale_wait_threshold_ms"), 5000, 0)
+        buffer = _safe_int(cfg.get("dynamic_image_scale_buffer"), 2, 0)
+        per_account = max(1, int(pressure.get("image_account_concurrency") or 1))
+        inflight = max(0, int(pressure.get("image_inflight") or 0))
+        waiting = max(0, int(pressure.get("image_waiting") or 0))
+        current_demand = max(0, int(pressure.get("image_current_demand") or 0))
+        peak_demand = max(current_demand, int(pressure.get("image_peak_demand") or 0))
+        current_wait_ms = max(0, int(pressure.get("image_current_wait_ms") or 0))
+        recent_max_wait_ms = max(0, int(pressure.get("image_recent_max_wait_ms") or 0))
+        pressure_duration = float(pressure.get("image_pressure_duration_seconds") or 0)
+        seconds_since_pressure_raw = pressure.get("image_seconds_since_pressure")
+        try:
+            seconds_since_pressure = float(seconds_since_pressure_raw) if seconds_since_pressure_raw is not None else None
+        except Exception:
+            seconds_since_pressure = None
+        wait_units = math.ceil(max(current_wait_ms, recent_max_wait_ms) / max(1, wait_threshold_ms)) if wait_threshold_ms else 0
+        queue_pressure_score = max(waiting, wait_units)
+
+        now = time.monotonic()
+        current_pressure_ready = (
+            (waiting > 0 and pressure_duration >= pressure_seconds)
+            or (waiting > 0 and wait_threshold_ms > 0 and current_wait_ms >= wait_threshold_ms)
+        )
+        recent_wait_ready = (
+            wait_threshold_ms > 0
+            and recent_max_wait_ms >= wait_threshold_ms
+            and (seconds_since_pressure is None or seconds_since_pressure <= cooldown_seconds)
+        )
+        pressure_ready = current_pressure_ready or recent_wait_ready
+        demand_for_target = current_demand if current_pressure_ready else peak_demand
+        demand_target = math.ceil(max(0, demand_for_target) / per_account) + buffer if demand_for_target > 0 else base_target
+        demand_target = max(base_target, min(base_target + max_extra, demand_target))
+
+        if pressure_ready and demand_target > base_target:
+            self._dynamic_image_target_available = max(self._dynamic_image_target_available, demand_target)
+            observed_last_pressure_at = now - seconds_since_pressure if seconds_since_pressure is not None else now
+            self._dynamic_image_last_pressure_at = max(self._dynamic_image_last_pressure_at, observed_last_pressure_at)
+            self._dynamic_image_last_reason = (
+                f"生图排队压力触发：在途={inflight}，等待={waiting}，峰值需求={peak_demand}，"
+                f"单号并发={per_account}，目标={self._dynamic_image_target_available}"
+            )
+        elif self._dynamic_image_target_available > base_target:
+            idle_seconds = now - self._dynamic_image_last_pressure_at if self._dynamic_image_last_pressure_at > 0 else cooldown_seconds
+            if idle_seconds >= cooldown_seconds:
+                self._dynamic_image_target_available = base_target
+                self._dynamic_image_last_reason = f"生图排队低压超过 {cooldown_seconds}s，动态目标回落到基础目标"
+            else:
+                remaining = int(max(0, cooldown_seconds - idle_seconds))
+                self._dynamic_image_last_reason = f"生图排队压力冷却中，{remaining}s 后可回落"
+        else:
+            self._dynamic_image_target_available = base_target
+            self._dynamic_image_last_reason = "未检测到持续生图排队压力"
+
+        effective_target = max(base_target, min(base_target + max_extra, int(self._dynamic_image_target_available or base_target)))
+        return {
+            **pressure,
+            "target_available_base": base_target,
+            "dynamic_target_available": effective_target,
+            "dynamic_extra_buffer": max(0, effective_target - base_target),
+            "queue_pressure_score": queue_pressure_score,
+            "last_dynamic_adjust_reason": self._dynamic_image_last_reason,
+        }
+
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
+        effective_target_available = int(cfg.get("target_available") or 1)
+        dynamic_stats: dict = {}
+        if mode == "available":
+            dynamic_stats = self._image_pressure_target(cfg, effective_target_available)
+            effective_target_available = int(dynamic_stats.get("dynamic_target_available") or effective_target_available)
         metrics = self._pool_metrics(
             refresh_stale=mode in {"quota", "available"},
             target_quota=int(cfg.get("target_quota") or 1) if mode == "quota" else None,
-            target_available=int(cfg.get("target_available") or 1) if mode == "available" else None,
+            target_available=effective_target_available if mode == "available" else None,
         )
+        if dynamic_stats:
+            metrics.update(dynamic_stats)
         self._bump(**metrics)
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
             self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
-            reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            reached = metrics["current_available"] >= effective_target_available
+            self._append_log(
+                f"检查号池：当前正常账号={metrics['current_available']}，基础目标={cfg.get('target_available')}，"
+                f"动态目标={effective_target_available}，生图在途={metrics.get('image_inflight', 0)}，"
+                f"生图等待={metrics.get('image_waiting', 0)}，当前剩余额度={metrics['current_quota']}，"
+                f"{'跳过注册' if reached else '继续注册'}",
+                "yellow",
+            )
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
