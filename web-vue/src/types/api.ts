@@ -64,6 +64,7 @@ export interface Settings {
   image_poll_initial_wait_secs?: number
   image_account_concurrency?: number
   image_account_retry_enabled?: boolean
+  image_no_account_wait_seconds?: number
   image_preflight_token_refresh_enabled?: boolean
   image_upscale_enabled?: boolean
   image_upscale_engine?: 'sharp_lanczos3' | 'pillow_lanczos'

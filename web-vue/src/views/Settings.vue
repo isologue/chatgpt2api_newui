@@ -83,6 +83,7 @@
             :settings="localSettings"
             :image-auth-refresh-concurrency-field="imageAuthRefreshConcurrencyField"
             :image-max-account-attempts-field="imageMaxAccountAttemptsField"
+            :image-no-account-wait-seconds-field="imageNoAccountWaitSecondsField"
             :image-settle-seconds-field="imageSettleSecondsField"
             @set-log-level="setLogLevel"
           />
@@ -481,6 +482,14 @@ const imageAuthRefreshConcurrencyField = useNumberSettingField(
     localSettings.value.image_auth_refresh_concurrency = value
   },
   { integer: true, min: 1, fallback: 10 },
+)
+const imageNoAccountWaitSecondsField = useNumberSettingField(
+  () => localSettings.value?.image_no_account_wait_seconds ?? 10,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_no_account_wait_seconds = value
+  },
+  { integer: true, min: 0, fallback: 10 },
 )
 const imageSettleSecondsField = useNumberSettingField(
   () => localSettings.value?.image_settle_secs ?? 5,

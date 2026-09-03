@@ -1357,6 +1357,52 @@ class AccountService:
             "no image account is ready for current model/status filters",
         )
 
+    @staticmethod
+    def _is_register_running() -> bool:
+        """读取注册机运行态；使用局部导入避免 register_service 循环依赖。"""
+        try:
+            from services.register_service import register_service
+
+            return bool(register_service.get().get("enabled"))
+        except Exception:
+            return False
+
+    def _wait_for_register_account(
+        self,
+        *,
+        plan_type: str | None = None,
+        source_type: str | None = None,
+        plan_types: set[str] | tuple[str, ...] | None = None,
+        excluded_tokens: set[str] | None = None,
+    ) -> bool:
+        """注册机运行且暂时没有匹配账号时，等待新账号进入账号池。"""
+        wait_seconds = config.image_no_account_wait_seconds
+        if wait_seconds <= 0 or not self._is_register_running():
+            return False
+
+        excluded = set(excluded_tokens or set())
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            with self._image_slot_condition:
+                resolved_excluded = {
+                    self._resolve_access_token_locked(token)
+                    for token in excluded
+                    if token
+                }
+                if self._list_ready_candidate_tokens(
+                    resolved_excluded,
+                    plan_type,
+                    source_type,
+                    plan_types,
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._image_slot_condition.wait(timeout=min(0.5, remaining))
+            if not self._is_register_running():
+                return False
+
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
             return
@@ -1392,6 +1438,7 @@ class AccountService:
         # 只要出现过非额度类失败，就说明不能断言全部账号都耗尽，应返回可重试的 unavailable。
         saw_remote_quota_exhausted = False
         saw_unavailable_failure = False
+        registration_wait_used = False
         for _attempt in range(max_attempts):
             try:
                 access_token = self._acquire_next_candidate_token(
@@ -1400,7 +1447,20 @@ class AccountService:
                     source_type=source_type,
                     plan_types=plan_types,
                 )
-            except ImageAccountSelectionError:
+            except ImageAccountSelectionError as exc:
+                if (
+                    exc.kind == "unavailable"
+                    and not attempted_tokens
+                    and not registration_wait_used
+                ):
+                    registration_wait_used = True
+                    if self._wait_for_register_account(
+                        plan_type=plan_type,
+                        source_type=source_type,
+                        plan_types=plan_types,
+                        excluded_tokens=externally_excluded,
+                    ):
+                        continue
                 if attempted_tokens:
                     break
                 raise
@@ -1996,6 +2056,7 @@ class AccountService:
                 if account is not None:
                     self._accounts[access_token] = account
             self._save_accounts()
+            self._image_slot_condition.notify_all()
             items = [dict(item) for item in self._accounts.values()] if return_items else []
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})

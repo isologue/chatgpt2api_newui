@@ -62,6 +62,7 @@ SETTINGS_UPDATE_KEYS = {
     "image_poll_initial_wait_secs",
     "image_account_concurrency",
     "image_account_retry_enabled",
+    "image_no_account_wait_seconds",
     "image_preflight_token_refresh_enabled",
     "image_upscale_enabled",
     "image_upscale_engine",

@@ -52,6 +52,18 @@
           @update:model-value="imageAuthRefreshConcurrencyField.update"
         />
       </FormField>
+      <FormField label="无可用账号时等待注册（秒）">
+        <template #label-extra>
+          <HelpTip text="生图没有可用账号且注册机正在运行时，最多等待该时长；账号恢复后继续请求，超时返回 503。注册机未运行时不会等待。设置为 0 表示不等待。" />
+        </template>
+        <Input
+          :model-value="imageNoAccountWaitSecondsField.input.value"
+          type="number"
+          block
+          placeholder="10"
+          @update:model-value="imageNoAccountWaitSecondsField.update"
+        />
+      </FormField>
     </FormSection>
 
     <FormSection title="图片确认">
@@ -135,6 +147,7 @@ defineProps<{
   settings: Settings
   imageAuthRefreshConcurrencyField: NumberSettingField
   imageMaxAccountAttemptsField: NumberSettingField
+  imageNoAccountWaitSecondsField: NumberSettingField
   imageSettleSecondsField: NumberSettingField
 }>()
 
