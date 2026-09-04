@@ -484,6 +484,16 @@ class ConfigStore:
         )
 
     @property
+    def image_no_quota_wait_seconds(self) -> int:
+        """图片额度耗尽时，注册机运行中的最长等待时间。"""
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_no_quota_wait_seconds"),
+            10,
+            0,
+        )
+
+    @property
     def image_preflight_token_refresh_enabled(self) -> bool:
         self.reload_if_changed()
         return _normalize_bool(self.data.get("image_preflight_token_refresh_enabled"), False)
@@ -644,6 +654,7 @@ class ConfigStore:
             data["image_account_concurrency"] = self.image_account_concurrency
             data["image_account_retry_enabled"] = self.image_account_retry_enabled
             data["image_no_account_wait_seconds"] = self.image_no_account_wait_seconds
+            data["image_no_quota_wait_seconds"] = self.image_no_quota_wait_seconds
             data["image_preflight_token_refresh_enabled"] = self.image_preflight_token_refresh_enabled
             data["image_upscale_enabled"] = self.image_upscale_enabled
             data["image_upscale_engine"] = self.image_upscale_engine

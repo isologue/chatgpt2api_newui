@@ -1370,13 +1370,14 @@ class AccountService:
     def _wait_for_register_account(
         self,
         *,
+        wait_seconds: int,
         plan_type: str | None = None,
         source_type: str | None = None,
         plan_types: set[str] | tuple[str, ...] | None = None,
         excluded_tokens: set[str] | None = None,
     ) -> bool:
         """注册机运行且暂时没有匹配账号时，等待新账号进入账号池。"""
-        wait_seconds = config.image_no_account_wait_seconds
+        wait_seconds = max(0, int(wait_seconds or 0))
         if wait_seconds <= 0 or not self._is_register_running():
             return False
 
@@ -1430,88 +1431,112 @@ class AccountService:
 
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
+        当注册机运行时，账号池暂时为空或额度全部耗尽可分别等待一次，
+        等待期间出现新账号/额度恢复则重新走完整选择流程。
         """
         max_attempts = 20  # 防止无限循环
         externally_excluded = set(excluded_tokens or set())
-        attempted_tokens: set[str] = set()
-        # 控制流只保留两个出口，但最终是否能说“额度耗尽”必须谨慎：
-        # 只要出现过非额度类失败，就说明不能断言全部账号都耗尽，应返回可重试的 unavailable。
-        saw_remote_quota_exhausted = False
-        saw_unavailable_failure = False
-        registration_wait_used = False
-        for _attempt in range(max_attempts):
-            try:
-                access_token = self._acquire_next_candidate_token(
-                    excluded_tokens=externally_excluded | attempted_tokens,
-                    plan_type=plan_type,
-                    source_type=source_type,
-                    plan_types=plan_types,
-                )
-            except ImageAccountSelectionError as exc:
+        account_wait_used = False
+        quota_wait_used = False
+
+        while True:
+            attempted_tokens: set[str] = set()
+            # 控制流只保留两个出口，但最终是否能说“额度耗尽”必须谨慎：
+            # 只要出现过非额度类失败，就说明不能断言全部账号都耗尽，应返回可重试的 unavailable。
+            saw_remote_quota_exhausted = False
+            saw_unavailable_failure = False
+            restart_selection = False
+
+            for _attempt in range(max_attempts):
+                try:
+                    access_token = self._acquire_next_candidate_token(
+                        excluded_tokens=externally_excluded | attempted_tokens,
+                        plan_type=plan_type,
+                        source_type=source_type,
+                        plan_types=plan_types,
+                    )
+                except ImageAccountSelectionError as exc:
+                    if not attempted_tokens:
+                        wait_seconds = None
+                        if exc.kind == "unavailable" and not account_wait_used:
+                            account_wait_used = True
+                            wait_seconds = config.image_no_account_wait_seconds
+                        elif exc.kind == "quota_exhausted" and not quota_wait_used:
+                            quota_wait_used = True
+                            wait_seconds = config.image_no_quota_wait_seconds
+                        if wait_seconds is not None and self._wait_for_register_account(
+                            wait_seconds=wait_seconds,
+                            plan_type=plan_type,
+                            source_type=source_type,
+                            plan_types=plan_types,
+                            excluded_tokens=externally_excluded,
+                        ):
+                            restart_selection = True
+                            break
+                    if attempted_tokens:
+                        break
+                    raise
+                attempted_tokens.add(access_token)
+                try:
+                    if config.image_preflight_token_refresh_enabled:
+                        access_token = self.refresh_access_token(
+                            access_token,
+                            force=True,
+                            event="get_available_access_token:forced_preflight",
+                            image_scope=True,
+                            skip_if_image_busy=True,
+                        )
+                        attempted_tokens.add(access_token)
+                    account = self.fetch_remote_info(
+                        access_token,
+                        "get_available_access_token",
+                        image_scope=True,
+                    )
+                except Exception:
+                    # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
+                    # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
+                    saw_unavailable_failure = True
+                    self.release_image_slot(access_token)
+                    continue
+                # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
+                # 把新 token 也加入排除列表，防止重复尝试
+                resolved = str((account or {}).get("access_token") or "")
+                if resolved and resolved != access_token:
+                    attempted_tokens.add(resolved)
                 if (
-                    exc.kind == "unavailable"
-                    and not attempted_tokens
-                    and not registration_wait_used
+                        self._is_image_account_available(account or {})
+                        and self._account_matches_plan_type(account or {}, plan_type)
+                        and self._account_matches_any_plan_type(account or {}, plan_types)
+                        and self._account_matches_source_type(account or {}, source_type)
                 ):
-                    registration_wait_used = True
+                    return str((account or {}).get("access_token") or access_token)
+                if str((account or {}).get("status") or "") == "限流":
+                    saw_remote_quota_exhausted = True
+                else:
+                    saw_unavailable_failure = True
+                self.release_image_slot(access_token)
+
+            if restart_selection:
+                continue
+            if saw_remote_quota_exhausted and not saw_unavailable_failure:
+                if not quota_wait_used:
+                    quota_wait_used = True
                     if self._wait_for_register_account(
+                        wait_seconds=config.image_no_quota_wait_seconds,
                         plan_type=plan_type,
                         source_type=source_type,
                         plan_types=plan_types,
                         excluded_tokens=externally_excluded,
                     ):
                         continue
-                if attempted_tokens:
-                    break
-                raise
-            attempted_tokens.add(access_token)
-            try:
-                if config.image_preflight_token_refresh_enabled:
-                    access_token = self.refresh_access_token(
-                        access_token,
-                        force=True,
-                        event="get_available_access_token:forced_preflight",
-                        image_scope=True,
-                        skip_if_image_busy=True,
-                    )
-                    attempted_tokens.add(access_token)
-                account = self.fetch_remote_info(
-                    access_token,
-                    "get_available_access_token",
-                    image_scope=True,
+                raise ImageAccountSelectionError(
+                    "quota_exhausted",
+                    f"all usable image accounts remote-confirmed quota exhausted after {len(attempted_tokens)} attempts",
                 )
-            except Exception:
-                # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
-                # 401 已在 fetch_remote_info 内部走异常处理，这里不再二次分类。
-                saw_unavailable_failure = True
-                self.release_image_slot(access_token)
-                continue
-            # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
-            # 把新 token 也加入排除列表，防止重复尝试
-            resolved = str((account or {}).get("access_token") or "")
-            if resolved and resolved != access_token:
-                attempted_tokens.add(resolved)
-            if (
-                    self._is_image_account_available(account or {})
-                    and self._account_matches_plan_type(account or {}, plan_type)
-                    and self._account_matches_any_plan_type(account or {}, plan_types)
-                    and self._account_matches_source_type(account or {}, source_type)
-            ):
-                return str((account or {}).get("access_token") or access_token)
-            if str((account or {}).get("status") or "") == "限流":
-                saw_remote_quota_exhausted = True
-            else:
-                saw_unavailable_failure = True
-            self.release_image_slot(access_token)
-        if saw_remote_quota_exhausted and not saw_unavailable_failure:
             raise ImageAccountSelectionError(
-                "quota_exhausted",
-                f"all usable image accounts remote-confirmed quota exhausted after {len(attempted_tokens)} attempts",
+                "unavailable",
+                f"no image account available after {len(attempted_tokens)} attempts",
             )
-        raise ImageAccountSelectionError(
-            "unavailable",
-            f"no image account available after {len(attempted_tokens)} attempts",
-        )
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         attempted = set(excluded_tokens or set())

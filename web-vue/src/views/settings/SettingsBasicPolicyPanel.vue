@@ -64,6 +64,18 @@
           @update:model-value="imageNoAccountWaitSecondsField.update"
         />
       </FormField>
+      <FormField label="无可用额度时等待注册（秒）">
+        <template #label-extra>
+          <HelpTip text="图片账号额度都被远程确认耗尽且注册机正在运行时，最多等待该时长；期间有新账号或额度恢复就重新尝试，超时返回 429。注册机未运行时不会等待。设置为 0 表示不等待。" />
+        </template>
+        <Input
+          :model-value="imageNoQuotaWaitSecondsField.input.value"
+          type="number"
+          block
+          placeholder="10"
+          @update:model-value="imageNoQuotaWaitSecondsField.update"
+        />
+      </FormField>
     </FormSection>
 
     <FormSection title="图片确认">
@@ -148,6 +160,7 @@ defineProps<{
   imageAuthRefreshConcurrencyField: NumberSettingField
   imageMaxAccountAttemptsField: NumberSettingField
   imageNoAccountWaitSecondsField: NumberSettingField
+  imageNoQuotaWaitSecondsField: NumberSettingField
   imageSettleSecondsField: NumberSettingField
 }>()
 
