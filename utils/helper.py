@@ -18,9 +18,16 @@ from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+# 标准网页 picture_v2 生图模型；均走 ChatGPT 对话链路的 model=auto。
+WEB_IMAGE_MODELS = (
+    "gpt-image-2",
+    "gpt-image-2.5",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+)
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+BASE_IMAGE_MODELS = set(WEB_IMAGE_MODELS) | {CODEX_IMAGE_MODEL}
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES

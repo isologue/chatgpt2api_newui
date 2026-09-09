@@ -39,7 +39,7 @@ from services.image_failure import (
 )
 from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import WEB_IMAGE_MODELS, UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.diagnostics import diagnostic_excerpt
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -789,8 +789,10 @@ class OpenAIBackendAPI:
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
-        if base_model == "gpt-image-2":
-            return "gpt-5-3"
+        if base_model in WEB_IMAGE_MODELS:
+            # 与 ChatGPT 网页 picture_v2 生图链路一致：传 auto，
+            # 由上游按当前账号能力解析实际会话模型。
+            return "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
