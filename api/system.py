@@ -41,6 +41,7 @@ from services.model_catalog_service import get_model_catalog
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 from services.realtime_monitor_service import realtime_monitor_service
 from services.runtime_log_service import list_runtime_logs
+from services.threadpool_service import apply_thread_pool_capacity
 from utils.timezone import beijing_now, parse_to_beijing_naive
 
 
@@ -53,6 +54,7 @@ SETTINGS_UPDATE_KEYS = {
     "fallback_proxy",
     "proxy_runtime",
     "base_url",
+    "thread_pool_capacity",
     "refresh_account_interval_minute",
     "image_retention_days",
     "log_retention_days",
@@ -586,7 +588,13 @@ def create_router(app_version: str) -> APIRouter:
             if not updates:
                 return {"config": config.get()}
             previous_refresh_interval = config.refresh_account_interval_minute
+            previous_thread_pool_capacity = config.thread_pool_capacity
             updated_config = config.update(updates)
+            if (
+                "thread_pool_capacity" in updates
+                and config.thread_pool_capacity != previous_thread_pool_capacity
+            ):
+                apply_thread_pool_capacity(config.thread_pool_capacity)
             if (
                 "refresh_account_interval_minute" in updates
                 and config.refresh_account_interval_minute != previous_refresh_interval

@@ -14,6 +14,19 @@
         />
       </FormField>
 
+      <FormField label="后端线程池容量">
+        <template #label-extra>
+          <HelpTip text="限制同步接口可同时占用的后端工作线程数。保存后立即生效，无需重启；调低时不会中断正在执行的请求，只会限制后续请求进入。" />
+        </template>
+        <Input
+          :model-value="threadPoolCapacityField.input.value"
+          type="number"
+          block
+          placeholder="80"
+          @update:model-value="threadPoolCapacityField.update"
+        />
+      </FormField>
+
       <FormField label="图片访问地址">
         <template #label-extra>
           <HelpTip text="用于生成图片结果的访问前缀地址。" />
@@ -131,6 +144,7 @@ import type { NumberSettingField } from '@/views/settings/useNumberSettingField'
 
 defineProps<{
   settings: Settings
+  threadPoolCapacityField: NumberSettingField
   refreshAccountIntervalField: NumberSettingField
   imageRetentionDaysField: NumberSettingField
   logRetentionDaysField: NumberSettingField

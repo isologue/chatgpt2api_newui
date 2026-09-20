@@ -29,6 +29,7 @@
           <div class="space-y-4 xl:col-span-2">
             <SettingsBasicConfigPanel
               :settings="localSettings"
+              :thread-pool-capacity-field="threadPoolCapacityField"
               :refresh-account-interval-field="refreshAccountIntervalField"
               :image-retention-days-field="imageRetentionDaysField"
               :log-retention-days-field="logRetentionDaysField"
@@ -443,6 +444,14 @@ const refreshAccountIntervalField = useNumberSettingField(
     localSettings.value.refresh_account_interval_minute = value
   },
   { integer: true, min: 1, fallback: 5 },
+)
+const threadPoolCapacityField = useNumberSettingField(
+  () => localSettings.value?.thread_pool_capacity ?? 80,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.thread_pool_capacity = value
+  },
+  { integer: true, min: 1, fallback: 80 },
 )
 const imagePollTimeoutField = useNumberSettingField(
   () => localSettings.value?.image_poll_timeout_secs ?? 60,

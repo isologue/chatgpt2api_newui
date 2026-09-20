@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import os
 from threading import Event
 
-from anyio.to_thread import current_default_thread_limiter
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -18,33 +16,12 @@ from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.image_service import start_image_cleanup_scheduler
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
-from services.realtime_monitor_service import realtime_monitor_service
+from services.threadpool_service import apply_thread_pool_capacity
 from utils.log import logger
 
 
-def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
-    try:
-        value = int(str(os.getenv(name, "") or default).strip())
-    except (TypeError, ValueError):
-        value = default
-    value = max(value, minimum)
-    if maximum is not None:
-        value = min(value, maximum)
-    return value
-
-
 def _configure_threadpool() -> None:
-    tokens = _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1)
-    limiter = current_default_thread_limiter()
-    previous = int(getattr(limiter, "total_tokens", 0) or 0)
-    if previous != tokens:
-        limiter.total_tokens = tokens
-    realtime_monitor_service.set_threadpool(tokens=tokens, previous_tokens=previous)
-    logger.info({
-        "event": "runtime_threadpool_configured",
-        "previous_tokens": previous,
-        "tokens": tokens,
-    })
+    apply_thread_pool_capacity(config.thread_pool_capacity)
 
 
 def create_app() -> FastAPI:

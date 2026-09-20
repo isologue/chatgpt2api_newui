@@ -248,6 +248,7 @@ environment:
 
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
+| `thread_pool_capacity` | `80` | 后端同步线程池容量，可在系统设置保存后实时调整；`CHATGPT2API_THREAD_TOKENS` 作为未保存该配置时的启动默认值。 |
 | `image_stream_timeout_secs` | `80` | 图片上游 SSE / HTTP 流最长等待时间。 |
 | `image_poll_timeout_secs` | `60` | 图片结果解析和轮询最长等待时间。 |
 | `image_parallel_generation` | `true` | 多图请求是否并行生成。 |

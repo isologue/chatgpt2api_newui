@@ -415,6 +415,12 @@ class ConfigStore:
             return 5
 
     @property
+    def thread_pool_capacity(self) -> int:
+        self.reload_if_changed()
+        env_default = _normalize_positive_int(os.getenv("CHATGPT2API_THREAD_TOKENS"), 80, 1)
+        return _normalize_positive_int(self.data.get("thread_pool_capacity"), env_default, 1)
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -645,6 +651,7 @@ class ConfigStore:
             self.reload_if_changed()
             data = dict(self.data)
             data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+            data["thread_pool_capacity"] = self.thread_pool_capacity
             data["image_retention_days"] = self.image_retention_days
             data["log_retention_days"] = self.log_retention_days
             data["image_poll_timeout_secs"] = self.image_poll_timeout_secs

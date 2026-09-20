@@ -55,6 +55,7 @@ export interface Settings {
   fallback_proxy?: string
   proxy_runtime: ProxyRuntimeSettings
   base_url?: string
+  thread_pool_capacity?: number
   refresh_account_interval_minute?: number
   image_retention_days?: number
   log_retention_days?: number
