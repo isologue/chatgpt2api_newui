@@ -451,6 +451,43 @@ class ConfigStore:
             return 80
 
     @property
+    def image_egress_fallback_on_stream_timeout(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_egress_fallback_on_stream_timeout"), True)
+
+    @property
+    def image_egress_circuit_breaker_enabled(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_egress_circuit_breaker_enabled"), True)
+
+    @property
+    def image_egress_failure_threshold(self) -> int:
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_egress_failure_threshold"),
+            3,
+            1,
+        )
+
+    @property
+    def image_egress_failure_window_seconds(self) -> int:
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_egress_failure_window_seconds"),
+            60,
+            1,
+        )
+
+    @property
+    def image_egress_cooldown_seconds(self) -> int:
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_egress_cooldown_seconds"),
+            120,
+            1,
+        )
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -656,6 +693,11 @@ class ConfigStore:
             data["log_retention_days"] = self.log_retention_days
             data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
             data["image_stream_timeout_secs"] = self.image_stream_timeout_secs
+            data["image_egress_fallback_on_stream_timeout"] = self.image_egress_fallback_on_stream_timeout
+            data["image_egress_circuit_breaker_enabled"] = self.image_egress_circuit_breaker_enabled
+            data["image_egress_failure_threshold"] = self.image_egress_failure_threshold
+            data["image_egress_failure_window_seconds"] = self.image_egress_failure_window_seconds
+            data["image_egress_cooldown_seconds"] = self.image_egress_cooldown_seconds
             data["image_poll_interval_secs"] = self.image_poll_interval_secs
             data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
             data["image_account_concurrency"] = self.image_account_concurrency

@@ -109,6 +109,15 @@ class ClearanceBundle:
         return _cookies_to_header(self.cookies)
 
 
+@dataclass
+class ImageEgressCircuitState:
+    """生图出口熔断状态，仅保存在当前进程内存中。"""
+
+    failure_times: list[float] = field(default_factory=list)
+    opened_until: float = 0.0
+    half_open_probe: bool = False
+
+
 @dataclass(frozen=True)
 class ProxyGroupSelection:
     proxy_url: str = ""
@@ -216,6 +225,7 @@ class ProxySettingsStore:
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
         self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
         self._egress_inflight: dict[str, int] = {}
+        self._image_egress_circuits: dict[str, ImageEgressCircuitState] = {}
         self._lock = threading.RLock()
         self._egress_condition = threading.Condition(self._lock)
 
@@ -538,6 +548,189 @@ class ProxySettingsStore:
 
     def should_skip_ssl_verify(self) -> bool:
         return bool(self._get_runtime_settings().get("skip_ssl_verify"))
+
+    def image_egress_circuit_decision(self, profile: ProxyRuntimeProfile) -> dict[str, object]:
+        """判断新生图请求是否应绕过当前出口改走备用出口。"""
+        enabled = bool(getattr(self._config, "image_egress_circuit_breaker_enabled", True))
+        key = self._image_egress_key(profile)
+        now = time.monotonic()
+        with self._lock:
+            if not enabled:
+                self._image_egress_circuits.clear()
+                return {
+                    "enabled": False,
+                    "state": "disabled",
+                    "egress_key": key,
+                    "route_fallback": False,
+                    "half_open_probe": False,
+                    "remaining_seconds": 0,
+                }
+
+            state = self._image_egress_circuits.get(key)
+            if state is None:
+                return {
+                    "enabled": True,
+                    "state": "closed",
+                    "egress_key": key,
+                    "route_fallback": False,
+                    "half_open_probe": False,
+                    "remaining_seconds": 0,
+                }
+
+            self._prune_image_egress_failures(state, now)
+            if state.opened_until > now:
+                return {
+                    "enabled": True,
+                    "state": "open",
+                    "egress_key": key,
+                    "route_fallback": True,
+                    "half_open_probe": False,
+                    "remaining_seconds": max(1, int(state.opened_until - now + 0.999)),
+                }
+
+            if state.opened_until > 0:
+                if not state.half_open_probe:
+                    state.half_open_probe = True
+                    return {
+                        "enabled": True,
+                        "state": "half_open",
+                        "egress_key": key,
+                        "route_fallback": False,
+                        "half_open_probe": True,
+                        "remaining_seconds": 0,
+                    }
+                return {
+                    "enabled": True,
+                    "state": "half_open",
+                    "egress_key": key,
+                    "route_fallback": True,
+                    "half_open_probe": False,
+                    "remaining_seconds": 0,
+                }
+
+            if not state.failure_times:
+                self._image_egress_circuits.pop(key, None)
+            return {
+                "enabled": True,
+                "state": "closed",
+                "egress_key": key,
+                "route_fallback": False,
+                "half_open_probe": False,
+                "remaining_seconds": 0,
+            }
+
+    def record_image_egress_failure(
+        self,
+        profile: ProxyRuntimeProfile,
+        failure_code: str,
+        *,
+        half_open_probe: bool = False,
+    ) -> dict[str, object]:
+        """记录主出口故障；达到阈值时开路，半开探测失败时重新开路。"""
+        enabled = bool(getattr(self._config, "image_egress_circuit_breaker_enabled", True))
+        key = self._image_egress_key(profile)
+        if not enabled:
+            with self._lock:
+                self._image_egress_circuits.clear()
+            return {"opened": False, "state": "disabled", "egress_key": key}
+
+        threshold = max(1, int(getattr(self._config, "image_egress_failure_threshold", 3)))
+        cooldown = max(1, int(getattr(self._config, "image_egress_cooldown_seconds", 120)))
+        now = time.monotonic()
+        with self._lock:
+            state = self._image_egress_circuits.setdefault(key, ImageEgressCircuitState())
+            self._prune_image_egress_failures(state, now)
+            state.failure_times.append(now)
+            opened = False
+            reopened = False
+            if half_open_probe:
+                state.opened_until = now + cooldown
+                state.half_open_probe = False
+                opened = True
+                reopened = True
+            elif state.opened_until <= now and len(state.failure_times) >= threshold:
+                state.opened_until = now + cooldown
+                state.half_open_probe = False
+                opened = True
+            return {
+                "opened": opened,
+                "reopened": reopened,
+                "state": "open" if state.opened_until > now else "closed",
+                "egress_key": key,
+                "failure_code": str(failure_code or ""),
+                "failure_count": len(state.failure_times),
+                "threshold": threshold,
+                "cooldown_seconds": cooldown,
+                "remaining_seconds": cooldown if opened else 0,
+            }
+
+    def record_image_egress_success(
+        self,
+        profile: ProxyRuntimeProfile,
+        *,
+        half_open_probe: bool = False,
+    ) -> dict[str, object]:
+        """半开探测成功后关闭熔断。"""
+        enabled = bool(getattr(self._config, "image_egress_circuit_breaker_enabled", True))
+        key = self._image_egress_key(profile)
+        with self._lock:
+            if not enabled:
+                self._image_egress_circuits.clear()
+                return {"closed": False, "state": "disabled", "egress_key": key}
+            state = self._image_egress_circuits.get(key)
+            closed = bool(state is not None and half_open_probe and state.half_open_probe)
+            if closed:
+                self._image_egress_circuits.pop(key, None)
+            return {
+                "closed": closed,
+                "state": "closed" if closed or state is None else "open",
+                "egress_key": key,
+            }
+
+    def release_image_egress_probe(self, profile: ProxyRuntimeProfile) -> bool:
+        """释放尚未真正请求上游的半开探测名额，让下一请求继续试探。"""
+        key = self._image_egress_key(profile)
+        with self._lock:
+            state = self._image_egress_circuits.get(key)
+            if state is None or not state.half_open_probe:
+                return False
+            state.half_open_probe = False
+            state.opened_until = min(state.opened_until, time.monotonic())
+            return True
+
+    def get_image_egress_circuit_status(self) -> list[dict[str, object]]:
+        """返回当前进程内的生图出口熔断状态，供诊断使用。"""
+        now = time.monotonic()
+        with self._lock:
+            result: list[dict[str, object]] = []
+            for key, state in list(self._image_egress_circuits.items()):
+                self._prune_image_egress_failures(state, now)
+                if state.opened_until <= 0 and not state.failure_times:
+                    self._image_egress_circuits.pop(key, None)
+                    continue
+                result.append({
+                    "egress_key": key,
+                    "state": (
+                        "open"
+                        if state.opened_until > now
+                        else "half_open"
+                        if state.opened_until > 0
+                        else "closed"
+                    ),
+                    "failure_count": len(state.failure_times),
+                    "half_open_probe": state.half_open_probe,
+                    "remaining_seconds": max(0, int(state.opened_until - now + 0.999)),
+                })
+            return result
+
+    def _prune_image_egress_failures(self, state: ImageEgressCircuitState, now: float) -> None:
+        window = max(1, int(getattr(self._config, "image_egress_failure_window_seconds", 60)))
+        cutoff = now - window
+        state.failure_times = [timestamp for timestamp in state.failure_times if timestamp >= cutoff]
+
+    @staticmethod
+    def _image_egress_key(profile: ProxyRuntimeProfile) -> str:
+        return _clean(getattr(profile, "egress_key", "")) or _egress_key_for_proxy(profile.proxy_url)
 
     def acquire_image_egress(self, profile: ProxyRuntimeProfile) -> int:
         if bool(getattr(profile, "image_egress_reserved", False)):

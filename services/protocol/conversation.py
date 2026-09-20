@@ -35,7 +35,7 @@ from services.image_failure import (
 from services.image_storage_service import image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI
-from services.proxy_service import proxy_settings
+from services.proxy_service import normalize_proxy_url, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
@@ -1290,6 +1290,48 @@ def _image_stream_timeout_error(
     return exc
 
 
+def _is_safe_image_stream_timeout_failover(
+        exc: BaseException,
+        failure: ImageFailure,
+        *,
+        emitted_for_token: bool,
+) -> bool:
+    """仅在没有任何上游已受理迹象时，允许流超时改走备用出口重试。"""
+    if (
+        not config.image_egress_fallback_on_stream_timeout
+        or emitted_for_token
+        or failure.code != "image_stream_timeout"
+        or str(getattr(exc, "conversation_id", "") or "").strip()
+    ):
+        return False
+
+    followup = getattr(exc, "stream_timeout_followup", None)
+    if not isinstance(followup, dict):
+        return False
+    last_state = followup.get("last_stream_state")
+    last_state = last_state if isinstance(last_state, dict) else {}
+    return not any((
+        str(followup.get("conversation_id") or "").strip(),
+        int(followup.get("task_count") or 0) > 0,
+        bool(followup.get("tasks")),
+        bool(followup.get("recovered_file_ids")),
+        bool(followup.get("recovered_sediment_ids")),
+        int(followup.get("conversation_message_count") or 0) > 0,
+        str(followup.get("latest_assistant_text") or "").strip(),
+        str(followup.get("conversation_failure") or "").strip(),
+        str(followup.get("task_error") or "").strip(),
+        str(last_state.get("conversation_id") or "").strip(),
+        bool(last_state.get("file_ids")),
+        bool(last_state.get("sediment_ids")),
+        bool(last_state.get("blocked")),
+        bool(last_state.get("tool_invoked")),
+        str(last_state.get("turn_use_case") or "").strip(),
+        str(last_state.get("async_task_type") or "").strip(),
+        str(last_state.get("message_type") or "").strip(),
+        str(last_state.get("text_preview") or "").strip(),
+    ))
+
+
 def _recover_after_image_stream_timeout(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -2005,6 +2047,49 @@ def _generate_single_image(
         for output in outputs:
             output.image_attempts = attempts
 
+    def record_circuit_success(profile: Any, *, half_open_probe: bool) -> None:
+        if profile is None:
+            return
+        result = proxy_settings.record_image_egress_success(
+            profile,
+            half_open_probe=half_open_probe,
+        )
+        if result.get("closed"):
+            logger.info({
+                "event": "image_egress_circuit_closed",
+                "call_id": request.call_id,
+                "egress_key": result.get("egress_key", ""),
+                "account_email": account_email,
+                "index": index,
+            })
+
+    def record_circuit_failure(
+        profile: Any,
+        failure_code: str,
+        *,
+        half_open_probe: bool,
+    ) -> None:
+        if profile is None:
+            return
+        result = proxy_settings.record_image_egress_failure(
+            profile,
+            failure_code,
+            half_open_probe=half_open_probe,
+        )
+        if result.get("opened"):
+            logger.warning({
+                "event": "image_egress_circuit_opened",
+                "call_id": request.call_id,
+                "egress_key": result.get("egress_key", ""),
+                "failure_code": failure_code,
+                "failure_count": result.get("failure_count", 0),
+                "threshold": result.get("threshold", 0),
+                "cooldown_seconds": result.get("cooldown_seconds", 0),
+                "reopened": bool(result.get("reopened")),
+                "account_email": account_email,
+                "index": index,
+            })
+
     def retry_with_different_account(
         failure: ImageFailure,
         error: ImageGenerationError | None = None,
@@ -2265,6 +2350,9 @@ def _generate_single_image(
         })
         backend: OpenAIBackendAPI | None = None
         egress_acquired = False
+        circuit_primary_profile: Any = None
+        circuit_half_open_probe = False
+        circuit_routed = False
         try:
             egress_started = time.perf_counter()
             fallback_profile = None
@@ -2286,11 +2374,84 @@ def _generate_single_image(
                 proxy_profile=fallback_profile,
                 reserve_image_egress=fallback_profile is None,
             )
+            if not using_fallback_profile:
+                circuit_primary_profile = backend.proxy_profile
+                circuit_decision = proxy_settings.image_egress_circuit_decision(
+                    circuit_primary_profile,
+                )
+                circuit_half_open_probe = bool(circuit_decision.get("half_open_probe"))
+                if circuit_half_open_probe:
+                    logger.warning({
+                        "event": "image_egress_circuit_half_open",
+                        "call_id": request.call_id,
+                        "egress_key": circuit_decision.get("egress_key", ""),
+                        "account_email": account_email,
+                        "index": index,
+                    })
+                if circuit_decision.get("route_fallback"):
+                    fallback_candidate = proxy_settings.get_fallback_profile(
+                        upstream=True,
+                        reserve_image_egress=False,
+                    )
+                    primary_egress_key = str(
+                        getattr(circuit_primary_profile, "egress_key", "") or "direct"
+                    )
+                    primary_proxy_url = normalize_proxy_url(
+                        str(getattr(circuit_primary_profile, "proxy_url", "") or "")
+                    )
+                    fallback_egress_key = (
+                        str(getattr(fallback_candidate, "egress_key", "") or "direct")
+                        if fallback_candidate is not None
+                        else ""
+                    )
+                    fallback_proxy_url = normalize_proxy_url(
+                        str(getattr(fallback_candidate, "proxy_url", "") or "")
+                    ) if fallback_candidate is not None else ""
+                    same_egress = (
+                        fallback_candidate is not None
+                        and (
+                            fallback_egress_key == primary_egress_key
+                            or fallback_proxy_url == primary_proxy_url
+                        )
+                    )
+                    if fallback_candidate is not None and not same_egress:
+                        fallback_from_egress = _backend_egress_data(backend)
+                        if bool(getattr(backend.proxy_profile, "image_egress_reserved", False)):
+                            proxy_settings.release_image_egress(backend.proxy_profile)
+                        backend.close()
+                        backend = OpenAIBackendAPI(
+                            access_token=token,
+                            proxy_profile=fallback_candidate,
+                        )
+                        using_fallback_profile = True
+                        circuit_routed = True
+                        fallback_retry_used = True
+                        logger.warning({
+                            "event": "image_egress_circuit_route",
+                            "call_id": request.call_id,
+                            "egress_key": primary_egress_key,
+                            "fallback_egress_key": fallback_egress_key,
+                            "circuit_state": circuit_decision.get("state", "open"),
+                            "remaining_seconds": circuit_decision.get("remaining_seconds", 0),
+                            "account_email": account_email,
+                            "index": index,
+                        })
+                    else:
+                        logger.warning({
+                            "event": "image_egress_circuit_route_skipped",
+                            "call_id": request.call_id,
+                            "egress_key": primary_egress_key,
+                            "fallback_egress_key": fallback_egress_key,
+                            "reason": "fallback_missing_or_same_egress",
+                            "account_email": account_email,
+                            "index": index,
+                        })
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
                 if using_fallback_profile:
                     egress_data.update({
                         "fallback_retry": True,
+                        "circuit_routed": circuit_routed,
                         "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                         "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
                     })
@@ -2310,6 +2471,7 @@ def _generate_single_image(
                 if using_fallback_profile:
                     egress_data.update({
                         "fallback_retry": True,
+                        "circuit_routed": circuit_routed,
                         "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                         "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
                     })
@@ -2389,6 +2551,11 @@ def _generate_single_image(
                     "returned_result": returned_result,
                     "account_email": account_email,
                 })
+            if not using_fallback_profile:
+                record_circuit_success(
+                    circuit_primary_profile,
+                    half_open_probe=circuit_half_open_probe,
+                )
             if returned_message:
                 message_output = outputs[-1] if outputs else None
                 message_failure = (
@@ -2483,8 +2650,43 @@ def _generate_single_image(
                     "upstream_unavailable",
                 }
             )
+            connection_failure = (
+                not emitted_for_token
+                and failure.code in {
+                    "upstream_connection_failed",
+                    "upstream_connection_timeout",
+                    "upstream_unavailable",
+                }
+            )
+            safe_stream_timeout_failover = _is_safe_image_stream_timeout_failover(
+                exc,
+                failure,
+                emitted_for_token=emitted_for_token,
+            )
+            egress_failure = connection_failure or safe_stream_timeout_failover
+            if not using_fallback_profile:
+                if egress_failure:
+                    record_circuit_failure(
+                        circuit_primary_profile,
+                        failure.code,
+                        half_open_probe=circuit_half_open_probe,
+                    )
+                else:
+                    if circuit_half_open_probe and stream_started <= 0:
+                        proxy_settings.release_image_egress_probe(circuit_primary_profile)
+                    else:
+                        record_circuit_success(
+                            circuit_primary_profile,
+                            half_open_probe=circuit_half_open_probe,
+                        )
             fallback_reference = proxy_settings.get_fallback_proxy_reference()
-            if early_connection_failure and fallback_reference and not fallback_retry_used:
+            fallback_eligible = early_connection_failure or safe_stream_timeout_failover
+            if (
+                fallback_eligible
+                and fallback_reference
+                and not fallback_retry_used
+                and not using_fallback_profile
+            ):
                 fallback_retry_used = True
                 fallback_retry_pending = True
                 retry_token = token
@@ -2498,6 +2700,8 @@ def _generate_single_image(
                     "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                     "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
                     "stream_error_ms": stream_error_ms,
+                    "failure_code": failure.code,
+                    "safe_stream_timeout_failover": safe_stream_timeout_failover,
                     "error": str(exc)[:200],
                 })
                 if request.trace_image_perf:

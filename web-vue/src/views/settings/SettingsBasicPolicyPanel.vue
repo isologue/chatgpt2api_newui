@@ -78,6 +78,62 @@
       </FormField>
     </FormSection>
 
+    <FormSection title="生图出口容错">
+      <div class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.image_egress_fallback_on_stream_timeout">生图流超时后尝试备用出口</Checkbox>
+            <HelpTip text="默认开启。仅在没有收到任何上游内容、会话、任务或图片结果时，才使用同一账号通过 fallback_proxy 重试一次，避免重复提交已经被上游受理的任务。" />
+          </div>
+        </div>
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.image_egress_circuit_breaker_enabled">启用生图出口熔断</Checkbox>
+            <HelpTip text="主出口在统计窗口内达到故障阈值后临时熔断，新生图请求直接走 fallback_proxy；冷却结束只放行一个请求试探主出口。保存后实时生效，无需重启。" />
+          </div>
+        </div>
+      </div>
+      <FormField label="熔断失败次数">
+        <template #label-extra>
+          <HelpTip text="同一生图出口在统计窗口内达到该故障次数后熔断。默认 3，最小 1。" />
+        </template>
+        <Input
+          :model-value="imageEgressFailureThresholdField.input.value"
+          type="number"
+          block
+          placeholder="3"
+          :disabled="!settings.image_egress_circuit_breaker_enabled"
+          @update:model-value="imageEgressFailureThresholdField.update"
+        />
+      </FormField>
+      <FormField label="失败统计窗口（秒）">
+        <template #label-extra>
+          <HelpTip text="只累计该时间范围内的出口故障。默认 60 秒，最小 1 秒。" />
+        </template>
+        <Input
+          :model-value="imageEgressFailureWindowSecondsField.input.value"
+          type="number"
+          block
+          placeholder="60"
+          :disabled="!settings.image_egress_circuit_breaker_enabled"
+          @update:model-value="imageEgressFailureWindowSecondsField.update"
+        />
+      </FormField>
+      <FormField label="熔断冷却时间（秒）">
+        <template #label-extra>
+          <HelpTip text="熔断期间新请求使用备用出口；默认 120 秒。冷却结束后仅一个请求试探主出口，成功即恢复，失败重新计时。" />
+        </template>
+        <Input
+          :model-value="imageEgressCooldownSecondsField.input.value"
+          type="number"
+          block
+          placeholder="120"
+          :disabled="!settings.image_egress_circuit_breaker_enabled"
+          @update:model-value="imageEgressCooldownSecondsField.update"
+        />
+      </FormField>
+    </FormSection>
+
     <FormSection title="图片确认">
       <div class="settings-check-grid settings-check-grid--single">
         <div class="settings-check-item">
@@ -161,6 +217,9 @@ defineProps<{
   imageMaxAccountAttemptsField: NumberSettingField
   imageNoAccountWaitSecondsField: NumberSettingField
   imageNoQuotaWaitSecondsField: NumberSettingField
+  imageEgressFailureThresholdField: NumberSettingField
+  imageEgressFailureWindowSecondsField: NumberSettingField
+  imageEgressCooldownSecondsField: NumberSettingField
   imageSettleSecondsField: NumberSettingField
 }>()
 

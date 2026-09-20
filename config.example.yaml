@@ -13,6 +13,13 @@ image_retention_days: 15
 log_retention_days: 30
 image_poll_timeout_secs: 60
 image_stream_timeout_secs: 80
+# 主出口在未产生任何上游结果的流超时后，允许同账号改走备用出口重试一次
+image_egress_fallback_on_stream_timeout: true
+# 生图主出口连续异常时自动熔断，冷却期间的新请求直接走 fallback_proxy
+image_egress_circuit_breaker_enabled: true
+image_egress_failure_threshold: 3
+image_egress_failure_window_seconds: 60
+image_egress_cooldown_seconds: 120
 image_poll_interval_secs: 10
 image_poll_initial_wait_secs: 10
 image_account_concurrency: 1

@@ -86,6 +86,9 @@
             :image-max-account-attempts-field="imageMaxAccountAttemptsField"
             :image-no-account-wait-seconds-field="imageNoAccountWaitSecondsField"
             :image-no-quota-wait-seconds-field="imageNoQuotaWaitSecondsField"
+            :image-egress-failure-threshold-field="imageEgressFailureThresholdField"
+            :image-egress-failure-window-seconds-field="imageEgressFailureWindowSecondsField"
+            :image-egress-cooldown-seconds-field="imageEgressCooldownSecondsField"
             :image-settle-seconds-field="imageSettleSecondsField"
             @set-log-level="setLogLevel"
           />
@@ -508,6 +511,30 @@ const imageNoQuotaWaitSecondsField = useNumberSettingField(
     localSettings.value.image_no_quota_wait_seconds = value
   },
   { integer: true, min: 0, fallback: 10 },
+)
+const imageEgressFailureThresholdField = useNumberSettingField(
+  () => localSettings.value?.image_egress_failure_threshold ?? 3,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_egress_failure_threshold = value
+  },
+  { integer: true, min: 1, fallback: 3 },
+)
+const imageEgressFailureWindowSecondsField = useNumberSettingField(
+  () => localSettings.value?.image_egress_failure_window_seconds ?? 60,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_egress_failure_window_seconds = value
+  },
+  { integer: true, min: 1, fallback: 60 },
+)
+const imageEgressCooldownSecondsField = useNumberSettingField(
+  () => localSettings.value?.image_egress_cooldown_seconds ?? 120,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_egress_cooldown_seconds = value
+  },
+  { integer: true, min: 1, fallback: 120 },
 )
 const imageSettleSecondsField = useNumberSettingField(
   () => localSettings.value?.image_settle_secs ?? 5,

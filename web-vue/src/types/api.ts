@@ -61,6 +61,11 @@ export interface Settings {
   log_retention_days?: number
   image_poll_timeout_secs?: number
   image_stream_timeout_secs?: number
+  image_egress_fallback_on_stream_timeout?: boolean
+  image_egress_circuit_breaker_enabled?: boolean
+  image_egress_failure_threshold?: number
+  image_egress_failure_window_seconds?: number
+  image_egress_cooldown_seconds?: number
   image_poll_interval_secs?: number
   image_poll_initial_wait_secs?: number
   image_account_concurrency?: number
