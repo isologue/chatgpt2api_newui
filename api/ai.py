@@ -143,9 +143,17 @@ def create_router() -> APIRouter:
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, prompt)
-        payload["images"] = await read_image_sources(image_sources)
-        if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
+        try:
+            payload["images"] = await read_image_sources(image_sources)
+            if mask_sources:
+                payload["mask"] = await read_image_sources(mask_sources)
+        except HTTPException as exc:
+            fetch_metadata = getattr(exc, "fetch_metadata", None)
+            extra: dict[str, object] = {"stage": "image_input_fetch"}
+            if isinstance(fetch_metadata, dict) and fetch_metadata:
+                extra["image_fetch"] = fetch_metadata
+            call.log("调用失败", status="failed", error=str(exc.detail), extra=extra)
+            raise
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 

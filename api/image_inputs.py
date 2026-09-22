@@ -5,6 +5,7 @@ import binascii
 import json
 import mimetypes
 import re
+import time
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -14,7 +15,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from services.proxy_service import proxy_settings
+from services.proxy_service import normalize_proxy_url, proxy_settings
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -22,6 +23,28 @@ ImageSource = str | UploadFile | ImageInput
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
+IMAGE_FETCH_ATTEMPTS = 3
+IMAGE_FETCH_BACKOFF_SECONDS = (0.5, 1.5)
+RETRYABLE_IMAGE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_IMAGE_ERROR_MARKERS = (
+    "curl: (56)",
+    "connect tunnel failed",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network is unreachable",
+    "temporary failure",
+    "timed out",
+    "timeout",
+)
+
+
+class ImageFetchError(HTTPException):
+    """A remote image fetch failure with safe retry metadata for call logs."""
+
+    def __init__(self, message: str, *, metadata: dict[str, object] | None = None):
+        super().__init__(status_code=400, detail={"error": message})
+        self.fetch_metadata = metadata or {}
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -255,6 +278,40 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
+def _image_fetch_profile_metadata(profile: object, *, fallback: bool = False) -> dict[str, object]:
+    source = str(getattr(profile, "proxy_source", "direct") or "direct").strip() or "direct"
+    label = str(getattr(profile, "egress_label", "") or "").strip()
+    return {
+        "proxy_source": source,
+        "egress_label": label or source,
+        "fallback": fallback,
+    }
+
+
+def _image_fetch_error_is_retryable(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in RETRYABLE_IMAGE_ERROR_MARKERS)
+
+
+def _safe_image_fetch_error(exc: Exception, source: str, public_source: str) -> str:
+    text = str(exc)
+    if source:
+        text = text.replace(source, public_source)
+    return text[:500]
+
+
+def _image_fetch_metadata(
+    target_host: str,
+    attempts: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "target_host": target_host,
+        "attempts": len(attempts),
+        "fallback_used": any(bool(item.get("fallback")) for item in attempts),
+        "attempt_details": attempts,
+    }
+
+
 def _download_image_url(url: str) -> ImageInput:
     """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
     source = _clean(url)
@@ -263,18 +320,65 @@ def _download_image_url(url: str) -> ImageInput:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+    target_host = parsed.hostname or parsed.netloc.split("@")[-1]
+    primary_profile = proxy_settings.get_profile(resource=False, upstream=False)
+    profiles: list[tuple[object, bool]] = [(primary_profile, False)]
+    fallback_profile = proxy_settings.get_fallback_profile(
+        resource=False,
+        upstream=False,
+        reserve_image_egress=False,
+    )
+    if fallback_profile is not None:
+        primary_proxy = normalize_proxy_url(str(getattr(primary_profile, "proxy_url", "") or ""))
+        fallback_proxy = normalize_proxy_url(str(getattr(fallback_profile, "proxy_url", "") or ""))
+        primary_egress = str(getattr(primary_profile, "egress_key", "") or "direct")
+        fallback_egress = str(getattr(fallback_profile, "egress_key", "") or "direct")
+        if primary_proxy != fallback_proxy and primary_egress != fallback_egress:
+            profiles.append((fallback_profile, True))
+
+    attempt_details: list[dict[str, object]] = []
+    response = None
+    last_error = "image_url fetch failed"
+    for attempt in range(IMAGE_FETCH_ATTEMPTS):
+        if attempt:
+            time.sleep(IMAGE_FETCH_BACKOFF_SECONDS[min(attempt - 1, len(IMAGE_FETCH_BACKOFF_SECONDS) - 1)])
+        profile, using_fallback = profiles[min(attempt, len(profiles) - 1)]
+        profile_metadata = _image_fetch_profile_metadata(profile, fallback=using_fallback)
+        try:
+            response = requests.get(
+                source,
+                headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
+                timeout=60,
+                allow_redirects=True,
+                **proxy_settings.build_session_kwargs_from_profile(profile),
+            )
+        except Exception as exc:
+            safe_error = _safe_image_fetch_error(exc, source, f"{parsed.scheme}://{target_host}{parsed.path}")
+            last_error = f"image_url fetch failed: {safe_error}"
+            retryable = _image_fetch_error_is_retryable(exc)
+            attempt_details.append({**profile_metadata, "attempt": attempt + 1, "retryable": retryable, "error": safe_error})
+            if not retryable or attempt + 1 >= IMAGE_FETCH_ATTEMPTS:
+                raise ImageFetchError(
+                    last_error,
+                    metadata=_image_fetch_metadata(target_host, attempt_details),
+                ) from exc
+            continue
+
+        status_code = int(response.status_code)
+        if not 200 <= status_code < 300:
+            retryable = status_code in RETRYABLE_IMAGE_STATUS_CODES
+            last_error = f"image_url fetch failed: HTTP {status_code}"
+            attempt_details.append({**profile_metadata, "attempt": attempt + 1, "status_code": status_code, "retryable": retryable})
+            if not retryable or attempt + 1 >= IMAGE_FETCH_ATTEMPTS:
+                raise ImageFetchError(
+                    last_error,
+                    metadata=_image_fetch_metadata(target_host, attempt_details),
+                )
+            continue
+        break
+
+    if response is None:
+        raise ImageFetchError(last_error, metadata=_image_fetch_metadata(target_host, attempt_details))
     content_length = _clean(response.headers.get("content-length"))
     if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})

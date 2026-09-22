@@ -108,9 +108,18 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
         prompt = str(payload["prompt"])
         model = str(payload["model"])
-        await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
-        images = await read_image_sources(image_sources)
-        masks = await read_image_sources(mask_sources) if mask_sources else None
+        call = LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt)
+        await filter_or_log(call, prompt)
+        try:
+            images = await read_image_sources(image_sources)
+            masks = await read_image_sources(mask_sources) if mask_sources else None
+        except HTTPException as exc:
+            fetch_metadata = getattr(exc, "fetch_metadata", None)
+            extra: dict[str, object] = {"stage": "image_input_fetch"}
+            if isinstance(fetch_metadata, dict) and fetch_metadata:
+                extra["image_fetch"] = fetch_metadata
+            call.log("调用失败", status="failed", error=str(exc.detail), extra=extra)
+            raise
         try:
             return await run_in_threadpool(
                 image_task_service.submit_edit,
