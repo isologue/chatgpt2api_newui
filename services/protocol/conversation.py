@@ -82,6 +82,7 @@ def _backend_egress_data(backend: OpenAIBackendAPI) -> dict[str, Any]:
     resource_profile = getattr(backend, "resource_proxy_profile", None)
     proxy_url = getattr(profile, "proxy_url", "") if profile else ""
     resource_url = getattr(resource_profile, "proxy_url", "") if resource_profile else ""
+    egress_mode = str(getattr(profile, "egress_mode", "") or "direct")
     return {
         # 控制出口（B）：鉴权、会话、SSE 和文件元数据控制请求。
         "proxy_source": str(getattr(profile, "proxy_source", "") or "direct"),
