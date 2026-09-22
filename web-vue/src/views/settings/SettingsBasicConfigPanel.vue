@@ -38,35 +38,9 @@
         />
       </FormField>
 
-      <FormField label="默认出口" class="md:col-span-2">
-        <template #label-extra>
-          <HelpTip text="账号个人代理、账号组代理优先于默认出口。可填写代理 URL、direct 或 group:代理组ID；完整选择可到代理管理维护。" />
-        </template>
-        <div class="flex flex-col gap-2 sm:flex-row">
-          <Input
-            v-model.trim="settings.proxy"
-            block
-            root-class="font-mono"
-            placeholder="http://127.0.0.1:7890"
-            @update:model-value="$emit('clearProxyTestResult')"
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            root-class="shrink-0"
-            :disabled="proxyBusy === 'test'"
-            @click="$emit('testDefaultProxy')"
-          >
-            {{ proxyBusy === 'test' ? '测试中...' : '测试出口' }}
-          </Button>
-        </div>
-        <div v-if="proxyTestResult" class="mt-2 rounded-xl border border-border bg-background px-3 py-2 text-xs">
-          <p :class="proxyTestResult.ok ? 'text-emerald-600' : 'text-rose-600'">
-            {{ proxyTestResult.ok ? `出口可用：HTTP ${proxyTestResult.status}，${proxyTestResult.latency_ms} ms` : `出口不可用：${proxyTestResult.error || '未知错误'}` }}
-          </p>
-        </div>
-      </FormField>
-
+      <div class="md:col-span-2 rounded-xl border border-border bg-muted/20 px-3 py-3 text-xs leading-5 text-muted-foreground">
+        默认出口、生图 A/B 分流、备用出口、Cloudflare 清障和出口监控已统一迁移到“代理管理”，避免多处配置互相覆盖。
+      </div>
       <FormField label="图片自动清理">
         <template #label-extra>
           <HelpTip text="自动删除多少天前的本地图片。" />
@@ -137,8 +111,7 @@
 </template>
 
 <script setup lang="ts">
-import { Button, FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
-import type { ProxyTestResult } from '@/api/proxy'
+import { FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
 import type { Settings } from '@/types/api'
 import type { NumberSettingField } from '@/views/settings/useNumberSettingField'
 
@@ -151,12 +124,5 @@ defineProps<{
   imagePollTimeoutField: NumberSettingField
   imageStreamTimeoutField: NumberSettingField
   imageAccountConcurrencyField: NumberSettingField
-  proxyBusy: string
-  proxyTestResult: ProxyTestResult | null
-}>()
-
-defineEmits<{
-  clearProxyTestResult: []
-  testDefaultProxy: []
 }>()
 </script>

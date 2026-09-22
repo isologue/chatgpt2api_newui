@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import random
 import re
@@ -90,6 +91,9 @@ class ProxyRuntimeProfile:
 class ClearanceBundle:
     target_host: str
     proxy_url: str = ""
+    proxy_source: str = "direct"
+    egress_key: str = "direct"
+    egress_label: str = "direct"
     cookies: dict[str, str] = field(default_factory=dict, repr=False)
     user_agent: str = ""
     created_at: float = field(default_factory=time.time)
@@ -226,6 +230,7 @@ class ProxySettingsStore:
         self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
         self._egress_inflight: dict[str, int] = {}
         self._image_egress_circuits: dict[str, ImageEgressCircuitState] = {}
+        self._route_metrics: dict[str, dict[str, object]] = {}
         self._lock = threading.RLock()
         self._egress_condition = threading.Condition(self._lock)
 
@@ -242,12 +247,26 @@ class ProxySettingsStore:
         runtime_enabled = bool(runtime.get("enabled"))
         egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
 
-        runtime_proxy = ""
+        runtime_reference = ""
         runtime_proxy_source = "runtime"
-        if upstream and runtime_enabled and egress_mode == "single_proxy":
-            resource_proxy = _clean(runtime.get("resource_proxy_url")) if resource else ""
-            runtime_proxy = resource_proxy or _clean(runtime.get("proxy_url"))
-            runtime_proxy_source = "runtime_resource" if resource_proxy else "runtime"
+        force_runtime_route = False
+        if upstream and runtime_enabled and egress_mode in {"single_proxy", "split_proxy"}:
+            control_proxy = _clean(runtime.get("control_proxy_url")) or _clean(runtime.get("proxy_url"))
+            resource_proxy = _clean(runtime.get("resource_proxy_url"))
+            if egress_mode == "split_proxy":
+                # A/B 模式强制按用途分流：控制请求走 B，资源请求走 A；
+                # A 未配置时资源请求明确回落到 B，避免账号个人代理或旧版全局出口接管。
+                runtime_reference = resource_proxy if resource and resource_proxy else control_proxy
+                force_runtime_route = bool(runtime_reference)
+                runtime_proxy_source = "runtime_resource_a" if resource and resource_proxy else (
+                    "runtime_control_b" if control_proxy else "runtime_control"
+                )
+            else:
+                # 单代理模式下控制流和图片资源流必须使用同一个主代理，
+                # 不读取账号个人代理或曾经保存的 A/B 字段，确保模式语义一致。
+                runtime_reference = control_proxy
+                force_runtime_route = bool(control_proxy)
+                runtime_proxy_source = "runtime_single_proxy"
 
         selected_proxy = ""
         source = "direct"
@@ -261,8 +280,27 @@ class ProxySettingsStore:
         image_egress_reserved = False
         image_egress_wait_ms = 0
 
+        # 单代理和 A/B 分流都是显式运行时路由：选中后覆盖账号个人代理、
+        # 账号组代理和旧版全局出口；切回 direct 才恢复账号级路由规则。
+        if force_runtime_route:
+            resolved = self._resolve_proxy_reference(
+                runtime_reference,
+                source=runtime_proxy_source,
+                terminal_when_unresolved=True,
+                reserve_image_egress=reserve_image_egress and not resource,
+            )
+            selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
+            egress_key = resolved.egress_key
+            egress_label = resolved.egress_label
+            proxy_group_id = resolved.proxy_group_id
+            proxy_node_id = resolved.proxy_node_id
+            proxy_node_name = resolved.proxy_node_name
+            image_concurrency_limit = resolved.image_concurrency_limit
+            image_egress_reserved = resolved.image_egress_reserved
+            image_egress_wait_ms = resolved.image_egress_wait_ms
+
         account_proxy = _clean((account or {}).get("proxy") if isinstance(account, dict) else "")
-        if account_proxy:
+        if account_proxy and not selected_proxy and not terminal:
             resolved = self._resolve_proxy_reference(
                 account_proxy,
                 source="account",
@@ -317,6 +355,26 @@ class ProxySettingsStore:
                 image_egress_reserved = resolved.image_egress_reserved
                 image_egress_wait_ms = resolved.image_egress_wait_ms
 
+        # 兼容没有形成强制运行时路由的旧配置；新版 single_proxy/split_proxy
+        # 在上方已经按用途选定出口，不会再走到这里。
+        if not selected_proxy and not terminal and runtime_reference:
+            resolved = self._resolve_proxy_reference(
+                runtime_reference,
+                source=runtime_proxy_source,
+                terminal_when_unresolved=True,
+                reserve_image_egress=reserve_image_egress and not resource,
+            )
+            selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
+            egress_key = resolved.egress_key
+            egress_label = resolved.egress_label
+            proxy_group_id = resolved.proxy_group_id
+            proxy_node_id = resolved.proxy_node_id
+            proxy_node_name = resolved.proxy_node_name
+            image_concurrency_limit = resolved.image_concurrency_limit
+            image_egress_reserved = resolved.image_egress_reserved
+            image_egress_wait_ms = resolved.image_egress_wait_ms
+
+        # 仅当新运行时没有指定该用途出口时，才兼容旧版全局 proxy。
         if not selected_proxy and not terminal:
             legacy_proxy = _clean(self._config.get_proxy_settings())
             if legacy_proxy:
@@ -335,12 +393,6 @@ class ProxySettingsStore:
                 image_concurrency_limit = resolved.image_concurrency_limit
                 image_egress_reserved = resolved.image_egress_reserved
                 image_egress_wait_ms = resolved.image_egress_wait_ms
-
-        if not selected_proxy and not terminal and runtime_proxy:
-            selected_proxy = runtime_proxy
-            source = runtime_proxy_source
-            egress_key = _egress_key_for_proxy(runtime_proxy)
-            egress_label = runtime_proxy_source
 
         return ProxyRuntimeProfile(
             proxy_url=normalize_proxy_url(selected_proxy),
@@ -361,7 +413,68 @@ class ProxySettingsStore:
             clearance=clearance,
         )
 
-    def get_fallback_proxy_reference(self) -> str:
+    def get_registration_profile(
+        self,
+        proxy: str = "",
+        clearance: Mapping[str, object] | None = None,
+    ) -> ProxyRuntimeProfile:
+        """Resolve one fixed outbound route for a complete registration task.
+
+        Registration has its own proxy selector. Explicit direct/group/custom
+        choices must not be overridden by the image/control runtime route. The
+        special ``global`` choice intentionally follows the current global
+        control route, but is resolved only once so a proxy-group task keeps the
+        same node for both auth requests and Cloudflare clearance.
+        """
+        reference = _clean(proxy)
+        if not reference or reference.lower() == "global":
+            profile = self.get_profile(upstream=True)
+            return replace(
+                profile,
+                proxy_source=f"register_{profile.proxy_source}",
+                resource=False,
+                runtime_enabled=True,
+                clearance=dict(clearance or {}),
+            )
+
+        resolved = self._resolve_proxy_reference(
+            reference,
+            source="register",
+            terminal_when_unresolved=True,
+        )
+        runtime = self._get_runtime_settings()
+        return ProxyRuntimeProfile(
+            proxy_url=resolved.proxy_url,
+            proxy_source=resolved.source,
+            egress_key=resolved.egress_key,
+            egress_label=resolved.egress_label,
+            proxy_group_id=resolved.proxy_group_id,
+            proxy_node_id=resolved.proxy_node_id,
+            proxy_node_name=resolved.proxy_node_name,
+            runtime_enabled=True,
+            egress_mode="registration",
+            skip_ssl_verify=bool(runtime.get("skip_ssl_verify")),
+            reset_session_status_codes=_status_codes_tuple(runtime.get("reset_session_status_codes")),
+            clearance=dict(clearance or {}),
+        )
+
+    def get_fallback_proxy_reference(self, *, resource: bool = False) -> str:
+        runtime = self._get_runtime_settings()
+        if bool(runtime.get("enabled")):
+            egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
+            if egress_mode == "direct":
+                # 新版直连模式不再继承旧版备用出口，确保选择即语义明确。
+                return ""
+            if resource and egress_mode == "split_proxy":
+                reference = _clean(runtime.get("resource_fallback_proxy_url"))
+            else:
+                # 单代理模式的控制流和资源流共用同一个备用代理；
+                # A/B 分流的控制流则使用控制备用出口。
+                reference = _clean(runtime.get("control_fallback_proxy_url"))
+            if reference:
+                return "" if reference.lower() == "global" else reference
+            # 运行时路由已启用时，不再让隐藏的旧版 fallback_proxy 接管。
+            return ""
         try:
             reference = _clean(self._config.get_proxy_fallback_settings())
         except AttributeError:
@@ -376,25 +489,37 @@ class ProxySettingsStore:
         upstream: bool = False,
         reserve_image_egress: bool = False,
     ) -> ProxyRuntimeProfile | None:
-        reference = self.get_fallback_proxy_reference()
+        reference = self.get_fallback_proxy_reference(resource=resource)
         if not reference:
             return None
-        profile = self.get_profile(
-            account=None,
-            proxy=reference,
-            resource=resource,
-            upstream=upstream,
-            reserve_image_egress=reserve_image_egress,
+        runtime = self._get_runtime_settings()
+        clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
+        resolved = self._resolve_proxy_reference(
+            reference,
+            source="resource_fallback" if resource else "control_fallback",
+            terminal_when_unresolved=True,
+            reserve_image_egress=reserve_image_egress and not resource,
         )
-        source = str(profile.proxy_source or "direct").strip() or "direct"
-        if source.startswith("explicit"):
-            source = "fallback" + source[len("explicit"):]
-        elif not source.startswith("fallback"):
-            source = f"fallback_{source}"
-        label = str(profile.egress_label or "").strip()
-        if not label or label.startswith("explicit"):
-            label = "fallback" if profile.proxy_url else source
-        return replace(profile, proxy_source=source, egress_label=label)
+        source = str(resolved.source or ("resource_fallback" if resource else "control_fallback")).strip()
+        label = str(resolved.egress_label or source).strip() or source
+        return ProxyRuntimeProfile(
+            proxy_url=normalize_proxy_url(resolved.proxy_url),
+            proxy_source=source,
+            egress_key=resolved.egress_key or _egress_key_for_proxy(resolved.proxy_url),
+            egress_label=label,
+            proxy_group_id=resolved.proxy_group_id,
+            proxy_node_id=resolved.proxy_node_id,
+            proxy_node_name=resolved.proxy_node_name,
+            image_concurrency_limit=max(0, int(resolved.image_concurrency_limit or 0)),
+            image_egress_reserved=bool(resolved.image_egress_reserved),
+            image_egress_wait_ms=max(0, int(resolved.image_egress_wait_ms or 0)),
+            resource=bool(resource),
+            runtime_enabled=bool(runtime.get("enabled")),
+            egress_mode=str(runtime.get("egress_mode") or "direct").strip().lower(),
+            skip_ssl_verify=bool(runtime.get("skip_ssl_verify")),
+            reset_session_status_codes=_status_codes_tuple(runtime.get("reset_session_status_codes")),
+            clearance=clearance,
+        )
 
     def build_session_kwargs(
         self,
@@ -430,15 +555,21 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        clearance_proxy_url: str = "",
+        profile: ProxyRuntimeProfile | None = None,
     ) -> dict[str, object]:
         merged_headers: dict[str, object] = dict(headers or {})
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = profile or self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         if not profile.clearance_enabled:
             return merged_headers
 
         target_host = _host_from_url(target_url)
-        bundle = self._bundle_for_headers(profile, target_host)
-        if bundle is None or not bundle.is_valid_for(target_host, profile.proxy_url):
+        bundle_proxy_url = normalize_proxy_url(clearance_proxy_url) or profile.proxy_url
+        if clearance_proxy_url:
+            bundle = self._get_cached_bundle(self._cache_key(bundle_proxy_url, target_host))
+        else:
+            bundle = self._bundle_for_headers(profile, target_host)
+        if bundle is None or not bundle.is_valid_for(target_host, bundle_proxy_url):
             return merged_headers
 
         if bundle.user_agent and _find_header_key(merged_headers, "user-agent") is None:
@@ -460,57 +591,95 @@ class ProxySettingsStore:
         resource: bool = False,
         force: bool = False,
         upstream: bool = True,
+        profile: ProxyRuntimeProfile | None = None,
     ) -> ClearanceBundle | None:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
-        if not profile.clearance_enabled:
+        primary_profile = profile or self.get_profile(
+            account=account,
+            proxy=proxy,
+            resource=resource,
+            upstream=upstream,
+        )
+        if not primary_profile.clearance_enabled:
             return None
 
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
-        if profile.clearance_mode == "manual":
-            bundle = self._build_manual_bundle(profile, target_host)
+        primary_key = self._cache_key(primary_profile.proxy_url, target_host)
+        if primary_profile.clearance_mode == "manual":
+            bundle = self._build_manual_bundle(primary_profile, target_host)
             if bundle is not None:
-                self._set_cached_bundle(key, bundle)
+                self._set_cached_bundle(primary_key, bundle)
             return bundle
-        if profile.clearance_mode != "flaresolverr":
+        if primary_profile.clearance_mode != "flaresolverr":
             return None
 
-        cached_before = self._get_cached_bundle(key)
-        if cached_before is not None and not force and cached_before.is_valid_for(target_host, profile.proxy_url):
-            return cached_before
+        stale_bundles: list[ClearanceBundle] = []
+        attempt_errors: list[str] = []
+        for profile in (primary_profile,):
+            key = self._cache_key(profile.proxy_url, target_host)
+            cached_before = self._get_cached_bundle(key)
+            if cached_before is not None and not force and cached_before.is_valid_for(target_host, profile.proxy_url):
+                return cached_before
 
-        lock = self._get_flight_lock(key)
-        if not lock.acquire(blocking=False):
-            with lock:
-                pass
-            return self._get_cached_bundle(key) or cached_before
+            lock = self._get_flight_lock(key)
+            if not lock.acquire(blocking=False):
+                with lock:
+                    pass
+                cached_after_wait = self._get_cached_bundle(key)
+                if cached_after_wait is not None and cached_after_wait.is_valid_for(target_host, profile.proxy_url):
+                    return cached_after_wait
+                if cached_before is not None:
+                    stale_bundles.append(cached_before)
+                continue
 
-        try:
-            cached_now = self._get_cached_bundle(key)
-            if cached_now is not None and not force and cached_now.is_valid_for(target_host, profile.proxy_url):
-                return cached_now
+            try:
+                cached_now = self._get_cached_bundle(key)
+                if cached_now is not None and not force and cached_now.is_valid_for(target_host, profile.proxy_url):
+                    return cached_now
 
-            flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
-            provider = self._get_provider(flaresolverr_url)
-            new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
-            if new_bundle is not None:
-                expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
-                if (
-                    not new_bundle.target_host
-                    or normalize_proxy_url(new_bundle.proxy_url) != normalize_proxy_url(profile.proxy_url)
-                    or new_bundle.expires_at != expires_at
-                ):
+                flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
+                provider = self._get_provider(flaresolverr_url)
+                try:
+                    new_bundle = provider.get_clearance(
+                        target_url,
+                        proxy_url=profile.proxy_url,
+                        timeout_sec=profile.timeout_sec,
+                    )
+                except Exception as exc:
+                    error = _redact_url_credentials(str(exc) or exc.__class__.__name__)
+                    attempt_errors.append(f"{profile.egress_label}: {error}")
+                    if cached_now is not None:
+                        stale_bundles.append(cached_now)
+                    elif cached_before is not None:
+                        stale_bundles.append(cached_before)
+                    continue
+
+                if new_bundle is not None:
+                    expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
                     new_bundle = replace(
                         new_bundle,
                         target_host=new_bundle.target_host or target_host,
                         proxy_url=profile.proxy_url,
+                        proxy_source=profile.proxy_source,
+                        egress_key=profile.egress_key,
+                        egress_label=profile.egress_label,
                         expires_at=expires_at,
                     )
-                self._set_cached_bundle(key, new_bundle)
-                return new_bundle
-            return cached_now or cached_before
-        finally:
-            lock.release()
+                    self._set_cached_bundle(key, new_bundle)
+                    return new_bundle
+                if cached_now is not None:
+                    stale_bundles.append(cached_now)
+                elif cached_before is not None:
+                    stale_bundles.append(cached_before)
+            finally:
+                lock.release()
+
+        # FlareSolverr 与注册请求必须使用同一个实际出口；刷新失败时只允许
+        # 回退到该出口已有的旧缓存，不能切换到生图控制流的备用出口。
+        if stale_bundles:
+            return stale_bundles[0]
+        if attempt_errors:
+            raise RuntimeError("clearance refresh failed: " + "; ".join(attempt_errors))
+        return None
 
     def invalidate_clearance(
         self,
@@ -526,24 +695,114 @@ class ProxySettingsStore:
         with self._lock:
             self._clearance_cache.pop(key, None)
 
+    def route_request_started(self, lane: str, profile: ProxyRuntimeProfile) -> float:
+        """记录 A/B 出口请求开始，只保存脱敏出口标识。"""
+        normalized_lane = "resource" if str(lane).lower() == "resource" else "control"
+        started = time.perf_counter()
+        with self._lock:
+            metric = self._route_metrics.setdefault(normalized_lane, {
+                "inflight": 0,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "fallback": 0,
+                "total_ms": 0,
+                "max_ms": 0,
+                "last_ms": 0,
+                "last_error": "",
+                "last_egress_key": "direct",
+                "last_egress_label": "direct",
+                "updated_at": 0,
+            })
+            metric["inflight"] = int(metric.get("inflight") or 0) + 1
+            metric["last_egress_key"] = str(profile.egress_key or "direct")
+            metric["last_egress_label"] = str(profile.egress_label or profile.proxy_source or "direct")
+        return started
+
+    def route_request_finished(
+        self,
+        lane: str,
+        profile: ProxyRuntimeProfile,
+        started: float,
+        *,
+        success: bool,
+        fallback: bool = False,
+        error: object = "",
+    ) -> int:
+        """完成一次出口请求统计，供代理管理页实时查看 A/B 健康。"""
+        normalized_lane = "resource" if str(lane).lower() == "resource" else "control"
+        duration_ms = max(0, int((time.perf_counter() - float(started or time.perf_counter())) * 1000))
+        with self._lock:
+            metric = self._route_metrics.setdefault(normalized_lane, {})
+            metric["inflight"] = max(0, int(metric.get("inflight") or 0) - 1)
+            metric["total"] = int(metric.get("total") or 0) + 1
+            key = "success" if success else "failed"
+            metric[key] = int(metric.get(key) or 0) + 1
+            if fallback:
+                metric["fallback"] = int(metric.get("fallback") or 0) + 1
+            metric["total_ms"] = int(metric.get("total_ms") or 0) + duration_ms
+            metric["max_ms"] = max(int(metric.get("max_ms") or 0), duration_ms)
+            metric["last_ms"] = duration_ms
+            metric["last_error"] = "" if success else str(error or "")[:300]
+            metric["last_egress_key"] = str(profile.egress_key or "direct")
+            metric["last_egress_label"] = str(profile.egress_label or profile.proxy_source or "direct")
+            metric["updated_at"] = int(time.time())
+        return duration_ms
+
+    def _route_metrics_status(self) -> dict[str, dict[str, object]]:
+        with self._lock:
+            result: dict[str, dict[str, object]] = {}
+            for lane in ("control", "resource"):
+                metric = {
+                    "inflight": 0,
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "fallback": 0,
+                    "total_ms": 0,
+                    "max_ms": 0,
+                    "last_ms": 0,
+                    "last_error": "",
+                    "last_egress_key": "direct",
+                    "last_egress_label": "direct",
+                    "updated_at": 0,
+                    **dict(self._route_metrics.get(lane) or {}),
+                }
+                total = max(0, int(metric.get("total") or 0))
+                total_ms = max(0, int(metric.get("total_ms") or 0))
+                metric["avg_ms"] = int(total_ms / total) if total else 0
+                metric.pop("total_ms", None)
+                result[lane] = metric
+            return result
+
     def get_runtime_status(self) -> dict[str, object]:
-        profile = self.get_profile(upstream=True)
+        control = self.get_profile(upstream=True, resource=False)
+        resource = self.get_profile(upstream=True, resource=True)
         with self._lock:
             cached_hosts = [host for _proxy, host in self._clearance_cache]
             cached_count = len(self._clearance_cache)
         return {
-            "enabled": profile.runtime_enabled,
-            "egress_mode": profile.egress_mode,
-            "proxy_source": profile.proxy_source,
-            "egress_key": profile.egress_key,
-            "egress_label": profile.egress_label,
-            "image_concurrency_limit": profile.image_concurrency_limit,
-            "has_proxy": bool(profile.proxy_url),
-            "skip_ssl_verify": profile.skip_ssl_verify,
-            "clearance_enabled": profile.clearance_enabled,
-            "clearance_mode": profile.clearance_mode,
+            "enabled": control.runtime_enabled,
+            "egress_mode": control.egress_mode,
+            "proxy_source": control.proxy_source,
+            "egress_key": control.egress_key,
+            "egress_label": control.egress_label,
+            "control_egress_key": control.egress_key,
+            "control_egress_label": control.egress_label,
+            "resource_egress_key": resource.egress_key,
+            "resource_egress_label": resource.egress_label,
+            "control_proxy_source": control.proxy_source,
+            "resource_proxy_source": resource.proxy_source,
+            "image_concurrency_limit": control.image_concurrency_limit,
+            "has_proxy": bool(control.proxy_url),
+            "has_control_proxy": bool(control.proxy_url),
+            "has_resource_proxy": bool(resource.proxy_url),
+            "skip_ssl_verify": control.skip_ssl_verify,
+            "clearance_enabled": control.clearance_enabled,
+            "clearance_mode": control.clearance_mode,
             "has_clearance_bundle": cached_count > 0,
             "cached_clearance_hosts": sorted(set(cached_hosts)),
+            "route_metrics": self._route_metrics_status(),
         }
 
     def should_skip_ssl_verify(self) -> bool:
@@ -943,6 +1202,9 @@ class ProxySettingsStore:
         return ClearanceBundle(
             target_host=target_host,
             proxy_url=profile.proxy_url,
+            proxy_source=profile.proxy_source,
+            egress_key=profile.egress_key,
+            egress_label=profile.egress_label,
             cookies=cookies,
             user_agent=user_agent,
             created_at=now,
@@ -1021,8 +1283,21 @@ def _status_codes_tuple(value: object) -> tuple[int, ...]:
 
 
 def _egress_key_for_proxy(proxy_url: object) -> str:
+    """生成可追踪但不泄露代理凭据的出口标识。"""
     normalized = normalize_proxy_url(_clean(proxy_url))
-    return f"proxy:{normalized}" if normalized else "direct"
+    if not normalized:
+        return "direct"
+    parsed = urlparse(normalized)
+    if parsed.hostname:
+        scheme = (parsed.scheme or "proxy").lower()
+        host = parsed.hostname.lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        return f"proxy:{scheme}://{host}:{port}" if port else f"proxy:{scheme}://{host}"
+    digest = hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"proxy:opaque:{digest}"
 
 
 def _proxy_node_id(node: Mapping[str, object], index: int) -> str:
@@ -1189,11 +1464,21 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
         session.close()
 
 
-def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
-    target_url = str(target_url or "https://chatgpt.com").strip() or "https://chatgpt.com"
+def test_clearance(
+    target_url: str = "https://auth.openai.com",
+    proxy: str = "",
+    clearance: Mapping[str, object] | None = None,
+) -> dict:
+    target_url = str(target_url or "https://auth.openai.com").strip() or "https://auth.openai.com"
     started = time.perf_counter()
-    status = proxy_settings.get_runtime_status()
-    if not status.get("clearance_enabled"):
+    profile = proxy_settings.get_registration_profile(proxy, clearance)
+    result_base = {
+        "egress_key": profile.egress_key,
+        "egress_label": profile.egress_label,
+        "proxy_source": profile.proxy_source,
+        "has_proxy": bool(profile.proxy_url),
+    }
+    if not profile.clearance_enabled:
         return {
             "ok": False,
             "status": "disabled",
@@ -1201,24 +1486,26 @@ def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
             "has_cookies": False,
             "user_agent": "",
             "error": "clearance is disabled",
-            "runtime": status,
+            **result_base,
         }
     try:
-        bundle = proxy_settings.refresh_clearance(target_url=target_url, force=True, upstream=True)
+        bundle = proxy_settings.refresh_clearance(
+            target_url=target_url,
+            force=True,
+            profile=profile,
+        )
     except Exception as exc:
-        latency_ms = int((time.perf_counter() - started) * 1000)
         return {
             "ok": False,
             "status": "error",
-            "latency_ms": latency_ms,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
             "has_cookies": False,
             "user_agent": "",
             "error": _redact_url_credentials(str(exc) or exc.__class__.__name__),
-            "runtime": proxy_settings.get_runtime_status(),
+            **result_base,
         }
 
     latency_ms = int((time.perf_counter() - started) * 1000)
-    runtime = proxy_settings.get_runtime_status()
     if bundle is None:
         return {
             "ok": False,
@@ -1227,7 +1514,7 @@ def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
             "has_cookies": False,
             "user_agent": "",
             "error": "clearance refresh returned no bundle",
-            "runtime": runtime,
+            **result_base,
         }
     return {
         "ok": True,
@@ -1236,7 +1523,7 @@ def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
         "has_cookies": bool(bundle.cookies),
         "user_agent": bundle.user_agent or "",
         "error": None,
-        "runtime": runtime,
+        **result_base,
     }
 
 

@@ -1,4 +1,5 @@
 import apiClient from './client'
+import type { ClearanceTestResult, ProxyRuntimeClearance } from '@/types/api'
 
 export type OutlookMailboxParseStats = {
   raw_lines?: number
@@ -89,6 +90,7 @@ export type LegacyRegisterConfig = {
     [key: string]: unknown
   }
   proxy: string
+  clearance: ProxyRuntimeClearance
   total: number
   threads: number
   mode: 'total' | 'quota' | 'available' | string
@@ -170,6 +172,9 @@ export const registerApi = {
   },
   updateConfig(payload: Partial<LegacyRegisterConfig>) {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register', payload)
+  },
+  testClearance(payload: { target_url: string; proxy: string; clearance: ProxyRuntimeClearance }) {
+    return apiClient.post<any, { result: ClearanceTestResult }>('/api/register/clearance/test', payload)
   },
   startLegacy() {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/start')

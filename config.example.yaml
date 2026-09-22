@@ -46,17 +46,20 @@ log_levels:
   - warning
   - error
 
-proxy: ""
-fallback_proxy: ""
 base_url: ""
 sensitive_words: []
 global_system_prompt: ""
 
 proxy_runtime:
   enabled: false
+  # direct / single_proxy / split_proxy
   egress_mode: direct
-  proxy_url: ""
+  # 稳定出口 B：账号鉴权、会话、SSE、上传元数据
+  control_proxy_url: ""
+  # 便宜出口 A：图片大文件上传和最终图片下载
   resource_proxy_url: ""
+  control_fallback_proxy_url: ""
+  resource_fallback_proxy_url: ""
   skip_ssl_verify: false
   reset_session_status_codes:
     - 403

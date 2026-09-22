@@ -1,10 +1,10 @@
-﻿<template>
+<template>
   <div class="space-y-6">
     <PagePanel class="space-y-5">
-      <PanelHeader title="代理管理" align="start">
+      <PanelHeader title="代理管理 / 出口路由" align="start">
         <template #copy>
           <p class="mt-1 text-xs text-muted-foreground">
-            出口优先级：账号个人代理 > 账号组代理/代理组 > 默认出口；默认出口可配置代理组、代理 URL 或直连。
+            代理路由统一在这里维护。根据出站方式选择直连、单代理或 A/B 分流；保存后对新请求实时生效。
           </p>
         </template>
         <template #actions>
@@ -12,122 +12,21 @@
             {{ loading ? '刷新中...' : '刷新' }}
           </Button>
           <Button size="sm" variant="primary" :disabled="savingDefaultProxy || loading" @click="saveDefaultProxy">
-            {{ savingDefaultProxy ? '保存中...' : '保存出口配置' }}
+            {{ savingDefaultProxy ? '保存中...' : '保存出站路由' }}
           </Button>
         </template>
       </PanelHeader>
 
-      <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
-        <FormSection density="roomy">
-          <div class="grid grid-cols-1 gap-3 md:grid-cols-[12rem_minmax(0,1fr)]">
-            <label class="block text-xs">
-              <span class="ui-field-label">默认出口模式</span>
-              <GroupedSelectMenu
-                :model-value="defaultProxyMode"
-                :options="defaultProxyModeOptions"
-                aria-label="默认出口模式"
-                selected-indicator="none"
-                block
-                @update:model-value="setDefaultProxyMode"
-              />
-            </label>
-
-            <label v-if="defaultProxyMode === 'group'" class="block text-xs">
-              <span class="ui-field-label">默认出口代理组</span>
-              <GroupedSelectMenu
-                :model-value="selectedDefaultProxyGroupId"
-                :options="defaultProxyGroupOptions"
-                :disabled="loading"
-                aria-label="默认出口代理组"
-                selected-indicator="none"
-                block
-                @update:model-value="selectDefaultProxyGroup"
-              />
-            </label>
-
-            <label v-else-if="defaultProxyMode === 'custom'" class="block text-xs">
-              <span class="ui-field-label">自定义代理 URL</span>
-              <Input
-                :model-value="defaultCustomProxyInput"
-                block
-                root-class="font-mono"
-                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890"
-                @update:model-value="setDefaultCustomProxyInput"
-              />
-            </label>
-
-            <div v-else class="flex min-h-[2.5rem] items-center rounded-lg border border-dashed border-border bg-muted/20 px-3 text-xs text-muted-foreground">
-              未指定账号或账号组代理时直连。
-            </div>
-          </div>
-          <ActionRow class="mt-3" gap="tight">
-            <Button size="xs" variant="outline" :disabled="testingKey === DEFAULT_TEST_KEY || !canTestDefaultProxy" @click="testDefaultProxy">
-              {{ testingKey === DEFAULT_TEST_KEY ? '测试中...' : '测试默认出口' }}
-            </Button>
-            <Button size="xs" variant="outline" :disabled="savingDefaultProxy || testingKey === DEFAULT_TEST_KEY" @click="setDefaultProxyDirect">
-              设为直连
-            </Button>
-          </ActionRow>
-          <div class="mt-4 border-t border-border pt-4">
-            <div class="grid grid-cols-1 gap-3 md:grid-cols-[12rem_minmax(0,1fr)]">
-              <label class="block text-xs">
-                <span class="ui-field-label">备用出口模式</span>
-                <GroupedSelectMenu
-                  :model-value="fallbackProxyMode"
-                  :options="fallbackProxyModeOptions"
-                  aria-label="备用出口模式"
-                  selected-indicator="none"
-                  block
-                  @update:model-value="setFallbackProxyMode"
-                />
-              </label>
-
-              <label v-if="fallbackProxyMode === 'group'" class="block text-xs">
-                <span class="ui-field-label">备用出口代理组</span>
-                <GroupedSelectMenu
-                  :model-value="selectedFallbackProxyGroupId"
-                  :options="defaultProxyGroupOptions"
-                  :disabled="loading"
-                  aria-label="备用出口代理组"
-                  selected-indicator="none"
-                  block
-                  @update:model-value="selectFallbackProxyGroup"
-                />
-              </label>
-
-              <label v-else-if="fallbackProxyMode === 'custom'" class="block text-xs">
-                <span class="ui-field-label">备用代理 URL</span>
-                <Input
-                  :model-value="fallbackCustomProxyInput"
-                  block
-                  root-class="font-mono"
-                  placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890"
-                  @update:model-value="setFallbackCustomProxyInput"
-                />
-              </label>
-
-              <div v-else class="flex min-h-[2.5rem] items-center rounded-lg border border-dashed border-border bg-muted/20 px-3 text-xs text-muted-foreground">
-                {{ fallbackProxyMode === 'direct' ? '早期连接失败时重试直连一次。' : '未启用备用出口。' }}
-              </div>
-            </div>
-            <p class="mt-2 text-xs text-muted-foreground">
-              仅图片请求在早期 TLS / 连接超时且尚未收到上游事件时重试一次；生成中断和轮询超时不会切换。
-            </p>
-          </div>
-        </FormSection>
-
-        <FormSection density="roomy" surface="background">
-          <p class="text-xs text-muted-foreground">默认出口测试结果</p>
-          <div v-if="defaultTestResult" class="mt-3 space-y-1 text-xs">
-            <p :class="defaultTestResult.ok ? 'text-emerald-600' : 'text-rose-600'">
-              {{ defaultTestResult.ok ? '可用' : '不可用' }}
-            </p>
-            <p class="text-muted-foreground">HTTP {{ defaultTestResult.status || '-' }} · {{ defaultTestResult.latency_ms || 0 }}ms</p>
-            <p v-if="defaultTestResult.error" class="break-all text-rose-600">{{ defaultTestResult.error }}</p>
-          </div>
-          <p v-else class="mt-3 text-xs text-muted-foreground">尚未测试</p>
-        </FormSection>
-      </div>
+      <SettingsProxyRuntimePanel
+        v-if="currentSettings"
+        :settings="currentSettings"
+        :groups="groups"
+        :runtime-status="proxyRuntimeStatus"
+        :route-testing-key="routeTestingKey"
+        :route-test-results="routeTestResults"
+        @clear-proxy-route-result="clearProxyRouteResult"
+        @test-proxy-route="testProxyRoute"
+      />
     </PagePanel>
 
     <PagePanel class="space-y-4">
@@ -154,7 +53,7 @@
         description="读取代理组、节点和健康状态。"
       />
       <StateBlock v-else-if="filteredGroups.length === 0">
-        <EmptyState plain title="暂无代理组" description="新建代理组后，可绑定账号组、账号或默认出口使用。" />
+        <EmptyState plain title="暂无代理组" description="新建代理组后，可绑定账号组、账号或出站路由使用。" />
       </StateBlock>
       <TableShell v-else>
         <table class="min-w-[1080px] w-full table-fixed text-left text-sm">
@@ -334,7 +233,6 @@
 
 <script setup lang="ts">
 import { Button, Checkbox, EmptyState, Input } from 'nanocat-ui'
-import ActionRow from '@/components/ai/ActionRow.vue'
 import FormSection from '@/components/ai/FormSection.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
 import ModalFooter from '@/components/ai/ModalFooter.vue'
@@ -345,13 +243,8 @@ import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import TableShell from '@/components/ai/TableShell.vue'
-import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
 import { usePageRuntime } from '@/composables/usePageRuntime'
-import {
-  defaultProxyModeOptions,
-  fallbackProxyModeOptions,
-} from '@/views/proxy/proxyView'
-import { DEFAULT_TEST_KEY, useProxyDefaultRuntime } from '@/views/proxy/proxyDefaultRuntime'
+import { useProxyDefaultRuntime } from '@/views/proxy/proxyDefaultRuntime'
 import {
   FORM_TEST_KEY,
   normalizeGroupId,
@@ -359,6 +252,7 @@ import {
   useProxyGroupRuntime,
 } from '@/views/proxy/proxyGroupRuntime'
 import ProxyGroupRow from '@/views/proxy/ProxyGroupRow.vue'
+import SettingsProxyRuntimePanel from '@/views/settings/SettingsProxyRuntimePanel.vue'
 
 defineOptions({ name: 'Proxy' })
 
@@ -395,26 +289,16 @@ const proxyDefaultRuntime = useProxyDefaultRuntime({
 })
 const loading = proxyDefaultRuntime.loading
 const savingDefaultProxy = proxyDefaultRuntime.savingDefaultProxy
-const defaultProxyMode = proxyDefaultRuntime.defaultProxyMode
-const selectedDefaultProxyGroupId = proxyDefaultRuntime.selectedDefaultProxyGroupId
-const defaultCustomProxyInput = proxyDefaultRuntime.defaultCustomProxyInput
-const fallbackProxyMode = proxyDefaultRuntime.fallbackProxyMode
-const selectedFallbackProxyGroupId = proxyDefaultRuntime.selectedFallbackProxyGroupId
-const fallbackCustomProxyInput = proxyDefaultRuntime.fallbackCustomProxyInput
-const defaultTestResult = proxyDefaultRuntime.defaultTestResult
-const defaultProxyGroupOptions = proxyDefaultRuntime.defaultProxyGroupOptions
-const canTestDefaultProxy = proxyDefaultRuntime.canTestDefaultProxy
 const isDefaultProxyDirty = proxyDefaultRuntime.isDefaultProxyDirty
-const setDefaultProxyMode = proxyDefaultRuntime.setDefaultProxyMode
-const setFallbackProxyMode = proxyDefaultRuntime.setFallbackProxyMode
-const selectDefaultProxyGroup = proxyDefaultRuntime.selectDefaultProxyGroup
-const selectFallbackProxyGroup = proxyDefaultRuntime.selectFallbackProxyGroup
-const setDefaultCustomProxyInput = proxyDefaultRuntime.setDefaultCustomProxyInput
-const setFallbackCustomProxyInput = proxyDefaultRuntime.setFallbackCustomProxyInput
 const loadData = proxyDefaultRuntime.loadData
 const saveDefaultProxy = proxyDefaultRuntime.saveDefaultProxy
-const setDefaultProxyDirect = proxyDefaultRuntime.setDefaultProxyDirect
-const testDefaultProxy = proxyDefaultRuntime.testDefaultProxy
+const currentSettings = proxyDefaultRuntime.currentSettings
+const proxyRuntimeStatus = proxyDefaultRuntime.proxyRuntimeStatus
+const routeTestingKey = proxyDefaultRuntime.routeTestingKey
+const routeTestResults = proxyDefaultRuntime.routeTestResults
+const testProxyRoute = proxyDefaultRuntime.testProxyRoute
+const clearProxyRouteResult = proxyDefaultRuntime.clearProxyRouteResult
+
 
 function deactivateProxyView() {
   proxyDefaultRuntime.invalidate()

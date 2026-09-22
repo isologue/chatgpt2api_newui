@@ -192,9 +192,12 @@ export function normalizeProxyRuntime(raw: unknown): ProxyRuntimeSettings {
 
   return {
     enabled: boolValue(source.enabled, false),
-    egress_mode: egressMode === 'single_proxy' ? 'single_proxy' : 'direct',
+    egress_mode: ['single_proxy', 'split_proxy'].includes(egressMode) ? egressMode as ProxyRuntimeSettings['egress_mode'] : 'direct',
     proxy_url: cleanString(source.proxy_url),
+    control_proxy_url: cleanString(source.control_proxy_url) || cleanString(source.proxy_url),
     resource_proxy_url: cleanString(source.resource_proxy_url),
+    control_fallback_proxy_url: cleanString(source.control_fallback_proxy_url),
+    resource_fallback_proxy_url: cleanString(source.resource_fallback_proxy_url),
     skip_ssl_verify: boolValue(source.skip_ssl_verify, false),
     reset_session_status_codes: statusCodes.length ? Array.from(new Set(statusCodes)) : [403],
     clearance: {

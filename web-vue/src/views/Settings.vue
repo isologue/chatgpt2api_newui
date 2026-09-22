@@ -36,25 +36,8 @@
               :image-poll-timeout-field="imagePollTimeoutField"
               :image-stream-timeout-field="imageStreamTimeoutField"
               :image-account-concurrency-field="imageAccountConcurrencyField"
-              :proxy-busy="proxyBusy"
-              :proxy-test-result="proxyTestResult"
-              @clear-proxy-test-result="proxyTestResult = null"
-              @test-default-proxy="testDefaultProxy"
             />
 
-            <SettingsProxyRuntimePanel
-              v-model:clearance-test-target="clearanceTestTarget"
-              :settings="localSettings"
-              :runtime-status="proxyRuntimeStatus"
-              :runtime-loading="proxyRuntimeLoading"
-              :runtime-testing="proxyRuntimeTesting"
-              :clearance-test-result="clearanceTestResult"
-              :clearance-timeout-field="clearanceTimeoutField"
-              :clearance-refresh-interval-field="clearanceRefreshIntervalField"
-              @clear-clearance-test-result="clearanceTestResult = null"
-              @refresh-runtime-status="loadProxyRuntimeStatus(false)"
-              @test-clearance="testProxyClearance"
-            />
 
             <FormSection title="全局附加指令">
               <FormField label="全局系统提示词">
@@ -250,7 +233,6 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent } from 'vue'
 import { Button, FormField, FormSection, HelpTip } from 'nanocat-ui'
-import { normalizeProxyRuntime } from '@/api/settings'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import ConsoleSegmentedTabs from '@/components/ai/ConsoleSegmentedTabs.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
@@ -269,7 +251,6 @@ import SettingsBackupPanel from '@/views/settings/SettingsBackupPanel.vue'
 import SettingsExternalSourceModals from '@/views/settings/SettingsExternalSourceModals.vue'
 import SettingsExternalSourcesPanel from '@/views/settings/SettingsExternalSourcesPanel.vue'
 import SettingsIntegrationsPanel from '@/views/settings/SettingsIntegrationsPanel.vue'
-import SettingsProxyRuntimePanel from '@/views/settings/SettingsProxyRuntimePanel.vue'
 import SettingsPromptSourcesPanel from '@/views/settings/SettingsPromptSourcesPanel.vue'
 import SettingsUserKeyModals from '@/views/settings/SettingsUserKeyModals.vue'
 import SettingsStorageReviewPanel from '@/views/settings/SettingsStorageReviewPanel.vue'
@@ -278,7 +259,6 @@ import { useSettingsBackupRuntime } from '@/views/settings/settingsBackupRuntime
 import { useSettingsConfigRuntime } from '@/views/settings/settingsConfigRuntime'
 import { useSettingsExternalSourcesRuntime } from '@/views/settings/settingsExternalSourcesRuntime'
 import { useSettingsImageStorageRuntime } from '@/views/settings/settingsImageStorageRuntime'
-import { useSettingsProxyRuntime } from '@/views/settings/settingsProxyRuntime'
 import { useSettingsTabRuntime } from '@/views/settings/settingsTabRuntime'
 import { useSettingsUserKeysRuntime } from '@/views/settings/settingsUserKeysRuntime'
 import { useNumberSettingField } from '@/views/settings/useNumberSettingField'
@@ -290,7 +270,6 @@ const RemoteAccountImportPanel = defineAsyncComponent(() => import('@/components
 const pageRuntime = usePageRuntime('settings')
 
 const SETTINGS_RELOAD_REQUEST_KEY = 'settings:reload'
-const PROXY_RUNTIME_REQUEST_KEY = 'settings:proxy-runtime'
 const USER_KEYS_REQUEST_KEY = 'settings:user-keys'
 const BACKUPS_REQUEST_KEY = 'settings:backups'
 const CPA_POOLS_REQUEST_KEY = 'settings:cpa-pools'
@@ -299,8 +278,6 @@ const SUB2API_SERVERS_REQUEST_KEY = 'settings:sub2api-servers'
 const settingsConfigRuntime = useSettingsConfigRuntime({
   runtime: pageRuntime,
   requestKey: SETTINGS_RELOAD_REQUEST_KEY,
-  afterReload: () => loadProxyRuntimeStatus(true),
-  afterSave: () => loadProxyRuntimeStatus(true),
 })
 const settingsStore = settingsConfigRuntime.settingsStore
 const localSettings = settingsConfigRuntime.localSettings
@@ -407,22 +384,6 @@ const imageStorageBusy = imageStorageRuntime.imageStorageBusy
 const imageStorageTestResult = imageStorageRuntime.imageStorageTestResult
 const testImageStorageConnection = imageStorageRuntime.testImageStorageConnection
 const syncImageStorageFiles = imageStorageRuntime.syncImageStorageFiles
-const proxyRuntime = useSettingsProxyRuntime({
-  runtime: pageRuntime,
-  requestKey: PROXY_RUNTIME_REQUEST_KEY,
-  localSettings,
-  requireSavedSettings,
-})
-const proxyBusy = proxyRuntime.proxyBusy
-const proxyTestResult = proxyRuntime.proxyTestResult
-const proxyRuntimeLoading = proxyRuntime.proxyRuntimeLoading
-const proxyRuntimeTesting = proxyRuntime.proxyRuntimeTesting
-const proxyRuntimeStatus = proxyRuntime.proxyRuntimeStatus
-const clearanceTestTarget = proxyRuntime.clearanceTestTarget
-const clearanceTestResult = proxyRuntime.clearanceTestResult
-const testDefaultProxy = proxyRuntime.testDefaultProxy
-const loadProxyRuntimeStatus = proxyRuntime.loadProxyRuntimeStatus
-const testProxyClearance = proxyRuntime.testProxyClearance
 
 const imageRetentionDaysField = useNumberSettingField(
   () => localSettings.value?.image_retention_days ?? 15,
@@ -544,24 +505,6 @@ const imageSettleSecondsField = useNumberSettingField(
   },
   { min: 0.5, fallback: 5 },
 )
-const clearanceTimeoutField = useNumberSettingField(
-  () => localSettings.value?.proxy_runtime?.clearance.timeout_sec ?? 60,
-  (value) => {
-    if (!localSettings.value) return
-    localSettings.value.proxy_runtime = normalizeProxyRuntime(localSettings.value.proxy_runtime)
-    localSettings.value.proxy_runtime.clearance.timeout_sec = value
-  },
-  { integer: true, min: 1, fallback: 60 },
-)
-const clearanceRefreshIntervalField = useNumberSettingField(
-  () => localSettings.value?.proxy_runtime?.clearance.refresh_interval ?? 3600,
-  (value) => {
-    if (!localSettings.value) return
-    localSettings.value.proxy_runtime = normalizeProxyRuntime(localSettings.value.proxy_runtime)
-    localSettings.value.proxy_runtime.clearance.refresh_interval = value
-  },
-  { integer: true, min: 60, fallback: 3600 },
-)
 const backupIntervalMinutesField = useNumberSettingField(
   () => localSettings.value?.backup?.interval_minutes ?? 1440,
   (value) => { if (localSettings.value) localSettings.value.backup.interval_minutes = value },
@@ -606,7 +549,6 @@ useSettingsTabRuntime({
   ],
   invalidators: [
     settingsConfigRuntime.invalidate,
-    proxyRuntime.invalidate,
     userKeysRuntime.invalidate,
     backupRuntime.invalidate,
     externalSourcesRuntime.invalidate,
@@ -616,8 +558,6 @@ useSettingsTabRuntime({
     isSaving.value ||
     settingsStore.isLoading ||
     imageStorageBusy.value ||
-    proxyBusy.value ||
-    proxyRuntimeTesting.value ||
     backupBusy.value ||
     savingExternalSource.value ||
     testingExternalSource.value ||

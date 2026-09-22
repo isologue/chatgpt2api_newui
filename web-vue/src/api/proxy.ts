@@ -1,5 +1,5 @@
 import apiClient from './client'
-import type { ClearanceTestResult, ProxyRuntimeSettings, ProxyRuntimeStatus } from '@/types/api'
+import type { ProxyRuntimeSettings, ProxyRuntimeStatus } from '@/types/api'
 
 export interface ProxyTestResult {
   ok: boolean
@@ -57,7 +57,7 @@ export interface ProxyReference {
   value: string
 }
 
-export type { ClearanceTestResult, ProxyRuntimeSettings, ProxyRuntimeStatus }
+export type { ProxyRuntimeSettings, ProxyRuntimeStatus }
 
 export function parseProxyReference(value: unknown): ProxyReference {
   const raw = String(value || '').trim()
@@ -138,9 +138,4 @@ export const proxyApi = {
   getRuntime: () =>
     apiClient.get<never, { runtime: ProxyRuntimeSettings; status: ProxyRuntimeStatus }>('/api/proxy/runtime'),
 
-  testClearance: (targetUrl = 'https://chatgpt.com') =>
-    apiClient.post<{ target_url: string }, { result: ClearanceTestResult }>(
-      '/api/proxy/clearance/test',
-      { target_url: targetUrl },
-    ),
 }

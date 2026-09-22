@@ -79,17 +79,29 @@ def _proxy_hash(proxy_url: object) -> str:
 
 def _backend_egress_data(backend: OpenAIBackendAPI) -> dict[str, Any]:
     profile = getattr(backend, "proxy_profile", None)
+    resource_profile = getattr(backend, "resource_proxy_profile", None)
     proxy_url = getattr(profile, "proxy_url", "") if profile else ""
+    resource_url = getattr(resource_profile, "proxy_url", "") if resource_profile else ""
     return {
+        # 控制出口（B）：鉴权、会话、SSE 和文件元数据控制请求。
         "proxy_source": str(getattr(profile, "proxy_source", "") or "direct"),
         "proxy_hash": _proxy_hash(proxy_url),
         "egress_key": str(getattr(profile, "egress_key", "") or "direct"),
         "egress_label": str(getattr(profile, "egress_label", "") or ""),
+        "control_egress_key": str(getattr(profile, "egress_key", "") or "direct"),
+        "control_egress_label": str(getattr(profile, "egress_label", "") or ""),
+        "control_proxy_source": str(getattr(profile, "proxy_source", "") or "direct"),
+        # 资源出口（A）：参考图大文件 PUT 和最终图片 GET。
+        "resource_proxy_hash": _proxy_hash(resource_url),
+        "resource_egress_key": str(getattr(resource_profile, "egress_key", "") or "direct"),
+        "resource_egress_label": str(getattr(resource_profile, "egress_label", "") or ""),
+        "resource_proxy_source": str(getattr(resource_profile, "proxy_source", "") or "direct"),
         "proxy_group_id": str(getattr(profile, "proxy_group_id", "") or ""),
         "proxy_node_id": str(getattr(profile, "proxy_node_id", "") or ""),
         "proxy_node_name": str(getattr(profile, "proxy_node_name", "") or ""),
         "image_egress_limit": int(getattr(profile, "image_concurrency_limit", 0) or 0),
         "has_proxy": bool(proxy_url),
+        "has_resource_proxy": bool(resource_url),
         "egress_mode": str(getattr(profile, "egress_mode", "") or "direct"),
     }
 
@@ -2236,6 +2248,8 @@ def _generate_single_image(
             }
             if attempt_conversation_id:
                 attempt["conversation_id"] = attempt_conversation_id
+            if backend is not None:
+                attempt.update(_backend_egress_data(backend))
             if failure is not None:
                 raw_error = str(getattr(error, "raw_error", "") or "").strip()
                 if failure.code == "image_poll_timeout":

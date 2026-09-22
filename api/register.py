@@ -4,16 +4,19 @@ import asyncio
 import json
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
+from services.proxy_service import test_clearance
 from services.register_service import register_service
 
 
 class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
+    clearance: dict | None = None
     total: int | None = None
     threads: int | None = None
     mode: str | None = None
@@ -26,6 +29,12 @@ class RegisterConfigRequest(BaseModel):
     dynamic_image_scale_cooldown_seconds: int | None = None
     dynamic_image_scale_wait_threshold_ms: int | None = None
     dynamic_image_scale_buffer: int | None = None
+
+
+class RegisterClearanceTestRequest(BaseModel):
+    target_url: str = "https://auth.openai.com"
+    proxy: str = ""
+    clearance: dict | None = None
 
 
 class OutlookPoolResetRequest(BaseModel):
@@ -53,6 +62,18 @@ def create_router() -> APIRouter:
     async def update_register_config(body: RegisterConfigRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.update(body.model_dump(exclude_none=True))}
+
+    @router.post("/api/register/clearance/test")
+    async def test_register_clearance(body: RegisterClearanceTestRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {
+            "result": await run_in_threadpool(
+                test_clearance,
+                body.target_url,
+                body.proxy,
+                body.clearance or {},
+            )
+        }
 
     @router.post("/api/register/start")
     async def start_register(authorization: str | None = Header(default=None)):

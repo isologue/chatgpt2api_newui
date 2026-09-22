@@ -59,8 +59,13 @@ DEFAULT_PROXY_RUNTIME_USER_AGENT = (
 DEFAULT_PROXY_RUNTIME = {
     "enabled": False,
     "egress_mode": "direct",
+    # 兼容旧版 proxy_url；split_proxy 模式下 control_proxy_url 是稳定出口 B。
     "proxy_url": "",
+    "control_proxy_url": "",
+    # split_proxy 模式下 resource_proxy_url 是便宜出口 A。
     "resource_proxy_url": "",
+    "control_fallback_proxy_url": "",
+    "resource_fallback_proxy_url": "",
     "skip_ssl_verify": False,
     "reset_session_status_codes": [403],
     "clearance": {
@@ -223,7 +228,7 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     clearance_source = source.get("clearance") if isinstance(source.get("clearance"), dict) else {}
 
     egress_mode = str(source.get("egress_mode") or DEFAULT_PROXY_RUNTIME["egress_mode"]).strip().lower()
-    if egress_mode not in {"direct", "single_proxy"}:
+    if egress_mode not in {"direct", "single_proxy", "split_proxy"}:
         egress_mode = str(DEFAULT_PROXY_RUNTIME["egress_mode"])
 
     clearance_mode = str(clearance_source.get("mode") or default_clearance["mode"]).strip().lower()
@@ -246,7 +251,10 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_PROXY_RUNTIME["enabled"])),
         "egress_mode": egress_mode,
         "proxy_url": str(source.get("proxy_url") or "").strip(),
+        "control_proxy_url": str(source.get("control_proxy_url") or "").strip(),
         "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
+        "control_fallback_proxy_url": str(source.get("control_fallback_proxy_url") or "").strip(),
+        "resource_fallback_proxy_url": str(source.get("resource_fallback_proxy_url") or "").strip(),
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
             bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),

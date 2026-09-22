@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { getAuthToken } from '@/api/client'
 import { proxyApi, type ProxyGroup } from '@/api/proxy'
 import { registerApi, type LegacyRegisterConfig } from '@/api/register'
+import type { ClearanceTestResult } from '@/types/api'
 import { usePageQuery } from '@/composables/usePageQuery'
 import type { PageRuntime } from '@/composables/usePageRuntime'
 import {
@@ -40,6 +41,9 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   const proxyMode = ref<RegisterProxyMode>('global')
   const selectedProxyGroupId = ref('')
   const customProxyInput = ref('')
+  const clearanceTestTarget = ref('https://auth.openai.com')
+  const clearanceTesting = ref(false)
+  const clearanceTestResult = ref<ClearanceTestResult | null>(null)
   const config = ref<LegacyRegisterConfig | null>(null)
   const applyListeners = new Set<() => void>()
 
@@ -74,6 +78,7 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   function applyConfig(nextConfig: LegacyRegisterConfig) {
     config.value = normalizeRegisterConfig(nextConfig)
     syncProxyControlsFromValue(config.value.proxy)
+    clearanceTestResult.value = null
     applyListeners.forEach((callback) => callback())
   }
 
@@ -139,6 +144,28 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
         },
       },
     )
+  }
+
+  async function testClearance() {
+    if (!config.value) return
+    clearanceTesting.value = true
+    clearanceTestResult.value = null
+    try {
+      const response = await registerApi.testClearance({
+        target_url: clearanceTestTarget.value || 'https://auth.openai.com',
+        proxy: String(config.value.proxy || '').trim(),
+        clearance: config.value.clearance,
+      })
+      clearanceTestResult.value = response.result
+      if (response.result.ok) input.notifySuccess('注册清障测试成功')
+      else input.notifyError(response.result.error || '注册清障测试失败')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '注册清障测试失败')
+      clearanceTestResult.value = { ok: false, status: 'error', latency_ms: 0, has_cookies: false, user_agent: '', error: message }
+      input.notifyError(message)
+    } finally {
+      clearanceTesting.value = false
+    }
   }
 
   async function saveConfig() {
@@ -216,6 +243,9 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     proxyMode,
     selectedProxyGroupId,
     customProxyInput,
+    clearanceTestTarget,
+    clearanceTesting,
+    clearanceTestResult,
     config,
     providers,
     proxyGroupOptions,
@@ -227,6 +257,7 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     selectProxyGroup,
     setCustomProxyInput,
     payload,
+    testClearance,
     loadConfig,
     loadProxyGroups,
     saveConfig,

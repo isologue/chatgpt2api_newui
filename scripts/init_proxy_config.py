@@ -21,7 +21,10 @@ DEFAULT_PROXY_RUNTIME: dict[str, Any] = {
     "enabled": False,
     "egress_mode": "direct",
     "proxy_url": "",
+    "control_proxy_url": "",
     "resource_proxy_url": "",
+    "control_fallback_proxy_url": "",
+    "resource_fallback_proxy_url": "",
     "skip_ssl_verify": False,
     "reset_session_status_codes": [403],
     "clearance": {
@@ -79,7 +82,7 @@ def _warp_runtime_defaults() -> dict[str, Any]:
         clearance_mode = "none"
 
     egress_mode = os.getenv("CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE", "single_proxy").strip().lower()
-    if egress_mode not in {"direct", "single_proxy"}:
+    if egress_mode not in {"direct", "single_proxy", "split_proxy"}:
         egress_mode = "single_proxy"
 
     runtime = copy.deepcopy(DEFAULT_PROXY_RUNTIME)
@@ -88,7 +91,10 @@ def _warp_runtime_defaults() -> dict[str, Any]:
             "enabled": _env_bool("CHATGPT2API_PROXY_RUNTIME_ENABLED", True),
             "egress_mode": egress_mode,
             "proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_PROXY_URL", "http://privoxy:8118").strip(),
+            "control_proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_CONTROL_PROXY_URL", "").strip(),
             "resource_proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL", "").strip(),
+            "control_fallback_proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_CONTROL_FALLBACK_PROXY_URL", "").strip(),
+            "resource_fallback_proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_RESOURCE_FALLBACK_PROXY_URL", "").strip(),
             "skip_ssl_verify": _env_bool("CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY", False),
             "reset_session_status_codes": [
                 int(part.strip())
@@ -207,7 +213,8 @@ def main() -> int:
         "Proxy runtime summary: "
         f"enabled={bool(runtime.get('enabled'))}, "
         f"egress_mode={runtime.get('egress_mode')}, "
-        f"proxy_url={_mask_url(str(runtime.get('proxy_url') or ''))}, "
+        f"control_proxy_url={_mask_url(str(runtime.get('control_proxy_url') or runtime.get('proxy_url') or ''))}, "
+        f"resource_proxy_url={_mask_url(str(runtime.get('resource_proxy_url') or ''))}, "
         f"clearance_mode={clearance.get('mode')}, "
         f"flaresolverr_url={_mask_url(str(clearance.get('flaresolverr_url') or ''))}"
     )

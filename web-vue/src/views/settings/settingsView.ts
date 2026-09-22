@@ -93,13 +93,9 @@ export const imageStorageModeOptions: SettingsSelectOption[] = [
 export const proxyRuntimeEgressOptions: SettingsSelectOption[] = [
   { label: '直连', value: 'direct' },
   { label: '单代理', value: 'single_proxy' },
+  { label: 'A/B 分流', value: 'split_proxy' },
 ]
 
-export const proxyClearanceModeOptions: SettingsSelectOption[] = [
-  { label: '关闭', value: 'none' },
-  { label: 'FlareSolverr', value: 'flaresolverr' },
-  { label: '手动 Cookie', value: 'manual' },
-]
 
 export function backupStatusText(state: BackupState | null | undefined) {
   if (!state) return '未加载'
@@ -110,12 +106,27 @@ export function backupStatusText(state: BackupState | null | undefined) {
 }
 
 export function buildProxyRuntimeSummaryItems(status: ProxyRuntimeStatus | null | undefined): SettingsSummaryItem[] {
+  const mode = status?.egress_mode
+  const routeItems: SettingsSummaryItem[] = mode === 'split_proxy'
+    ? [
+        { label: '控制出口 B', value: status?.control_egress_label || status?.egress_label || '-' },
+        { label: '资源出口 A', value: status?.resource_egress_label || '-' },
+      ]
+    : mode === 'single_proxy'
+      ? [
+          { label: '主代理 · 控制', value: status?.control_egress_label || status?.egress_label || '-' },
+          { label: '主代理 · 资源', value: status?.resource_egress_label || '-' },
+        ]
+      : [
+          { label: '控制流', value: status ? '直连' : '-' },
+          { label: '资源流', value: status ? '直连' : '-' },
+        ]
+
   return [
     { label: '运行时', value: status ? (status.enabled ? '已启用' : '关闭') : '-' },
-    { label: '出站方式', value: status ? (status.egress_mode === 'single_proxy' ? '单代理' : '直连') : '-' },
+    { label: '出站方式', value: status ? (mode === 'split_proxy' ? 'A/B 分流' : mode === 'single_proxy' ? '单代理' : '直连') : '-' },
+    ...routeItems,
     { label: '代理', value: status ? (status.has_proxy ? '已配置' : '未配置') : '-' },
-    { label: '清障', value: status ? (status.clearance_enabled ? `已启用 / ${status.clearance_mode}` : '关闭') : '-' },
-    { label: '缓存', value: status ? (status.has_clearance_bundle ? '已有 clearance' : '暂无缓存') : '-' },
   ]
 }
 

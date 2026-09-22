@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config as app_config
 from services.json_file import read_json_object, write_json_file
 from services.register import mail_provider, openai_register
 
@@ -64,6 +64,26 @@ def _safe_int(value: object, fallback: int, minimum: int = 0) -> int:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_clearance(value: object, legacy: object = None) -> dict:
+    defaults = openai_register.config.get("clearance") if isinstance(openai_register.config.get("clearance"), dict) else {}
+    source = value if isinstance(value, dict) else (legacy if isinstance(legacy, dict) else {})
+    mode = str(source.get("mode") or defaults.get("mode") or "none").strip().lower()
+    if mode not in {"none", "manual", "flaresolverr"}:
+        mode = "none"
+    return {
+        "enabled": _safe_bool(source.get("enabled"), bool(defaults.get("enabled", False))),
+        "mode": mode,
+        "cf_cookies": str(source.get("cf_cookies") or "").strip(),
+        "cf_clearance": str(source.get("cf_clearance") or "").strip(),
+        "user_agent": str(source.get("user_agent") or defaults.get("user_agent") or "").strip(),
+        "browser": str(source.get("browser") or defaults.get("browser") or "chrome").strip(),
+        "flaresolverr_url": str(source.get("flaresolverr_url") or "").strip(),
+        "timeout_sec": _safe_int(source.get("timeout_sec"), int(defaults.get("timeout_sec") or 60), 1),
+        "refresh_interval": _safe_int(source.get("refresh_interval"), int(defaults.get("refresh_interval") or 3600), 60),
+        "warm_up_on_start": _safe_bool(source.get("warm_up_on_start"), bool(defaults.get("warm_up_on_start", False))),
+    }
 
 
 def _provider_id(provider: dict) -> str:
@@ -130,6 +150,8 @@ def _normalize(raw: dict) -> dict:
     cfg["dynamic_image_scale_wait_threshold_ms"] = _safe_int(cfg.get("dynamic_image_scale_wait_threshold_ms"), 5000, 0)
     cfg["dynamic_image_scale_buffer"] = _safe_int(cfg.get("dynamic_image_scale_buffer"), 2, 0)
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    legacy_clearance = app_config.get_proxy_runtime_settings().get("clearance") if "clearance" not in raw else None
+    cfg["clearance"] = _normalize_clearance(raw.get("clearance"), legacy_clearance)
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
     cfg["mail"] = {**default_mail, **mail}
@@ -166,6 +188,12 @@ class RegisterService:
         with self._lock:
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
+        clearance = snapshot.get("clearance") if isinstance(snapshot.get("clearance"), dict) else {}
+        if isinstance(clearance, dict):
+            clearance["has_cf_cookies"] = bool(str(clearance.get("cf_cookies") or "").strip())
+            clearance["has_cf_clearance"] = bool(str(clearance.get("cf_clearance") or "").strip())
+            clearance["cf_cookies"] = ""
+            clearance["cf_clearance"] = ""
         return snapshot
 
     @staticmethod
@@ -294,9 +322,18 @@ class RegisterService:
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._merge_outlook_pools(updates)
+            clearance_update = updates.get("clearance") if isinstance(updates.get("clearance"), dict) else None
+            if clearance_update is not None:
+                current_clearance = self._config.get("clearance") if isinstance(self._config.get("clearance"), dict) else {}
+                clearance_update = dict(clearance_update)
+                if not str(clearance_update.get("cf_cookies") or "").strip() and _safe_bool(clearance_update.get("has_cf_cookies"), False):
+                    clearance_update["cf_cookies"] = current_clearance.get("cf_cookies", "")
+                if not str(clearance_update.get("cf_clearance") or "").strip() and _safe_bool(clearance_update.get("has_cf_clearance"), False):
+                    clearance_update["cf_clearance"] = current_clearance.get("cf_clearance", "")
+                updates = {**updates, "clearance": clearance_update}
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "clearance", "total", "threads")})
             self._save()
             return self.get()
 
@@ -311,7 +348,7 @@ class RegisterService:
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "clearance", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
@@ -342,7 +379,7 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "clearance", "total", "threads")})
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()

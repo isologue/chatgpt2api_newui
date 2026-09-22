@@ -38,7 +38,7 @@ from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.model_catalog_service import get_model_catalog
-from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.proxy_service import proxy_settings, test_proxy
 from services.realtime_monitor_service import realtime_monitor_service
 from services.runtime_log_service import list_runtime_logs
 from services.threadpool_service import apply_thread_pool_capacity
@@ -100,9 +100,6 @@ SETTINGS_UPDATE_KEYS = {
 class ProxyTestRequest(BaseModel):
     url: str = ""
 
-
-class ClearanceTestRequest(BaseModel):
-    target_url: str = "https://chatgpt.com"
 
 
 class ProxyProfileRequest(BaseModel):
@@ -887,10 +884,6 @@ def create_router(app_version: str) -> APIRouter:
             "status": proxy_settings.get_runtime_status(),
         }
 
-    @router.post("/api/proxy/clearance/test")
-    async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):

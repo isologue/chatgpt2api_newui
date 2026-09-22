@@ -83,13 +83,13 @@
         <div class="settings-check-item">
           <div class="settings-check-control">
             <Checkbox v-model="settings.image_egress_fallback_on_stream_timeout">生图流超时后尝试备用出口</Checkbox>
-            <HelpTip text="默认开启。仅在没有收到任何上游内容、会话、任务或图片结果时，才使用同一账号通过 fallback_proxy 重试一次，避免重复提交已经被上游受理的任务。" />
+            <HelpTip text="默认开启。仅在没有收到任何上游内容、会话、任务或图片结果时，才使用当前出站方式配置的备用代理重试一次，避免重复提交已经被上游受理的任务。" />
           </div>
         </div>
         <div class="settings-check-item">
           <div class="settings-check-control">
             <Checkbox v-model="settings.image_egress_circuit_breaker_enabled">启用生图出口熔断</Checkbox>
-            <HelpTip text="主出口在统计窗口内达到故障阈值后临时熔断，新生图请求直接走 fallback_proxy；冷却结束只放行一个请求试探主出口。保存后实时生效，无需重启。" />
+            <HelpTip text="主出口在统计窗口内达到故障阈值后临时熔断，新生图请求直接走当前出站方式配置的备用代理；冷却结束只放行一个请求试探主出口。保存后实时生效，无需重启。" />
           </div>
         </div>
       </div>

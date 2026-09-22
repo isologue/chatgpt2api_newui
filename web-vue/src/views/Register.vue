@@ -32,6 +32,11 @@
             :custom-proxy-input="customRegisterProxyInput"
             :proxy-group-groups="registerProxyGroupGroups"
             :proxy-hint="registerProxyHint"
+            :clearance-test-target="clearanceTestTarget"
+            :clearance-testing="clearanceTesting"
+            :clearance-test-result="clearanceTestResult"
+            @update:clearance-test-target="clearanceTestTarget = $event"
+            @test-clearance="testRegisterClearance"
             @update-proxy-mode="setRegisterProxyMode"
             @select-proxy-group="selectRegisterProxyGroup"
             @update-custom-proxy="setCustomRegisterProxyInput"
@@ -146,6 +151,10 @@ const selectedRegisterProxyGroupId = registerConfigRuntime.selectedProxyGroupId
 const customRegisterProxyInput = registerConfigRuntime.customProxyInput
 const registerProxyGroupGroups = registerConfigRuntime.proxyGroupGroups
 const registerProxyHint = registerConfigRuntime.proxyHint
+const clearanceTestTarget = registerConfigRuntime.clearanceTestTarget
+const clearanceTesting = registerConfigRuntime.clearanceTesting
+const clearanceTestResult = registerConfigRuntime.clearanceTestResult
+const testRegisterClearance = registerConfigRuntime.testClearance
 const applyRegisterConfig = registerConfigRuntime.applyConfig
 const loadRegisterConfig = registerConfigRuntime.loadConfig
 const loadProxyGroups = registerConfigRuntime.loadProxyGroups

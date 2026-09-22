@@ -1,6 +1,6 @@
 // API 类型定义
 
-export type ProxyRuntimeEgressMode = 'direct' | 'single_proxy'
+export type ProxyRuntimeEgressMode = 'direct' | 'single_proxy' | 'split_proxy'
 export type ProxyRuntimeClearanceMode = 'none' | 'manual' | 'flaresolverr'
 
 export interface ProxyRuntimeClearance {
@@ -22,22 +22,53 @@ export interface ProxyRuntimeSettings {
   enabled: boolean
   egress_mode: ProxyRuntimeEgressMode
   proxy_url: string
+  control_proxy_url: string
   resource_proxy_url: string
+  control_fallback_proxy_url: string
+  resource_fallback_proxy_url: string
   skip_ssl_verify: boolean
   reset_session_status_codes: number[]
   clearance: ProxyRuntimeClearance
 }
 
+export interface ProxyRouteMetric {
+  inflight?: number
+  total?: number
+  success?: number
+  failed?: number
+  fallback?: number
+  avg_ms?: number
+  max_ms?: number
+  last_ms?: number
+  last_error?: string
+  last_egress_key?: string
+  last_egress_label?: string
+  updated_at?: number
+}
+
 export interface ProxyRuntimeStatus {
   enabled: boolean
   egress_mode: string
-  proxy_source?: string
+  egress_key?: string
+  egress_label?: string
+  control_egress_key?: string
+  control_egress_label?: string
+  resource_egress_key?: string
+  resource_egress_label?: string
+  control_proxy_source?: string
+  resource_proxy_source?: string
   has_proxy: boolean
+  has_control_proxy?: boolean
+  has_resource_proxy?: boolean
   skip_ssl_verify?: boolean
   clearance_enabled: boolean
   clearance_mode: string
   has_clearance_bundle: boolean
   cached_clearance_hosts: string[]
+  route_metrics?: {
+    control?: ProxyRouteMetric
+    resource?: ProxyRouteMetric
+  }
 }
 
 export interface ClearanceTestResult {
@@ -46,6 +77,8 @@ export interface ClearanceTestResult {
   latency_ms: number
   has_cookies: boolean
   user_agent: string
+  egress_key?: string
+  egress_label?: string
   error?: string | null
   runtime?: ProxyRuntimeStatus
 }

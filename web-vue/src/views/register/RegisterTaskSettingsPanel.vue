@@ -110,6 +110,71 @@
       </div>
     </FormSection>
 
+    <FormSection title="注册清障" density="roomy">
+      <div class="register-form-grid">
+        <label class="register-checkbox-field register-field--full">
+          <Checkbox v-model="config.clearance.enabled" :disabled="config.enabled">
+            启用 Cloudflare 注册清障
+          </Checkbox>
+          <span class="register-checkbox-hint">只用于注册 auth.openai.com；清障和注册请求固定使用同一个注册代理节点，不参与生图出站分流。</span>
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">清障方式</span>
+          <GroupedSelectMenu
+            v-model="config.clearance.mode"
+            :groups="clearanceModeGroups"
+            selected-indicator="none"
+            :disabled="config.enabled || !config.clearance.enabled"
+            block
+          />
+        </label>
+
+        <label v-if="config.clearance.mode === 'flaresolverr'" class="register-field register-field--full">
+          <span class="register-label">FlareSolverr URL</span>
+          <Input v-model.trim="config.clearance.flaresolverr_url" block root-class="font-mono" placeholder="http://flaresolverr:8191" :disabled="config.enabled || !config.clearance.enabled" />
+        </label>
+
+        <template v-if="config.clearance.mode === 'manual'">
+          <label class="register-field">
+            <span class="register-label">cf_clearance</span>
+            <Input v-model.trim="config.clearance.cf_clearance" block root-class="font-mono" :placeholder="config.clearance.has_cf_clearance ? '已保存，留空则沿用' : '手动填写 cf_clearance'" :disabled="config.enabled || !config.clearance.enabled" />
+          </label>
+          <label class="register-field">
+            <span class="register-label">Cookie</span>
+            <Input v-model.trim="config.clearance.cf_cookies" block root-class="font-mono" :placeholder="config.clearance.has_cf_cookies ? '已保存，留空则沿用' : '可粘贴完整 Cookie'" :disabled="config.enabled || !config.clearance.enabled" />
+          </label>
+        </template>
+
+        <label class="register-field register-field--full">
+          <span class="register-label">User-Agent</span>
+          <Input v-model.trim="config.clearance.user_agent" block root-class="font-mono" placeholder="Mozilla/5.0 ..." :disabled="config.enabled || !config.clearance.enabled" />
+        </label>
+        <label class="register-field">
+          <span class="register-label">清障超时（秒）</span>
+          <Input v-model.number="config.clearance.timeout_sec" type="number" min="1" block :disabled="config.enabled || !config.clearance.enabled" />
+        </label>
+        <label class="register-field">
+          <span class="register-label">缓存刷新间隔（秒）</span>
+          <Input v-model.number="config.clearance.refresh_interval" type="number" min="60" block :disabled="config.enabled || !config.clearance.enabled" />
+        </label>
+
+        <div class="register-clearance-test register-field--full">
+          <Input :model-value="clearanceTestTarget" block root-class="font-mono" placeholder="https://auth.openai.com" @update:model-value="emit('update-clearance-test-target', String($event || '').trim())" />
+          <Button size="sm" variant="outline" :disabled="clearanceTesting || !config.clearance.enabled" @click="emit('test-clearance')">
+            {{ clearanceTesting ? '测试中...' : '按注册代理测试' }}
+          </Button>
+        </div>
+        <div v-if="clearanceTestResult" class="register-clearance-result register-field--full">
+          <p :class="clearanceTestResult.ok ? 'text-emerald-600' : 'text-rose-600'">
+            {{ clearanceTestResult.ok ? `清障可用：${clearanceTestResult.latency_ms} ms` : `清障不可用：${clearanceTestResult.error || '未知错误'}` }}
+          </p>
+          <p v-if="clearanceTestResult.egress_label" class="text-muted-foreground">实际注册出口：{{ clearanceTestResult.egress_label }}</p>
+          <p v-if="clearanceTestResult.user_agent" class="break-all text-muted-foreground">User-Agent：{{ clearanceTestResult.user_agent }}</p>
+        </div>
+      </div>
+    </FormSection>
+
     <FormSection title="生图压力动态补号" density="roomy">
       <div class="register-form-grid">
         <label class="register-checkbox-field register-field--full">
@@ -232,11 +297,12 @@
 </template>
 
 <script setup lang="ts">
-import { Checkbox, Input } from 'nanocat-ui'
+import { Button, Checkbox, Input } from 'nanocat-ui'
 
 import FormSection from '@/components/ai/FormSection.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
 import type { LegacyRegisterConfig } from '@/api/register'
+import type { ClearanceTestResult } from '@/types/api'
 import {
   registerModeGroups,
   registerProxyModeGroups,
@@ -250,13 +316,24 @@ defineProps<{
   customProxyInput: string
   proxyGroupGroups: unknown[]
   proxyHint: string
+  clearanceTestTarget: string
+  clearanceTesting: boolean
+  clearanceTestResult: ClearanceTestResult | null
 }>()
 
 const emit = defineEmits<{
   (e: 'update-proxy-mode', value: string): void
   (e: 'select-proxy-group', value: string): void
   (e: 'update-custom-proxy', value: string): void
+  (e: 'update-clearance-test-target', value: string): void
+  (e: 'test-clearance'): void
 }>()
+
+const clearanceModeGroups = [{ options: [
+  { label: '关闭', value: 'none' },
+  { label: 'FlareSolverr 自动清障', value: 'flaresolverr' },
+  { label: '手动 Cookie', value: 'manual' },
+] }]
 </script>
 
 <style scoped>
@@ -294,6 +371,11 @@ const emit = defineEmits<{
   font-size: 12px;
   color: hsl(var(--muted-foreground));
 }
+
+.register-clearance-test { display: flex; align-items: center; gap: 8px; }
+.register-clearance-test :deep(.ui-input-root) { flex: 1; }
+.register-clearance-result { display: grid; gap: 4px; border: 1px solid hsl(var(--border)); border-radius: 12px; padding: 10px 12px; font-size: 12px; }
+.register-clearance-result p { margin: 0; }
 
 .register-proxy-hint {
   margin: 0;

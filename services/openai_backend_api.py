@@ -7,10 +7,8 @@ import re
 import threading
 import time
 
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -242,18 +240,92 @@ class OpenAIBackendAPI:
             upstream=True,
             reserve_image_egress=reserve_image_egress,
         )
+        # 控制流和大流量资源流量使用独立 Session，避免并发请求之间修改代理状态。
+        # control_session = 鉴权 / 会话 / SSE；resource_session = 图片上传 PUT / 图片下载 GET。
+        self.resource_proxy_profile = proxy_settings.get_profile(
+            account=self.account,
+            resource=True,
+            upstream=True,
+        )
+        self.resource_fallback_proxy_profile = proxy_settings.get_fallback_profile(
+            resource=True,
+            upstream=True,
+        )
+        if self.resource_fallback_proxy_profile is None:
+            resource_key = str(self.resource_proxy_profile.egress_key or "direct")
+            control_key = str(self.proxy_profile.egress_key or "direct")
+            resource_url = str(self.resource_proxy_profile.proxy_url or "")
+            control_url = str(self.proxy_profile.proxy_url or "")
+            if self.resource_proxy_profile.egress_mode == "single_proxy":
+                # 单代理模式的图片资源请求和控制流共用主代理；主代理失败时
+                # 使用同一套“备用代理”，不和 A/B 资源备用配置混用。
+                single_fallback = proxy_settings.get_fallback_profile(
+                    resource=False,
+                    upstream=True,
+                )
+                if single_fallback is not None:
+                    self.resource_fallback_proxy_profile = replace(
+                        single_fallback,
+                        proxy_source="resource_fallback_single_proxy",
+                        egress_label=f"single-fallback/{single_fallback.egress_label or single_fallback.egress_key}",
+                        resource=True,
+                        image_egress_reserved=False,
+                        image_egress_wait_ms=0,
+                    )
+            elif resource_key != control_key or resource_url != control_url:
+                self.resource_fallback_proxy_profile = replace(
+                    self.proxy_profile,
+                    proxy_source="resource_fallback_control_b",
+                    egress_label=f"control-b/{self.proxy_profile.egress_label or control_key}",
+                    resource=True,
+                    image_egress_reserved=False,
+                    image_egress_wait_ms=0,
+                )
+        if self.resource_fallback_proxy_profile is not None:
+            fallback_key = str(self.resource_fallback_proxy_profile.egress_key or "direct")
+            fallback_url = str(self.resource_fallback_proxy_profile.proxy_url or "")
+            if (
+                fallback_key == str(self.resource_proxy_profile.egress_key or "direct")
+                and fallback_url == str(self.resource_proxy_profile.proxy_url or "")
+            ):
+                self.resource_fallback_proxy_profile = None
+        self._active_control_route_started: float | None = None
         try:
-            self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
+            session_kwargs = {
+                "impersonate": self.fp["impersonate"],
+                "verify": True,
+                "curl_infos": list(HTTP_TIMING_INFOS),
+            }
+            self.control_session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
                 self.proxy_profile,
-                impersonate=self.fp["impersonate"],
-                verify=True,
-                curl_infos=list(HTTP_TIMING_INFOS),
+                **session_kwargs,
             ))
+            self.resource_session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
+                self.resource_proxy_profile,
+                **session_kwargs,
+            ))
+            self.resource_fallback_session = None
+            if self.resource_fallback_proxy_profile is not None:
+                self.resource_fallback_session = requests.Session(
+                    **proxy_settings.build_session_kwargs_from_profile(
+                        self.resource_fallback_proxy_profile,
+                        **session_kwargs,
+                    )
+                )
+            # 保留旧属性，未参与分流的控制请求无需逐个改名。
+            self.session = self.control_session
         except Exception:
             if bool(getattr(self.proxy_profile, "image_egress_reserved", False)):
                 proxy_settings.release_image_egress(self.proxy_profile)
+            for session_name in ("control_session", "resource_session", "resource_fallback_session"):
+                session = getattr(self, session_name, None)
+                if session:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
             raise
-        self.session.headers.update({
+        headers = {
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
             "Referer": self.base_url + "/",
@@ -278,13 +350,35 @@ class OpenAIBackendAPI:
             "OAI-Language": "zh-CN",
             "OAI-Client-Version": self.client_version,
             "OAI-Client-Build-Number": self.client_build_number,
+        }
+        for session_name in ("control_session", "resource_session", "resource_fallback_session"):
+            session = getattr(self, session_name, None)
+            if session is not None:
+                session.headers.update(headers)
+        logger.info({
+            "event": "proxy_routes_selected",
+            "control_egress_key": self.proxy_profile.egress_key,
+            "control_egress_label": self.proxy_profile.egress_label,
+            "control_proxy_source": self.proxy_profile.proxy_source,
+            "resource_egress_key": self.resource_proxy_profile.egress_key,
+            "resource_egress_label": self.resource_proxy_profile.egress_label,
+            "resource_proxy_source": self.resource_proxy_profile.proxy_source,
+            "resource_fallback_egress_key": (
+                self.resource_fallback_proxy_profile.egress_key
+                if self.resource_fallback_proxy_profile is not None else ""
+            ),
         })
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        session = getattr(self, "session", None)
-        if session:
+        closed: set[int] = set()
+        for session_name in ("control_session", "resource_session", "resource_fallback_session", "session"):
+            session = getattr(self, session_name, None)
+            if not session or id(session) in closed:
+                continue
+            closed.add(id(session))
             try:
                 session.close()
             except Exception:
@@ -300,6 +394,96 @@ class OpenAIBackendAPI:
         self.close()
         return False
 
+    def _tracked_control_request(self, method: str, url: str, *, operation: str, **kwargs) -> requests.Response:
+        started = proxy_settings.route_request_started("control", self.proxy_profile)
+        try:
+            response = getattr(self.control_session, method.lower())(url, **kwargs)
+        except BaseException as exc:
+            proxy_settings.route_request_finished(
+                "control",
+                self.proxy_profile,
+                started,
+                success=False,
+                error=diagnostic_excerpt(repr(exc), 300),
+            )
+            raise
+        success = 200 <= int(getattr(response, "status_code", 0) or 0) < 300
+        proxy_settings.route_request_finished(
+            "control",
+            self.proxy_profile,
+            started,
+            success=success,
+            error="" if success else f"{operation}: HTTP {getattr(response, 'status_code', 0)}",
+        )
+        return response
+
+    def _resource_request(self, method: str, url: str, *, operation: str, **kwargs) -> requests.Response:
+        attempts = [(
+            self.resource_session,
+            self.resource_proxy_profile,
+            False,
+        )]
+        if self.resource_fallback_session is not None and self.resource_fallback_proxy_profile is not None:
+            attempts.append((
+                self.resource_fallback_session,
+                self.resource_fallback_proxy_profile,
+                True,
+            ))
+
+        last_error: BaseException | None = None
+        last_response: requests.Response | None = None
+        for index, (session, profile, fallback) in enumerate(attempts):
+            started = proxy_settings.route_request_started("resource", profile)
+            try:
+                response = getattr(session, method.lower())(url, **kwargs)
+                last_response = response
+                success = 200 <= int(getattr(response, "status_code", 0) or 0) < 300
+                proxy_settings.route_request_finished(
+                    "resource",
+                    profile,
+                    started,
+                    success=success,
+                    fallback=fallback,
+                    error="" if success else f"{operation}: HTTP {getattr(response, 'status_code', 0)}",
+                )
+                if success or index == len(attempts) - 1:
+                    return response
+                reason = f"http_{getattr(response, 'status_code', 0)}"
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            except BaseException as exc:
+                last_error = exc
+                proxy_settings.route_request_finished(
+                    "resource",
+                    profile,
+                    started,
+                    success=False,
+                    fallback=fallback,
+                    error=diagnostic_excerpt(repr(exc), 300),
+                )
+                if index == len(attempts) - 1:
+                    raise
+                reason = diagnostic_excerpt(repr(exc), 200)
+
+            next_profile = attempts[index + 1][1]
+            logger.warning({
+                "event": "resource_proxy_fallback",
+                "operation": operation,
+                "from_egress_key": profile.egress_key,
+                "from_egress_label": profile.egress_label,
+                "to_egress_key": next_profile.egress_key,
+                "to_egress_label": next_profile.egress_label,
+                "reason": reason,
+                "url_host": urlparse(url).netloc,
+            })
+
+        if last_error is not None:
+            raise last_error
+        if last_response is not None:
+            return last_response
+        raise RuntimeError(f"{operation} did not produce a response")
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")
@@ -941,7 +1125,7 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any, max_duration_secs: float | None = None) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        status_code = getattr(raw, "status", None)
+        status_code = getattr(raw, "status", None) or getattr(raw, "status_code", None)
         timeout_secs = float(max_duration_secs or 0)
         started_at = time.monotonic()
         timed_out = False
@@ -1001,7 +1185,8 @@ class OpenAIBackendAPI:
         try:
             if "application/json" in content_type:
                 _raise_if_timeout()
-                text = raw.read().decode("utf-8", "replace")
+                body = raw.read() if hasattr(raw, "read") else getattr(raw, "content", b"")
+                text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body or "")
                 _raise_if_timeout()
                 _append_body(text)
                 try:
@@ -1012,13 +1197,16 @@ class OpenAIBackendAPI:
                     parse_errors.append(str(exc))
             else:
                 lines: list[str] = []
-                while True:
+                if hasattr(raw, "readline"):
+                    raw_lines = iter(lambda: raw.readline(), b"")
+                else:
+                    raw_lines = raw.iter_lines()
+                for raw_line in raw_lines:
                     _raise_if_timeout()
-                    raw_line = raw.readline()
-                    _raise_if_timeout()
-                    if not raw_line:
-                        break
-                    line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                    else:
+                        line = str(raw_line).rstrip("\r\n")
                     _append_body(line + "\n")
                     if not line:
                         if _flush_sse_event(lines):
@@ -1092,12 +1280,6 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
@@ -1106,7 +1288,7 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi.control_session",
             "timeout_secs": config.image_stream_timeout_secs,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
@@ -1140,20 +1322,39 @@ class OpenAIBackendAPI:
             },
         })
         stream_timeout = config.image_stream_timeout_secs
+        route_started = proxy_settings.route_request_started("control", self.proxy_profile)
+        response = None
+        stream_success = False
         try:
-            with urllib.request.urlopen(request, timeout=stream_timeout) as raw:
-                yield from self._iter_codex_response_events(raw, max_duration_secs=stream_timeout)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
+            response = self.control_session.post(
+                self.base_url + path,
+                headers=self._codex_responses_headers(),
+                json=payload,
+                timeout=stream_timeout,
+                stream=True,
+            )
+            if not (200 <= int(getattr(response, "status_code", 0) or 0) < 300):
+                body: Any = getattr(response, "text", "")
+                try:
+                    body = response.json()
+                except Exception:
+                    pass
+                self._log_codex_response_failure(path, int(response.status_code), response.headers, payload, body)
+                ensure_ok(response, path)
+            yield from self._iter_codex_response_events(response, max_duration_secs=stream_timeout)
+            stream_success = True
+        finally:
             try:
-                body = json.loads(body_text)
-            except Exception:
-                pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+                if response is not None:
+                    response.close()
+            finally:
+                proxy_settings.route_request_finished(
+                    "control",
+                    self.proxy_profile,
+                    route_started,
+                    success=stream_success,
+                    error="" if stream_success else "codex responses stream failed",
+                )
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -1177,8 +1378,10 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + path,
+            operation="image_prepare",
             headers=self._image_headers(path, requirements),
             json=payload,
             timeout=60,
@@ -1218,8 +1421,10 @@ class OpenAIBackendAPI:
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
         path = "/backend-api/files"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + path,
+            operation="image_upload_metadata",
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
@@ -1227,8 +1432,10 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         upload_meta = response.json()
-        response = self.session.put(
+        response = self._resource_request(
+            "put",
             upload_meta["upload_url"],
+            operation="image_upload",
             headers={
                 "Content-Type": mime_type,
                 "x-ms-blob-type": "BlockBlob",
@@ -1244,8 +1451,10 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, "image_upload", credential_scope="signed_asset")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + path,
+            operation="image_upload_metadata",
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
             timeout=60,
@@ -1329,31 +1538,48 @@ class OpenAIBackendAPI:
         # the stream-timeout recovery probe that fetches conversation/task
         # diagnostics.
         transport_timeout_secs = max(timeout_secs + 30, timeout_secs * 1.1)
-        curl_options = getattr(self.session, "curl_options", None)
+        curl_options = getattr(self.control_session, "curl_options", None)
         previous_total_timeout = None
         had_total_timeout = False
         if isinstance(curl_options, dict):
             had_total_timeout = CurlOpt.TIMEOUT_MS in curl_options
             previous_total_timeout = curl_options.get(CurlOpt.TIMEOUT_MS)
             curl_options[CurlOpt.TIMEOUT_MS] = int(transport_timeout_secs * 1000)
+        route_started = proxy_settings.route_request_started("control", self.proxy_profile)
+        response = None
         try:
-            response = self.session.post(
-                self.base_url + path,
-                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-                json=payload,
-                timeout=transport_timeout_secs,
-                stream=True,
+            try:
+                response = self.control_session.post(
+                    self.base_url + path,
+                    headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                    json=payload,
+                    timeout=transport_timeout_secs,
+                    stream=True,
+                )
+            finally:
+                if isinstance(curl_options, dict):
+                    if had_total_timeout:
+                        curl_options[CurlOpt.TIMEOUT_MS] = previous_total_timeout
+                    else:
+                        curl_options.pop(CurlOpt.TIMEOUT_MS, None)
+            ensure_ok(response, path)
+        except BaseException as exc:
+            proxy_settings.route_request_finished(
+                "control",
+                self.proxy_profile,
+                route_started,
+                success=False,
+                error=diagnostic_excerpt(repr(exc), 300),
             )
-        finally:
-            if isinstance(curl_options, dict):
-                if had_total_timeout:
-                    curl_options[CurlOpt.TIMEOUT_MS] = previous_total_timeout
-                else:
-                    curl_options.pop(CurlOpt.TIMEOUT_MS, None)
-        ensure_ok(response, path)
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
+            raise
+        self._active_control_route_started = route_started
         self._record_http_timing("image_generation_stream", response)
         return response
-
     def _get_conversation(self, conversation_id: str, timeout_secs: float = 60) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
@@ -1573,8 +1799,10 @@ class OpenAIBackendAPI:
     def _upload_editable_base64_image(self, base64_image: str, index: int) -> Dict[str, Any]:
         data, file_name, mime_type, width, height = self._decode_editable_base64_image(base64_image, index)
         path = "/backend-api/files"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + path,
+            operation="image_upload_metadata",
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
             json={
                 "file_name": file_name,
@@ -1593,8 +1821,10 @@ class OpenAIBackendAPI:
         file_id = str(payload.get("file_id") or "")
         if not upload_url or not file_id:
             raise RuntimeError(f"invalid upload response: {payload}")
-        response = self.session.put(
+        response = self._resource_request(
+            "put",
             upload_url,
+            operation="image_upload",
             headers=self._signed_asset_headers({
                 "Content-Type": mime_type,
                 "x-ms-blob-type": "BlockBlob",
@@ -1610,8 +1840,10 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, "image_upload", credential_scope="signed_asset")
         path = f"/backend-api/files/{file_id}/uploaded"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + path,
+            operation="image_upload_metadata",
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
             data="{}",
             timeout=60,
@@ -3302,8 +3534,10 @@ class OpenAIBackendAPI:
             )
             for attempt in range(2):
                 try:
-                    response = self.session.get(
+                    response = self._resource_request(
+                        "get",
                         url,
+                        operation="image_download",
                         headers=download_headers,
                         timeout=120,
                     )
@@ -3402,6 +3636,8 @@ class OpenAIBackendAPI:
         self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
+        stream_success = False
+        stream_error: BaseException | None = None
         try:
             for payload in self._iter_timed_sse_payloads(
                 response,
@@ -3415,13 +3651,29 @@ class OpenAIBackendAPI:
                         "payload_preview": diagnostic_excerpt(payload, 1000),
                     })
                     break
+            stream_success = True
+        except BaseException as exc:
+            stream_error = exc
+            raise
         finally:
             response.close()
+            route_started = self._active_control_route_started
+            self._active_control_route_started = None
+            if route_started is not None:
+                proxy_settings.route_request_finished(
+                    "control",
+                    self.proxy_profile,
+                    route_started,
+                    success=stream_success,
+                    error="" if stream_success else diagnostic_excerpt(repr(stream_error), 300),
+                )
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
+        response = self._tracked_control_request(
+            "get",
             self.base_url + "/",
+            operation="bootstrap",
             headers=self._bootstrap_headers(),
             timeout=30,
         )
@@ -3436,8 +3688,10 @@ class OpenAIBackendAPI:
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + prepare_path,
+            operation="chat_requirements_prepare",
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
             timeout=30,
@@ -3465,8 +3719,10 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
+        response = self._tracked_control_request(
+            "post",
             self.base_url + finalize_path,
+            operation="chat_requirements_finalize",
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),
