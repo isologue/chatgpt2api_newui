@@ -760,10 +760,24 @@ IMAGE_ATTEMPT_KEYS = {
     "monitor",
 }
 IMAGE_ATTEMPT_INTEGER_KEYS = {
-    "slot", "attempt", "duration_ms", "status_code", "failure_retry_after",
+    "slot", "attempt", "index", "total", "duration_ms", "status_code", "failure_retry_after",
 }
 IMAGE_ATTEMPT_BOOLEAN_KEYS = {
     "failure_retryable", "failure_account_failure", "account_failure", "switched_account",
+}
+IMAGE_ATTEMPT_EGRESS_TEXT_KEYS = {
+    "route", "route_label", "operation",
+    "proxy_source", "proxy_hash", "egress_mode", "egress_key", "egress_label",
+    "proxy_group_id", "proxy_node_id", "proxy_node_name", "image_egress_limit",
+    "control_egress_key", "control_egress_label", "control_proxy_source",
+    "resource_proxy_hash", "resource_egress_key", "resource_egress_label", "resource_proxy_source",
+    "fallback_from_egress_key", "fallback_from_egress_label",
+    "from_egress_key", "from_egress_label", "from_proxy_source",
+    "to_egress_key", "to_egress_label", "to_proxy_source",
+    "reason", "url_host",
+}
+IMAGE_ATTEMPT_EGRESS_BOOLEAN_KEYS = {
+    "has_proxy", "has_resource_proxy", "fallback_retry", "circuit_routed",
 }
 
 
@@ -807,10 +821,13 @@ def _normalize_image_attempt_monitor(value: object) -> dict[str, object] | None:
                         continue
                 elif key in IMAGE_ATTEMPT_BOOLEAN_KEYS:
                     event[key] = bool(item)
+                elif key in IMAGE_ATTEMPT_EGRESS_BOOLEAN_KEYS:
+                    event[key] = bool(item)
                 elif key in {
                     "time", "event", "label", "status",
                     "failure_code", "failure_scope", "failure_capability",
                     "error_type", "public_error",
+                    *IMAGE_ATTEMPT_EGRESS_TEXT_KEYS,
                 }:
                     text = str(item or "").strip()
                     if text:

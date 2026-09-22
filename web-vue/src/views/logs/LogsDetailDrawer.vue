@@ -84,6 +84,11 @@
           @toggle-details="emit('toggle-timeline-details')"
         />
 
+        <LogsEgressTrace
+          v-if="egressSteps.length"
+          :steps="egressSteps"
+        />
+
         <LogsImageAttemptTimeline
           v-if="log.imageAttempts.length && hasImageAttemptBreakdown(log)"
           :attempts="log.imageAttempts"
@@ -149,6 +154,7 @@ import StateBadge from '@/components/ai/StateBadge.vue'
 import { isSystemLogSuccess, isSystemLogTextReview, type SystemLogRow } from '@/api/logs'
 import {
   hasImageAttemptBreakdown,
+  type DetailEgressStep,
   type DetailField,
   type DetailTimelineGroup,
   type DetailTimelineLegendItem,
@@ -162,6 +168,7 @@ import {
   summaryText,
 } from '@/views/logs/logsView'
 import LogsDetailTimeline from '@/views/logs/LogsDetailTimeline.vue'
+import LogsEgressTrace from '@/views/logs/LogsEgressTrace.vue'
 import LogsImageAttemptTimeline from '@/views/logs/LogsImageAttemptTimeline.vue'
 
 const props = defineProps<{
@@ -171,6 +178,7 @@ const props = defineProps<{
   timelineSegments: DetailTimelineSegment[]
   timelineLegendItems: DetailTimelineLegendItem[]
   timelineGroups: DetailTimelineGroup[]
+  egressSteps: DetailEgressStep[]
   timelineStepCount: number
   timelineSegmentTotal: number
   timelineDetailsVisible: boolean

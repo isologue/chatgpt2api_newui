@@ -59,6 +59,28 @@ export type DetailTimelineGroup = {
   steps: DetailTimelineStep[]
 }
 
+export type DetailEgressStep = {
+  key: string
+  stage: string
+  route: 'control' | 'resource' | 'fallback' | 'unknown'
+  routeLabel: string
+  egressLabel: string
+  egressKey: string
+  proxySource: string
+  proxyHash: string
+  time: string
+  status: string
+  operation: string
+  slot: number
+  attempt: number
+  inherited: boolean
+  fromLabel: string
+  fromKey: string
+  toLabel: string
+  toKey: string
+  reason: string
+}
+
 type DetailTimelineSummary = {
   stepCount: number
   segmentTotalMs: number
@@ -541,6 +563,110 @@ export function shouldAutoExpandTimeline(item: SystemLogRow | null, bottleneckSt
   if (Number(item.durationMs || 0) >= 180_000) return true
   if (metricValueFromLog(item, 'stream_error_ms') > 0) return true
   return bottleneckStep?.tone === 'danger'
+}
+
+const egressStageConfig: Record<string, { label: string; route: DetailEgressStep['route'] }> = {
+  image_egress_ready: { label: '出口就绪', route: 'control' },
+  image_uploading: { label: '上传输入图', route: 'resource' },
+  image_bootstrapping: { label: '初始化上游', route: 'control' },
+  image_getting_token: { label: '获取请求令牌', route: 'control' },
+  image_preparing_conversation: { label: '准备会话', route: 'control' },
+  image_starting_generation: { label: '提交生成请求', route: 'control' },
+  image_generating: { label: 'SSE 控制流', route: 'control' },
+  image_stream_resolve_start: { label: '等待图片结果', route: 'control' },
+  image_resolve_done: { label: '解析图片地址', route: 'control' },
+  image_resolve_failed: { label: '解析图片地址', route: 'control' },
+  image_download_done: { label: '下载最终图片', route: 'resource' },
+  image_download_failed: { label: '下载最终图片', route: 'resource' },
+  image_codex_response_done: { label: 'Codex 图片响应', route: 'control' },
+  resource_proxy_fallback: { label: '资源出口切换', route: 'fallback' },
+  image_egress_fallback_retry: { label: '控制出口切换', route: 'fallback' },
+}
+
+function egressEventRecords(item: SystemLogRow): Record<string, unknown>[] {
+  const events = monitorRecord(item).events
+  if (Array.isArray(events)) {
+    const rows = events.filter((event): event is Record<string, unknown> => Boolean(event && typeof event === 'object'))
+    if (rows.length) return rows
+  }
+  return item.imageAttempts.flatMap((attempt) => attempt.monitor.events as Record<string, unknown>[])
+}
+
+function egressRoute(value: unknown, fallback: DetailEgressStep['route']): DetailEgressStep['route'] {
+  const route = cleanString(value).toLowerCase()
+  if (route === 'control') return 'control'
+  if (route === 'resource') return 'resource'
+  if (route.includes('fallback')) return 'fallback'
+  return fallback
+}
+
+function eventNumber(value: unknown): number {
+  const parsed = Number(value || 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0
+}
+
+export function buildEgressSteps(item: SystemLogRow | null): DetailEgressStep[] {
+  if (!item) return []
+  const monitor = monitorRecord(item)
+  const fallbackEgressKey = item.egressKey || formatInlineValue(monitor.egress_key)
+  const fallbackEgressLabel = item.egressLabel || formatInlineValue(monitor.egress_label)
+  const fallbackProxySource = item.proxySource || formatInlineValue(monitor.proxy_source)
+  const fallbackProxyHash = item.proxyHash || formatInlineValue(monitor.proxy_hash)
+  const rows: DetailEgressStep[] = []
+
+  egressEventRecords(item).forEach((event, eventIndex) => {
+    const eventName = cleanString(event.event)
+    const config = egressStageConfig[eventName]
+    if (!config) return
+    const exactEgress = Boolean(event.egress_key || event.egress_label || event.from_egress_key || event.to_egress_key)
+    const route = egressRoute(event.route, config.route)
+    const isFallback = route === 'fallback'
+    const egressKey = cleanString(event.egress_key) || (!isFallback ? fallbackEgressKey : '')
+    const egressLabel = cleanString(event.egress_label) || (!isFallback ? fallbackEgressLabel : '')
+    const proxySource = cleanString(event.proxy_source) || (!isFallback ? fallbackProxySource : '')
+    const proxyHash = cleanString(event.proxy_hash) || (!isFallback ? fallbackProxyHash : '')
+    const fromKey = cleanString(event.from_egress_key || event.fallback_from_egress_key)
+    const fromLabel = cleanString(event.from_egress_label || event.fallback_from_egress_label)
+    const toKey = cleanString(event.to_egress_key || event.egress_key)
+    const toLabel = cleanString(event.to_egress_label || event.egress_label)
+    if (!exactEgress && !egressKey && !fromKey && !toKey) return
+    rows.push({
+      key: `${eventName}-${eventIndex}-${event.index || 0}-${event.attempt || 0}`,
+      stage: config.label,
+      route,
+      routeLabel: cleanString(event.route_label)
+        || (route === 'control' ? '控制流出口' : route === 'resource' ? '资源流出口' : route === 'fallback' ? '备用出口' : '出口'),
+      egressLabel,
+      egressKey,
+      proxySource,
+      proxyHash,
+      time: cleanString(event.time),
+      status: cleanString(event.status),
+      operation: cleanString(event.operation),
+      slot: eventNumber(event.index),
+      attempt: eventNumber(event.attempt),
+      inherited: !exactEgress,
+      fromLabel,
+      fromKey,
+      toLabel,
+      toKey,
+      reason: cleanString(event.reason || event.upstream_error || event.error),
+    })
+  })
+
+  return rows.filter((row, index) => {
+    const previous = rows[index - 1]
+    if (!previous) return true
+    return !(
+      previous.stage === row.stage
+      && previous.route === row.route
+      && previous.egressKey === row.egressKey
+      && previous.fromKey === row.fromKey
+      && previous.toKey === row.toKey
+      && previous.slot === row.slot
+      && previous.attempt === row.attempt
+    )
+  })
 }
 
 export function buildPrimaryDetailFields(item: SystemLogRow | null): DetailField[] {

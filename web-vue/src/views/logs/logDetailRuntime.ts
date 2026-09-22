@@ -3,6 +3,7 @@ import type { GalleryFile } from '@/api/gallery'
 import type { SystemLogRow } from '@/api/logs'
 import {
   buildDiagnosticDetailFields,
+  buildEgressSteps,
   buildPrimaryDetailFields,
   buildTimelineGroups,
   buildTimelineLegendItems,
@@ -27,6 +28,7 @@ export function useLogDetailRuntime() {
   const selectedTimelineSegments = computed(() => buildTimelineSegments(selectedLog.value))
   const selectedTimelineLegendItems = computed(() => buildTimelineLegendItems(selectedTimelineSegments.value))
   const selectedTimelineGroups = computed(() => buildTimelineGroups(selectedLog.value))
+  const selectedEgressSteps = computed(() => buildEgressSteps(selectedLog.value))
 
   const selectedTimelineSummary = computed(() => summarizeTimeline(
     selectedTimelineSegments.value,
@@ -94,6 +96,7 @@ export function useLogDetailRuntime() {
     selectedTimelineSegments,
     selectedTimelineLegendItems,
     selectedTimelineGroups,
+    selectedEgressSteps,
     selectedTimelineStepCount,
     selectedTimelineSegmentTotal,
     timelineDetailsVisible,

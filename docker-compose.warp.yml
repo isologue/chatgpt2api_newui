@@ -30,7 +30,7 @@ services:
     container_name: chatgpt2api-warp-proxy
     restart: unless-stopped
     environment:
-      WARP_SLEEP: "2"
+      WARP_SLEEP: "15"
       # 可选：填写 Cloudflare WARP+ License Key
       # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
     cap_add:

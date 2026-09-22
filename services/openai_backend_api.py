@@ -230,6 +230,11 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        # 资源请求发生主/备用出口切换时，把实际切换过程交给上层监控记录。
+        # 回调只携带脱敏后的 egress_key/label，不包含代理用户名或密码。
+        self.resource_fallback_callback: Callable[[Dict[str, Any]], None] | None = None
+        # 记录最近一次资源请求真正采用的 profile；资源备用出口成功后，详情应显示备用出口而不是主出口。
+        self._last_resource_request_profile: ProxyRuntimeProfile | None = None
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
@@ -433,6 +438,7 @@ class OpenAIBackendAPI:
         last_error: BaseException | None = None
         last_response: requests.Response | None = None
         for index, (session, profile, fallback) in enumerate(attempts):
+            self._last_resource_request_profile = profile
             started = proxy_settings.route_request_started("resource", profile)
             try:
                 response = getattr(session, method.lower())(url, **kwargs)
@@ -468,16 +474,24 @@ class OpenAIBackendAPI:
                 reason = diagnostic_excerpt(repr(exc), 200)
 
             next_profile = attempts[index + 1][1]
-            logger.warning({
+            fallback_event = {
                 "event": "resource_proxy_fallback",
                 "operation": operation,
                 "from_egress_key": profile.egress_key,
                 "from_egress_label": profile.egress_label,
+                "from_proxy_source": profile.proxy_source,
                 "to_egress_key": next_profile.egress_key,
                 "to_egress_label": next_profile.egress_label,
+                "to_proxy_source": next_profile.proxy_source,
                 "reason": reason,
                 "url_host": urlparse(url).netloc,
-            })
+            }
+            logger.warning(fallback_event)
+            if self.resource_fallback_callback:
+                try:
+                    self.resource_fallback_callback(dict(fallback_event))
+                except Exception:
+                    pass
 
         if last_error is not None:
             raise last_error

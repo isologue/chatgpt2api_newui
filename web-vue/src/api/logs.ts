@@ -141,7 +141,7 @@ export type ImageAttempt = {
 
 export type ImageAttemptMonitor = {
   metrics: Record<string, number>
-  events: Array<Record<string, string | number>>
+  events: Array<Record<string, string | number | boolean>>
 }
 
 export type SystemLogRow = {
@@ -857,15 +857,30 @@ function normalizeImageAttemptMonitor(value: unknown): ImageAttemptMonitor {
       .filter(([, item]) => item > 0),
   )
   const rawEvents = Array.isArray(monitor.events) ? monitor.events : []
+  const eventTextKeys = new Set([
+    'time', 'event', 'label', 'status', 'index', 'total', 'attempt', 'route', 'route_label', 'operation',
+    'proxy_source', 'proxy_hash', 'egress_mode', 'egress_key', 'egress_label',
+    'proxy_group_id', 'proxy_node_id', 'proxy_node_name', 'image_egress_limit',
+    'control_egress_key', 'control_egress_label', 'control_proxy_source',
+    'resource_proxy_hash', 'resource_egress_key', 'resource_egress_label', 'resource_proxy_source',
+    'fallback_from_egress_key', 'fallback_from_egress_label',
+    'from_egress_key', 'from_egress_label', 'from_proxy_source',
+    'to_egress_key', 'to_egress_label', 'to_proxy_source', 'reason', 'url_host',
+  ])
+  const eventBooleanKeys = new Set([
+    'has_proxy', 'has_resource_proxy', 'fallback_retry', 'circuit_routed',
+  ])
   const events = rawEvents
     .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
     .slice(-40)
     .map((item) => Object.fromEntries(
       Object.entries(item)
-        .filter(([key]) => ['time', 'event', 'label', 'status'].includes(key) || key.endsWith('_ms'))
+        .filter(([key]) => eventTextKeys.has(key) || eventBooleanKeys.has(key) || key.endsWith('_ms'))
         .map(([key, eventValue]) => [
           key,
-          key.endsWith('_ms') ? normalizeNonNegativeNumber(eventValue) : cleanString(eventValue),
+          key.endsWith('_ms')
+            ? normalizeNonNegativeNumber(eventValue)
+            : eventBooleanKeys.has(key) ? eventValue === true : cleanString(eventValue),
         ]),
     ))
   return { metrics, events }

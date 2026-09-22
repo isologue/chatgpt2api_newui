@@ -102,8 +102,64 @@ def _backend_egress_data(backend: OpenAIBackendAPI) -> dict[str, Any]:
         "image_egress_limit": int(getattr(profile, "image_concurrency_limit", 0) or 0),
         "has_proxy": bool(proxy_url),
         "has_resource_proxy": bool(resource_url),
+        "egress_mode": egress_mode,
+    }
+
+
+def _backend_stage_egress_data(backend: OpenAIBackendAPI, route: str) -> dict[str, Any]:
+    """返回当前步骤真正使用的脱敏出口信息。"""
+    normalized_route = "resource" if route == "resource" else "control"
+    profile = (
+        getattr(backend, "_last_resource_request_profile", None)
+        or getattr(backend, "resource_proxy_profile", None)
+        if normalized_route == "resource"
+        else getattr(backend, "proxy_profile", None)
+    )
+    proxy_url = getattr(profile, "proxy_url", "") if profile else ""
+    egress_mode = str(getattr(profile, "egress_mode", "") or "direct")
+    split_mode = egress_mode == "split_proxy"
+    route_label = (
+        "资源出口 A" if split_mode else "资源流出口"
+    ) if normalized_route == "resource" else (
+        "控制出口 B" if split_mode else "控制流出口"
+    )
+    return {
+        "route": normalized_route,
+        "route_label": route_label,
+        "proxy_source": str(getattr(profile, "proxy_source", "") or "direct"),
+        "proxy_hash": _proxy_hash(proxy_url),
+        "egress_key": str(getattr(profile, "egress_key", "") or "direct"),
+        "egress_label": str(getattr(profile, "egress_label", "") or ""),
+        "proxy_group_id": str(getattr(profile, "proxy_group_id", "") or ""),
+        "proxy_node_id": str(getattr(profile, "proxy_node_id", "") or ""),
+        "proxy_node_name": str(getattr(profile, "proxy_node_name", "") or ""),
+        "has_proxy": bool(proxy_url),
         "egress_mode": str(getattr(profile, "egress_mode", "") or "direct"),
     }
+
+
+def _resource_fallback_monitor_callback(
+        request: "ConversationRequest",
+        index: int,
+        total: int,
+        account_email_getter: Callable[[], str],
+) -> Callable[[dict[str, Any]], None]:
+    def report(payload: dict[str, Any]) -> None:
+        data = dict(payload or {})
+        data.pop("event", None)
+        data.update({
+            "index": index,
+            "total": total,
+            "route": "resource_fallback",
+            "route_label": "资源备用出口",
+            "status": "fallback",
+        })
+        account_email = account_email_getter()
+        if account_email:
+            data["account_email"] = account_email
+        _monitor_image_stage(request, "resource_proxy_fallback", **data)
+
+    return report
 
 
 def _backend_http_timing_data(backend: OpenAIBackendAPI | None, name: str = "image_generation_stream") -> dict[str, Any]:
@@ -154,6 +210,7 @@ _IMAGE_PROGRESS_DURATION_KEYS = {
 
 
 def _image_progress_callback_with_monitor(
+        backend: OpenAIBackendAPI,
         request: "ConversationRequest",
         index: int,
         total: int,
@@ -178,7 +235,9 @@ def _image_progress_callback_with_monitor(
         if duration_key:
             data[duration_key] = int((now - last_step_started) * 1000)
         stage_event = _IMAGE_PROGRESS_STAGE_EVENTS.get(step_name)
-        if stage_event:
+        if stage_event and not (step_name == "uploading" and not request.images):
+            route = "resource" if step_name == "uploading" else "control"
+            data.update(_backend_stage_egress_data(backend, route))
             _monitor_image_stage(request, stage_event, **data)
         last_step = step_name
         last_step_started = now
@@ -221,6 +280,7 @@ def _resolve_image_urls_with_monitor(
                 total=total,
                 status="failed",
                 upstream_error=diagnostic_excerpt(repr(exc), 1000),
+                **_backend_stage_egress_data(backend, "control"),
                 **result_timing,
             )
             log_payload: dict[str, Any] = {
@@ -246,6 +306,7 @@ def _resolve_image_urls_with_monitor(
             url_count=len(image_urls),
             index=index,
             total=total,
+            **_backend_stage_egress_data(backend, "control"),
             **result_timing,
         )
         log_payload = {
@@ -288,6 +349,7 @@ def _download_image_bytes_with_monitor(
                 total=total,
                 status="failed",
                 upstream_error=diagnostic_excerpt(repr(exc), 1000),
+                **_backend_stage_egress_data(backend, "resource"),
             )
             log_payload: dict[str, Any] = {
                 "event": "image_download_failed",
@@ -316,6 +378,7 @@ def _download_image_bytes_with_monitor(
             image_count=len(downloaded_images),
             index=index,
             total=total,
+            **_backend_stage_egress_data(backend, "resource"),
         )
         log_payload = {
             "event": "image_download_done",
@@ -1749,6 +1812,7 @@ def stream_image_outputs(
         conversation_stream_ms=conversation_stream_ms,
         index=index,
         total=total,
+        **_backend_stage_egress_data(backend, "control"),
         **http_timing,
     )
     logger.info({
@@ -2469,6 +2533,7 @@ def _generate_single_image(
                         "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                         "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
                     })
+                egress_data.update(_backend_stage_egress_data(backend, "control"))
                 _monitor_image_stage(
                     request,
                     "image_egress_waiting",
@@ -2489,6 +2554,7 @@ def _generate_single_image(
                         "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                         "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
                     })
+                egress_data.update(_backend_stage_egress_data(backend, "control"))
                 _monitor_image_stage(
                     request,
                     "image_egress_ready",
@@ -2512,6 +2578,13 @@ def _generate_single_image(
                 })
             if request.progress_callback or request.trace_image_perf:
                 backend.progress_callback = _image_progress_callback_with_monitor(
+                    backend,
+                    request,
+                    index,
+                    total,
+                    lambda: account_email,
+                )
+                backend.resource_fallback_callback = _resource_fallback_monitor_callback(
                     request,
                     index,
                     total,

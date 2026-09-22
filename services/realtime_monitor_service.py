@@ -64,6 +64,46 @@ CALL_FAILURE_FIELDS = (
 )
 
 
+EGRESS_TRACE_FIELDS = (
+    "route",
+    "route_label",
+    "operation",
+    "proxy_source",
+    "proxy_hash",
+    "egress_mode",
+    "egress_key",
+    "egress_label",
+    "proxy_group_id",
+    "proxy_node_id",
+    "proxy_node_name",
+    "image_egress_limit",
+    "control_egress_key",
+    "control_egress_label",
+    "control_proxy_source",
+    "resource_proxy_hash",
+    "resource_egress_key",
+    "resource_egress_label",
+    "resource_proxy_source",
+    "fallback_from_egress_key",
+    "fallback_from_egress_label",
+    "from_egress_key",
+    "from_egress_label",
+    "from_proxy_source",
+    "to_egress_key",
+    "to_egress_label",
+    "to_proxy_source",
+    "reason",
+    "url_host",
+)
+
+EGRESS_TRACE_BOOLEAN_FIELDS = (
+    "has_proxy",
+    "has_resource_proxy",
+    "fallback_retry",
+    "circuit_routed",
+)
+
+
 def _trim_raw(value: object, limit: int = 4000) -> str:
     return _trim(value, limit)
 
@@ -100,6 +140,7 @@ STAGE_LABELS = {
     "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "切换备用出口",
+    "resource_proxy_fallback": "资源出口切换",
     "image_stream_resolve_start": "等待图片结果",
     "image_resolve_done": "图片地址就绪",
     "image_resolve_failed": "结果获取失败",
@@ -134,6 +175,7 @@ ACTIVE_STAGE_GROUPS = {
     "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "等待出口",
+    "resource_proxy_fallback": "资源出口切换",
     "image_stream_resolve_start": "等待图片结果",
     "image_resolve_done": "获取图片地址",
     "image_resolve_failed": "获取图片地址",
@@ -454,26 +496,16 @@ class RealtimeMonitorService:
             record["conversation_id"] = str(data.get("conversation_id") or "")
         if data.get("model") and not record.get("model"):
             record["model"] = str(data.get("model") or "")
-        for key in (
-            "proxy_source",
-            "proxy_hash",
-            "egress_mode",
-            "egress_key",
-            "egress_label",
-            "proxy_group_id",
-            "proxy_node_id",
-            "proxy_node_name",
-            "image_egress_limit",
-            "local_reason",
-        ):
+        for key in (*EGRESS_TRACE_FIELDS, "local_reason"):
             if key in data:
                 record[key] = str(data.get(key) or "")
         for key in RAW_DIAGNOSTIC_FIELDS:
             if key in data and data.get(key):
                 record[key] = _trim_raw(data.get(key))
         self._merge_failure_fields(record, data)
-        if "has_proxy" in data:
-            record["has_proxy"] = bool(data.get("has_proxy"))
+        for key in EGRESS_TRACE_BOOLEAN_FIELDS:
+            if key in data:
+                record[key] = bool(data.get(key))
 
         index = str(data.get("index") or "")
         if index:
@@ -502,26 +534,16 @@ class RealtimeMonitorService:
                 image["returned_result"] = bool(data.get("returned_result"))
             if data.get("returned_message") is not None:
                 image["returned_message"] = bool(data.get("returned_message"))
-            for key in (
-                "proxy_source",
-                "proxy_hash",
-                "egress_mode",
-                "egress_key",
-                "egress_label",
-                "proxy_group_id",
-                "proxy_node_id",
-                "proxy_node_name",
-                "image_egress_limit",
-                "local_reason",
-            ):
+            for key in (*EGRESS_TRACE_FIELDS, "local_reason"):
                 if key in data:
                     image[key] = str(data.get(key) or "")
             for key in RAW_DIAGNOSTIC_FIELDS:
                 if key in data and data.get(key):
                     image[key] = _trim_raw(data.get(key))
             self._merge_failure_fields(image, data)
-            if "has_proxy" in data:
-                image["has_proxy"] = bool(data.get("has_proxy"))
+            for key in EGRESS_TRACE_BOOLEAN_FIELDS:
+                if key in data:
+                    image[key] = bool(data.get(key))
             self._merge_metric_dict(image.setdefault("metrics", {}), metric_data)
             self._merge_image_account_summary(record)
 
@@ -606,8 +628,8 @@ class RealtimeMonitorService:
             compact_event = {
                 key: value
                 for key, value in event.items()
-                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS}
-                or key in {"public_error", "account_failure", "switched_account"}
+                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS, *EGRESS_TRACE_FIELDS}
+                or key in {"public_error", "account_failure", "switched_account", *EGRESS_TRACE_BOOLEAN_FIELDS}
                 or (str(key).endswith("_ms") and _int_ms(value) > 0)
             }
             if compact_event:
@@ -828,20 +850,7 @@ class RealtimeMonitorService:
 
     def _detail_diagnostic(self, record: dict[str, Any], events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         diagnostic: dict[str, Any] = {}
-        for key in (
-            "stage",
-            "stage_label",
-            "proxy_source",
-            "proxy_hash",
-            "egress_mode",
-            "egress_key",
-            "egress_label",
-            "proxy_group_id",
-            "proxy_node_id",
-            "proxy_node_name",
-            "image_egress_limit",
-            "local_reason",
-        ):
+        for key in ("stage", "stage_label", *EGRESS_TRACE_FIELDS, "local_reason"):
             value = str(record.get(key) or "").strip()
             if value:
                 diagnostic[key] = value
@@ -849,8 +858,9 @@ class RealtimeMonitorService:
             value = str(record.get(key) or "").strip()
             if value:
                 diagnostic[key] = value
-        if "has_proxy" in record:
-            diagnostic["has_proxy"] = bool(record.get("has_proxy"))
+        for key in EGRESS_TRACE_BOOLEAN_FIELDS:
+            if key in record:
+                diagnostic[key] = bool(record.get(key))
 
         metrics = {
             key: _int_ms(value)
@@ -881,16 +891,8 @@ class RealtimeMonitorService:
                     "status",
                     "returned_result",
                     "returned_message",
-                    "proxy_source",
-                    "proxy_hash",
-                    "has_proxy",
-                    "egress_mode",
-                    "egress_key",
-                    "egress_label",
-                    "proxy_group_id",
-                    "proxy_node_id",
-                    "proxy_node_name",
-                    "image_egress_limit",
+                    *EGRESS_TRACE_FIELDS,
+                    *EGRESS_TRACE_BOOLEAN_FIELDS,
                     "local_reason",
                     *CANONICAL_FAILURE_FIELDS,
                     "public_error",
@@ -917,9 +919,9 @@ class RealtimeMonitorService:
                 {
                     key: value
                     for key, value in event.items()
-                    if key in {"time", "event", "label", "index", "total", "attempt", "status"}
+                    if key in {"time", "event", "label", "index", "total", "attempt", "status", *EGRESS_TRACE_FIELDS}
                     or key in CANONICAL_FAILURE_FIELDS
-                    or key in {"public_error", "account_failure", "switched_account"}
+                    or key in {"public_error", "account_failure", "switched_account", *EGRESS_TRACE_BOOLEAN_FIELDS}
                     or key in RAW_DIAGNOSTIC_FIELDS
                     or (str(key).endswith("_ms") and _int_ms(value) > 0)
                 }
@@ -1003,16 +1005,8 @@ class RealtimeMonitorService:
                 "response_ms",
                 "stream_ms",
                 "total_ms",
-                "proxy_source",
-                "proxy_hash",
-                "egress_key",
-                "egress_label",
-                "proxy_group_id",
-                "proxy_node_id",
-                "proxy_node_name",
-                "image_egress_limit",
-                "egress_mode",
-                "has_proxy",
+                *EGRESS_TRACE_FIELDS,
+                *EGRESS_TRACE_BOOLEAN_FIELDS,
                 "local_reason",
                 *CANONICAL_FAILURE_FIELDS,
                 "public_error",

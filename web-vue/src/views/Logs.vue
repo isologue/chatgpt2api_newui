@@ -162,6 +162,7 @@
       :timeline-segments="selectedTimelineSegments"
       :timeline-legend-items="selectedTimelineLegendItems"
       :timeline-groups="selectedTimelineGroups"
+      :egress-steps="selectedEgressSteps"
       :timeline-step-count="selectedTimelineStepCount"
       :timeline-segment-total="selectedTimelineSegmentTotal"
       :timeline-details-visible="timelineDetailsVisible"
@@ -345,6 +346,7 @@ const selectedDiagnosticDetailFields = logDetailRuntime.selectedDiagnosticDetail
 const selectedTimelineSegments = logDetailRuntime.selectedTimelineSegments
 const selectedTimelineLegendItems = logDetailRuntime.selectedTimelineLegendItems
 const selectedTimelineGroups = logDetailRuntime.selectedTimelineGroups
+const selectedEgressSteps = logDetailRuntime.selectedEgressSteps
 const selectedTimelineStepCount = logDetailRuntime.selectedTimelineStepCount
 const selectedTimelineSegmentTotal = logDetailRuntime.selectedTimelineSegmentTotal
 const timelineDetailsVisible = logDetailRuntime.timelineDetailsVisible
