@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from curl_cffi import requests
 
 from services.account_service import account_service
+from services.account_push_service import account_push_service
 from services.json_file import read_json_object
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
@@ -1323,6 +1324,15 @@ def worker(index: int) -> dict:
         refresh_result = account_service.refresh_accounts([access_token])
         if refresh_result.get("errors"):
             step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+        account = account_service.get_account(access_token) or result
+        try:
+            push_result = account_push_service.push_account(account)
+        except Exception as exc:
+            push_result = {"ok": False, "error": str(exc)}
+        if push_result.get("ok"):
+            step(index, f"账号推送成功: {push_result.get('target', '')}, HTTP {push_result.get('status_code', 200)}", "green")
+        elif not push_result.get("skipped"):
+            step(index, f"账号注册成功，推送失败 ({push_result.get('target') or '未配置目标'}): {push_result.get('error', 'unknown error')}", "yellow")
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1

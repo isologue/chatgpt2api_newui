@@ -33,6 +33,10 @@
         :label="accountSourceText(item)"
         tone-class="border-cyan-500/40 bg-cyan-500/10 text-cyan-600"
       />
+      <StatusPill
+        :label="item.push_status === 'success' ? '已推送' : item.push_status === 'failed' ? '推送失败' : '未推送'"
+        :tone-class="item.push_status === 'success' ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600' : item.push_status === 'failed' ? 'border-rose-500/40 bg-rose-500/10 text-rose-600' : 'border-muted bg-muted/20 text-muted-foreground'"
+      />
       <button
         type="button"
         class="text-left"

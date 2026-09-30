@@ -26,6 +26,13 @@
               selected-indicator="none"
               aria-label="账号组筛选"
             />
+            <GroupedSelectMenu
+              v-model="pushStatusFilter"
+              :options="pushStatusFilterOptions"
+              placeholder="推送状态"
+              selected-indicator="none"
+              aria-label="账号推送状态筛选"
+            />
           </FilterToolbar>
 
           <div class="accounts-toolbar-summary">
@@ -76,6 +83,24 @@
                 :trigger-class="accountToolbarMenuClass"
                 @select="handleToolbarBatchAction"
               />
+              <Button
+                size="sm"
+                variant="outline"
+                :root-class="accountToolbarMenuClass"
+                :disabled="!selectedCount || batchBusy"
+                @click="pushSelectedAccounts"
+              >
+                推送选中账号
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                :root-class="accountToolbarMenuClass"
+                :disabled="pushStatusFilter === 'all' || batchBusy"
+                @click="pushFilteredAccounts"
+              >
+                推送当前筛选
+              </Button>
             </FilterToolbar>
           </div>
 
@@ -117,12 +142,13 @@
               <th class="py-3 pr-5">图片额度</th>
               <th class="py-3 pr-5">恢复时间</th>
               <th class="py-3 pr-5">成功 / 失败</th>
+              <th class="py-3 pr-5">推送状态</th>
               <th class="py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody class="text-sm text-foreground">
             <tr v-if="!loading && filteredAccounts.length === 0">
-              <td colspan="10" class="py-6">
+              <td colspan="11" class="py-6">
                 <EmptyState
                   plain
                   title="暂无账号数据"
@@ -732,13 +758,17 @@ const {
   keyword,
   statusFilter,
   groupFilter,
+  pushStatusFilter,
   statusFilterOptions,
   groupFilterOptions,
+  pushStatusFilterOptions,
   editingId,
   accounts,
   accountListTotal,
   accountAllTotal,
   selectedCount,
+  pushSelectedAccounts,
+  pushFilteredAccounts,
   allVisibleSelected,
   currentPage,
   pageSize,

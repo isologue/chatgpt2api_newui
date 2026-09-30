@@ -5,6 +5,7 @@ export type AccountLane = 'fast' | 'thinking' | 'pro'
 export type AccountSourceType = 'web' | 'codex'
 export type AccountBackendStatus = '正常' | '限流' | '存疑' | '异常' | '禁用'
 export type AccountStatusCategory = 'normal' | 'limited' | 'suspicious' | 'abnormal' | 'disabled'
+export type AccountPushStatus = 'pending' | 'success' | 'failed'
 
 export interface Account {
   id: string
@@ -18,6 +19,10 @@ export interface Account {
   source_type?: AccountSourceType
   proxy?: string
   group_id?: string
+  push_status?: AccountPushStatus
+  push_error?: string
+  push_at?: string
+  push_target?: string
   quota?: number
   image_quota_unknown?: boolean
   last_remote_check_result?: '' | 'pending' | 'ok' | 'error' | 'invalid'
@@ -424,6 +429,10 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
     source_type: sourceType,
     proxy: cleanString(item.proxy),
     group_id: cleanString(item.group_id),
+    push_status: (['pending', 'success', 'failed'].includes(cleanString(item.push_status)) ? cleanString(item.push_status) : 'pending') as AccountPushStatus,
+    push_error: cleanString(item.push_error),
+    push_at: cleanString(item.push_at),
+    push_target: cleanString(item.push_target),
     quota,
     image_quota_unknown: imageQuotaUnknown,
     last_remote_check_result: (
@@ -486,6 +495,7 @@ export type AccountListParams = {
   keyword?: string
   status?: 'all' | 'normal' | 'limited' | 'suspicious' | 'abnormal' | 'disabled'
   group_id?: string
+  push_status?: 'all' | AccountPushStatus
 }
 
 function mapAccountsResponse(response: BackendAccountsResponse): AccountsResponse {
@@ -666,6 +676,12 @@ export const accountsApi = {
     })
     return mapAccountsResponse(response)
   },
+
+  push: async (accessTokens: string[] = [], pushStatus: 'all' | AccountPushStatus = 'all') =>
+    apiClient.post<{ access_tokens: string[]; push_status: string }, { total: number; success: number; failed: number; results: Array<{ email?: string; ok: boolean; error?: string }> }>('/api/accounts/push', {
+      access_tokens: accessTokens.map(resolveToken).filter(Boolean),
+      push_status: pushStatus,
+    }),
 
   listGroups: () =>
     apiClient.get<never, { groups: AccountGroup[]; proxy_groups?: ProxyGroup[] }>('/api/account-groups'),

@@ -486,6 +486,11 @@ class AccountService:
             if remote_check_result in {"pending", "ok", "error", "invalid"}
             else None
         )
+        push_status = str(normalized.get("push_status") or "pending").strip().lower()
+        normalized["push_status"] = push_status if push_status in {"pending", "success", "failed"} else "pending"
+        normalized["push_error"] = normalized.get("push_error") or None
+        normalized["push_at"] = normalized.get("push_at") or None
+        normalized["push_target"] = normalized.get("push_target") or None
         pending_remove = normalized.get("pending_auth_remove_invalid")
         normalized["pending_auth_remove_invalid"] = (
             self._bool_value(pending_remove)

@@ -110,6 +110,28 @@
       </div>
     </FormSection>
 
+    <FormSection title="账号推送" density="roomy">
+      <div class="register-form-grid">
+        <label class="register-checkbox-field register-field--full">
+          <Checkbox v-model="config.push.enabled" :disabled="config.enabled">启用注册成功后自动推送</Checkbox>
+        </label>
+        <label class="register-field"><span class="register-label">服务名称</span><Input v-model="config.push.name" block :disabled="config.enabled" /></label>
+        <label class="register-field"><span class="register-label">API URL</span><Input v-model="config.push.api_url" block placeholder="https://example.com" :disabled="config.enabled" /></label>
+        <label class="register-field"><span class="register-label">API Key</span><Input v-model="config.push.api_key" type="password" block placeholder="留空保持不变" :disabled="config.enabled" /></label>
+        <label class="register-field"><span class="register-label">推送间隔（秒）</span><Input v-model.number="config.push.interval" type="number" min="0" step="0.1" block :disabled="config.enabled" /></label>
+        <div class="register-field--full flex flex-wrap items-center gap-3">
+          <Button size="sm" variant="outline" :disabled="pushTesting" @click="testPush">
+            {{ pushTesting ? '测试中...' : '测试推送' }}
+          </Button>
+          <span v-if="pushTestResult" class="min-w-0 break-words text-xs" :class="pushTestResult.ok ? 'text-emerald-600' : 'text-rose-600'" role="status">
+            {{ pushTestResult.ok
+              ? `推送成功：${pushTestResult.email || '账号'} → ${pushTestResult.target || '远程服务'}，HTTP ${pushTestResult.status_code}`
+              : `推送失败：${pushTestResult.error || '未知错误'}` }}
+          </span>
+        </div>
+      </div>
+    </FormSection>
+
     <FormSection title="生图压力动态补号" density="roomy">
       <div class="register-form-grid">
         <label class="register-checkbox-field register-field--full">
@@ -232,18 +254,21 @@
 </template>
 
 <script setup lang="ts">
-import { Checkbox, Input } from 'nanocat-ui'
+import { ref, watch } from 'vue'
+import { Button, Checkbox, Input } from 'nanocat-ui'
 
 import FormSection from '@/components/ai/FormSection.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
 import type { LegacyRegisterConfig } from '@/api/register'
+import { registerApi } from '@/api/register'
+import { errorMessage } from '@/lib/errorMessage'
 import {
   registerModeGroups,
   registerProxyModeGroups,
   type RegisterProxyMode,
 } from '@/views/register/registerProviderView'
 
-defineProps<{
+const props = defineProps<{
   config: LegacyRegisterConfig
   proxyMode: RegisterProxyMode
   selectedProxyGroupId: string
@@ -251,6 +276,24 @@ defineProps<{
   proxyGroupGroups: unknown[]
   proxyHint: string
 }>()
+
+const pushTesting = ref(false)
+const pushTestResult = ref<{ ok: boolean; target?: string; email?: string; status_code?: number; error?: string } | null>(null)
+
+watch(() => props.config.push, () => { pushTestResult.value = null }, { deep: true })
+
+async function testPush() {
+  if (pushTesting.value) return
+  pushTesting.value = true
+  pushTestResult.value = null
+  try {
+    pushTestResult.value = await registerApi.testPush(props.config.push)
+  } catch (error) {
+    pushTestResult.value = { ok: false, error: errorMessage(error) }
+  } finally {
+    pushTesting.value = false
+  }
+}
 
 const emit = defineEmits<{
   (e: 'update-proxy-mode', value: string): void

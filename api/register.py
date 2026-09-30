@@ -4,6 +4,7 @@ import asyncio
 import json
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -26,10 +27,15 @@ class RegisterConfigRequest(BaseModel):
     dynamic_image_scale_cooldown_seconds: int | None = None
     dynamic_image_scale_wait_threshold_ms: int | None = None
     dynamic_image_scale_buffer: int | None = None
+    push: dict | None = None
 
 
 class OutlookPoolResetRequest(BaseModel):
     scope: str | None = None
+
+
+class RegisterPushTestRequest(BaseModel):
+    push: dict | None = None
 
 
 class GptMailStatusRequest(BaseModel):
@@ -58,6 +64,11 @@ def create_router() -> APIRouter:
     async def start_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.start()}
+
+    @router.post("/api/register/push/test")
+    async def test_register_push(body: RegisterPushTestRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(register_service.test_push, body.push)
 
     @router.post("/api/register/stop")
     async def stop_register(authorization: str | None = Header(default=None)):

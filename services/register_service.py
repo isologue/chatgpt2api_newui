@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
+from services.account_push_service import account_push_service
 from services.config import DATA_DIR
 from services.json_file import read_json_object, write_json_file
 from services.register import mail_provider, openai_register
@@ -95,6 +96,13 @@ def _default_config() -> dict:
         "dynamic_image_scale_wait_threshold_ms": 5000,
         "dynamic_image_scale_buffer": 2,
         "enabled": False,
+        "push": {
+            "enabled": False,
+            "name": "ChatGPT2API Service",
+            "api_url": "",
+            "api_key": "",
+            "interval": 0,
+        },
         "stats": {
             "success": 0,
             "fail": 0,
@@ -136,6 +144,18 @@ def _normalize(raw: dict) -> dict:
     cfg["mail"]["api_use_register_proxy"] = _safe_bool(cfg["mail"].get("api_use_register_proxy"), True)
     cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
+    default_push = _default_config().get("push", {})
+    raw_push = cfg.get("push") if isinstance(cfg.get("push"), dict) else {}
+    push = {**default_push, **raw_push}
+    push["enabled"] = _safe_bool(push.get("enabled"), False)
+    push["name"] = str(push.get("name") or default_push["name"]).strip() or default_push["name"]
+    push["api_url"] = str(push.get("api_url") or "").strip().rstrip("/")
+    push["api_key"] = str(push.get("api_key") or "").strip()
+    try:
+        push["interval"] = max(0.0, float(push.get("interval") or 0))
+    except (TypeError, ValueError):
+        push["interval"] = 0.0
+    cfg["push"] = push
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
     cfg["stats"] = stats
@@ -150,6 +170,7 @@ class RegisterService:
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        account_push_service.configure(self._config.get("push"))
         self._dynamic_image_target_available = int(self._config.get("target_available") or 10)
         self._dynamic_image_last_pressure_at = 0.0
         self._dynamic_image_last_reason = ""
@@ -166,6 +187,10 @@ class RegisterService:
         with self._lock:
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
+        if isinstance(snapshot.get("push"), dict):
+            has_api_key = bool(self._config.get("push", {}).get("api_key"))
+            snapshot["push"]["api_key"] = ""
+            snapshot["push"]["has_api_key"] = has_api_key
         return snapshot
 
     @staticmethod
@@ -294,11 +319,34 @@ class RegisterService:
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._merge_outlook_pools(updates)
+            if isinstance(updates.get("push"), dict):
+                incoming_push = dict(updates["push"])
+                if not str(incoming_push.get("api_key") or "").strip():
+                    incoming_push["api_key"] = self._config.get("push", {}).get("api_key", "")
+                updates = {**updates, "push": incoming_push}
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            account_push_service.configure(self._config.get("push"))
             self._save()
             return self.get()
+
+    def test_push(self, draft: dict | None = None) -> dict:
+        with self._lock:
+            saved = dict(self._config.get("push") or {})
+        overrides = draft if isinstance(draft, dict) else {}
+        settings = {**saved, **overrides}
+        if not str(overrides.get("api_key") or "").strip():
+            settings["api_key"] = saved.get("api_key", "")
+        settings["interval"] = 0
+        accounts = account_service.list_accounts()
+        if not accounts:
+            return {"ok": False, "error": "没有可测试的本地账号，请先注册或导入账号"}
+        account = max(accounts, key=lambda item: str(item.get("created_at") or ""))
+        result = account_push_service.push_account(
+            account, force=True, settings_override=settings, record_status=False,
+        )
+        return {**result, "email": str(account.get("email") or "")}
 
     def start(self) -> dict:
         with self._lock:
@@ -312,6 +360,7 @@ class RegisterService:
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            account_push_service.configure(self._config.get("push"))
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()

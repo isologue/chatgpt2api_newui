@@ -24,6 +24,7 @@ from api.support import (
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.account_push_service import account_push_service
 from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
@@ -430,6 +431,13 @@ def _account_matches_group(account: dict[str, Any], group_id: str) -> bool:
     return current == group_id
 
 
+def _push_status_matches(account: dict[str, Any], push_status: str) -> bool:
+    value = _clean_text(push_status).lower()
+    if not value or value == "all":
+        return True
+    return _clean_text(account.get("push_status") or "pending").lower() == value
+
+
 def _accounts_page(
         *,
         page: int,
@@ -437,6 +445,7 @@ def _accounts_page(
         keyword: str,
         status: str,
         group_id: str,
+        push_status: str = "all",
 ) -> dict[str, Any]:
     items = account_service.list_accounts()
     filtered = [
@@ -444,6 +453,7 @@ def _accounts_page(
         if _account_matches_keyword(item, keyword)
         and _status_matches_filter(item, status)
         and _account_matches_group(item, group_id)
+        and _push_status_matches(item, push_status)
     ]
     safe_page = max(1, page)
     safe_page_size = max(1, min(page_size, 500))
@@ -550,6 +560,7 @@ def create_router() -> APIRouter:
             keyword: str = "",
             status: str = "all",
             group_id: str = "all",
+            push_status: str = "all",
             authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
@@ -559,7 +570,28 @@ def create_router() -> APIRouter:
             keyword=keyword,
             status=status,
             group_id=group_id,
+            push_status=push_status,
         )
+
+    @router.post("/api/accounts/push")
+    async def push_accounts(body: dict, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        tokens = _unique_tokens(body.get("access_tokens") or []) if isinstance(body, dict) else []
+        push_status = _clean_text(body.get("push_status") or "all").lower() if isinstance(body, dict) else "all"
+        if not tokens:
+            if push_status not in {"pending", "success", "failed"}:
+                raise HTTPException(status_code=400, detail={"error": "access_tokens or push_status is required"})
+            tokens = [str(item.get("access_token") or "") for item in account_service.list_accounts() if _push_status_matches(item, push_status)]
+        results = []
+        for token in tokens:
+            account = account_service.get_account(token)
+            if not account:
+                results.append({"email": "", "ok": False, "error": "account not found"})
+                continue
+            result = await run_in_threadpool(account_push_service.push_account, account, force=True)
+            results.append({"email": account.get("email") or "", "ok": bool(result.get("ok")), **({"error": result.get("error")} if not result.get("ok") else {})})
+        success = sum(1 for item in results if item["ok"])
+        return {"total": len(results), "success": success, "failed": len(results) - success, "results": results}
 
     @router.get("/api/account-groups")
     async def list_account_groups(authorization: str | None = Header(default=None)):

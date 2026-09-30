@@ -37,6 +37,7 @@ export function useAccountsPage() {
   const keyword = ref('')
   const statusFilter = ref<AccountStatusFilter>('all')
   const groupFilter = ref('all')
+  const pushStatusFilter = ref<'all' | 'pending' | 'success' | 'failed'>('all')
   const pageSize = ref(DEFAULT_PAGE_SIZE)
   const accounts = ref<Account[]>([])
   const accountAllTotal = ref(0)
@@ -56,6 +57,7 @@ export function useAccountsPage() {
       keyword: keyword.value.trim(),
       status: statusFilter.value,
       group_id: groupFilter.value,
+      push_status: pushStatusFilter.value,
     }),
     resolvePage: (res) => res.page,
     resolvePageCount: (res) => {
@@ -107,6 +109,41 @@ export function useAccountsPage() {
       value: group.id,
     })),
   ])
+  const pushStatusFilterOptions = [
+    { label: '全部推送状态', value: 'all' },
+    { label: '未推送', value: 'pending' },
+    { label: '已推送', value: 'success' },
+    { label: '推送失败', value: 'failed' },
+  ] as const
+
+  async function pushSelectedAccounts() {
+    if (!selectedIds.value.length) {
+      toast.warning('请先选择账号')
+      return
+    }
+    try {
+      const result = await accountsApi.push(selectedIds.value)
+      toast.success(`推送完成：成功 ${result.success}，失败 ${result.failed}`)
+      clearSelection()
+      await loadData({ silentErrorToast: true })
+    } catch (error) {
+      setError('推送账号失败', error)
+    }
+  }
+
+  async function pushFilteredAccounts() {
+    if (pushStatusFilter.value === 'all') {
+      toast.warning('请先选择推送状态筛选')
+      return
+    }
+    try {
+      const result = await accountsApi.push([], pushStatusFilter.value)
+      toast.success(`筛选账号推送完成：成功 ${result.success}，失败 ${result.failed}`)
+      await loadData({ silentErrorToast: true })
+    } catch (error) {
+      setError('推送筛选账号失败', error)
+    }
+  }
 
   const abnormalAccountIds = computed(() => (
     accounts.value
@@ -311,6 +348,7 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    pushStatusFilter,
     pageSizeDefault: DEFAULT_PAGE_SIZE,
     pageSizeOptions: ACCOUNT_PAGE_SIZE_OPTIONS,
     reloadTimerKey: LIST_RELOAD_TIMER_KEY,
@@ -339,8 +377,10 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    pushStatusFilter,
     statusFilterOptions,
     groupFilterOptions,
+    pushStatusFilterOptions,
     editingId,
     accounts,
     accountListTotal,
@@ -451,6 +491,8 @@ export function useAccountsPage() {
     removeAccount,
     runBulkAction,
     bindSelectedAccountsToGroup,
+    pushSelectedAccounts,
+    pushFilteredAccounts,
     exportAccounts,
   }
 }

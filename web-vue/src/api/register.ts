@@ -80,6 +80,14 @@ export type RegisterProvider = {
 }
 
 export type LegacyRegisterConfig = {
+  push?: {
+    enabled: boolean
+    name: string
+    api_url: string
+    api_key?: string
+    has_api_key?: boolean
+    interval: number
+  }
   mail: {
     request_timeout?: number
     wait_timeout?: number
@@ -170,6 +178,11 @@ export const registerApi = {
   },
   updateConfig(payload: Partial<LegacyRegisterConfig>) {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register', payload)
+  },
+  testPush(push: LegacyRegisterConfig['push']) {
+    return apiClient.post<any, { ok: boolean; target?: string; email?: string; status_code?: number; error?: string }>(
+      '/api/register/push/test', { push },
+    )
   },
   startLegacy() {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/start')

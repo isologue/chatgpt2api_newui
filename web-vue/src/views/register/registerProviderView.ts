@@ -119,6 +119,7 @@ export const providerLocalOnlyKeys: Record<string, string[]> = {
 }
 
 export const defaultRegisterConfig: LegacyRegisterConfig = {
+  push: { enabled: false, name: 'ChatGPT2API Service', api_url: '', api_key: '', interval: 0 },
   mail: {
     request_timeout: 30,
     wait_timeout: 30,
@@ -246,6 +247,14 @@ export function normalizeRegisterConfig(raw: LegacyRegisterConfig): LegacyRegist
     ...defaultRegisterConfig,
     ...raw,
     mail,
+    push: {
+      enabled: raw.push?.enabled === true,
+      name: String(raw.push?.name || defaultRegisterConfig.push?.name || 'ChatGPT2API Service'),
+      api_url: String(raw.push?.api_url || ''),
+      api_key: String(raw.push?.api_key || ''),
+      interval: Math.max(0, Number(raw.push?.interval) || 0),
+      has_api_key: raw.push?.has_api_key === true,
+    },
     stats: { ...defaultRegisterConfig.stats, ...(raw.stats || {}) },
     logs: Array.isArray(raw.logs) ? raw.logs : [],
   }
@@ -418,6 +427,14 @@ export function legacyRegisterPayload(config: LegacyRegisterConfig): Partial<Leg
     dynamic_image_scale_cooldown_seconds: Math.max(1, Number(config.dynamic_image_scale_cooldown_seconds) || 600),
     dynamic_image_scale_wait_threshold_ms: Math.max(0, Number(config.dynamic_image_scale_wait_threshold_ms) || 0),
     dynamic_image_scale_buffer: Math.max(0, Number(config.dynamic_image_scale_buffer) || 0),
+    push: {
+      ...config.push,
+      enabled: config.push?.enabled === true,
+      name: String(config.push?.name || '').trim(),
+      api_url: String(config.push?.api_url || '').trim(),
+      api_key: String(config.push?.api_key || ''),
+      interval: Math.max(0, Number(config.push?.interval) || 0),
+    },
   }
 }
 
